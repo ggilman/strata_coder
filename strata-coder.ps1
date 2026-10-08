@@ -219,6 +219,21 @@ function Invoke-Native([string]$Exe, [string[]]$ArgumentList) {
     return $output
 }
 
+function Reset-TerminalMouse {
+    $esc = [char] 27
+    $sequences = @(
+        "$esc[?1000l",
+        "$esc[?1002l",
+        "$esc[?1003l",
+        "$esc[?1005l",
+        "$esc[?1006l",
+        "$esc[?1015l"
+    )
+
+    [Console]::Out.Write(($sequences -join ''))
+    [Console]::Out.Flush()
+}
+
 function Get-FreeGB([string]$Path) {
     $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path))
     $drive = New-Object IO.DriveInfo($root)
@@ -624,27 +639,53 @@ function Prompt-SetupParams($Spec) {
         }
     }
 
+    $contextChoices = @(4096, 8192, 16384, 32768, 65536, 131072, 262144)
     $selectedContext = $defaultContext
 
     if (-not $Context) {
+        $contextNumber = 0
+
+        foreach ($tokens in $contextChoices) {
+            $contextNumber++
+            Write-Info "$contextNumber. $([int]($tokens / 1024))k ($tokens tokens)"
+        }
+
+        if ($defaultContext -eq 0) {
+            Write-Info 'Default: 0. Strata recommendation'
+        } else {
+            $defaultContextIndex = [array]::IndexOf($contextChoices, $defaultContext) + 1
+
+            if ($defaultContextIndex -ge 1) {
+                Write-Info "Default: $defaultContextIndex. $([int]($defaultContext / 1024))k"
+            } else {
+                Write-Info "Default: $defaultContext tokens"
+            }
+        }
+
         while ($true) {
-            $answer = Read-Host 'Context tokens [0 = Strata recommendation]'
+            $answer = Read-Host "Context [0 = Strata recommendation, 1-$($contextChoices.Count) = 4k-256k]"
 
             if ($answer.Trim() -eq '') {
                 break
             }
 
-            $number = 0
+            $index = 0
 
             if (
-                [int]::TryParse($answer.Trim(), [ref]$number) -and
-                $number -ge 0
+                [int]::TryParse($answer.Trim(), [ref]$index) -and
+                $index -ge 0 -and
+                $index -le $contextChoices.Count
             ) {
-                $selectedContext = $number
+                if ($index -eq 0) {
+                    $selectedContext = 0
+                } else {
+                    $selectedContext = $contextChoices[$index - 1]
+                }
+
                 break
             }
 
-            Write-Warn 'Enter a whole number or leave the field blank.'
+            Write-Warn "Enter a context number from 0 through $($contextChoices.Count), or leave the field blank."
         }
     }
 
@@ -2040,6 +2081,7 @@ try {
     & $OpenCodeExe $ProjectDir
 } finally {
     Pop-Location
+    Reset-TerminalMouse
 
     Remove-Item Env:OPENCODE_CONFIG_CONTENT -ErrorAction SilentlyContinue
     Remove-Item Env:OPENCODE_CONFIG -ErrorAction SilentlyContinue
