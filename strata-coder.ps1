@@ -955,6 +955,36 @@ function Test-StrataConfig([string]$Root) {
     )
 }
 
+function Test-SetupDrift([string]$Root) {
+    $config = Read-Json (Join-Path $Root "strata-$tag.json")
+
+    if (-not $config -or -not $config.args) {
+        return $false
+    }
+
+    $cfgArgs = @($config.args)
+    $currentContext = $null
+    $currentKv = $null
+
+    for ($i = 0; $i -lt $cfgArgs.Count; $i++) {
+        if ("$($cfgArgs[$i])" -eq '--max-context' -and $i + 1 -lt $cfgArgs.Count) {
+            $currentContext = "$($cfgArgs[$i + 1])"
+        } elseif ("$($cfgArgs[$i])" -eq '--kv' -and $i + 1 -lt $cfgArgs.Count) {
+            $currentKv = "$($cfgArgs[$i + 1])"
+        }
+    }
+
+    if ($Context -and $currentContext -ne "$Context") {
+        return $true
+    }
+
+    if ($Kv -and "$currentKv".ToLowerInvariant() -ne "$Kv".ToLowerInvariant()) {
+        return $true
+    }
+
+    return $false
+}
+
 function Get-StrataVersion([string]$Root) {
     if ((Split-Path $Root -Leaf) -match '^strata-(v[\d.]+)$') {
         return $Matches[1]
@@ -1796,17 +1826,43 @@ if ($strataTarget) {
 # Model configuration
 # ----------------------------------------------------------------------------------------------------
 
-if (-not $modelReady) {
-    Write-Step "Setting up $($variant.Title)"
+$configDrift = $false
 
-    $downloadEstimate = if ($ggufDir) {
-        6
+if ($modelReady -and -not $Setup) {
+    $configDrift = Test-SetupDrift $StrataRoot
+
+    if ($configDrift) {
+        Write-Info 'saved setup settings differ from the configured model; reconfiguring'
+    }
+}
+
+if (-not $modelReady -or $Setup -or $configDrift) {
+    $reconfigure = (($Setup -or $configDrift) -and $modelReady)
+
+    if ($reconfigure) {
+        $reason = if ($Setup) { '-Setup' } else { 'saved setup settings' }
+        Write-Step "Reconfiguring $($variant.Title) from $reason"
+
+        if ($serverRunning) {
+            Write-Info 'stopping the running server so the new settings take effect'
+            [void](Stop-StrataServers)
+            $serverRunning = $false
+            $health = $null
+        }
     } else {
-        [math]::Round($variant.DownloadGB + 6)
+        Write-Step "Setting up $($variant.Title)"
     }
 
-    Write-Info "this may download about $downloadEstimate GB and can take a long time"
-    Write-Info 'If interrupted, run the script again; supported downloads resume.'
+    if (-not $reconfigure) {
+        $downloadEstimate = if ($ggufDir) {
+            6
+        } else {
+            [math]::Round($variant.DownloadGB + 6)
+        }
+
+        Write-Info "this may download about $downloadEstimate GB and can take a long time"
+        Write-Info 'If interrupted, run the script again; supported downloads resume.'
+    }
 
     New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 
