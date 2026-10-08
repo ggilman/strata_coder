@@ -12,6 +12,7 @@
     .\strata-coder.ps1 -Stats
     .\strata-coder.ps1 -Setup
     .\strata-coder.ps1 -Launch
+    .\strata-coder.ps1 -Offline
 #>
 
 [CmdletBinding()]
@@ -28,7 +29,8 @@ param(
     [switch]$Update,
     [switch]$Stop,
     [switch]$Stats,
-    [switch]$Setup
+    [switch]$Setup,
+    [switch]$Offline
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,6 +42,7 @@ $ContextSpecified = $PSBoundParameters.ContainsKey('Context')
 $KvSpecified = $PSBoundParameters.ContainsKey('Kv')
 $DataDirSpecified = $PSBoundParameters.ContainsKey('DataDir')
 $PortSpecified = $PSBoundParameters.ContainsKey('Port')
+$OfflineSpecified = $PSBoundParameters.ContainsKey('Offline')
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -598,6 +601,7 @@ function Prompt-SetupParams($Spec) {
     $defaultKv = 'int8'
     $defaultPort = 8080
     $defaultNoLaunch = $false
+    $defaultOffline = $false
 
     if ($saved) {
         try {
@@ -623,6 +627,10 @@ function Prompt-SetupParams($Spec) {
 
         if ($saved.noLaunch -eq $true) {
             $defaultNoLaunch = $true
+        }
+
+        if ($saved.offline -eq $true) {
+            $defaultOffline = $true
         }
     }
 
@@ -881,6 +889,21 @@ function Prompt-SetupParams($Spec) {
         }
     }
 
+    $selectedOffline = $defaultOffline
+
+    if ($Offline) {
+        $selectedOffline = $true
+    } elseif ($OfflineSpecified) {
+        $selectedOffline = $false
+    } else {
+        $defaultAnswer = if ($selectedOffline) { 'y' } else { 'n' }
+        $answer = Read-Host "Stay fully local, block OpenCode web access? (y/n, default $defaultAnswer)"
+
+        if ($answer.Trim() -ne '') {
+            $selectedOffline = ($answer.Trim().ToUpper() -eq 'Y')
+        }
+    }
+
     $config = [ordered]@{
         family   = $selected.Family
         model    = $selected.Model
@@ -889,6 +912,7 @@ function Prompt-SetupParams($Spec) {
         dataDir  = $selectedDataDir
         port     = $selectedPort
         noLaunch = $selectedNoLaunch
+        offline  = $selectedOffline
     }
 
     New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
@@ -1372,6 +1396,10 @@ if ($savedSetup) {
         $NoLaunch = $false
     } elseif (-not $NoLaunch -and ($savedSetup.noLaunch -eq $true)) {
         $NoLaunch = $true
+    }
+
+    if (-not $OfflineSpecified -and ($savedSetup.offline -eq $true)) {
+        $Offline = $true
     }
 }
 
@@ -2243,6 +2271,13 @@ $openCodeConfig = [ordered]@{
     autoupdate        = $false
 }
 
+if ($Offline) {
+    $openCodeConfig['permission'] = [ordered]@{
+        webfetch  = 'deny'
+        websearch = 'deny'
+    }
+}
+
 $openCodeJson = $openCodeConfig | ConvertTo-Json -Depth 10
 
 $oldOpenCodeJson = if (Test-Path -LiteralPath $OpenCodeCfg) {
@@ -2280,6 +2315,11 @@ if ($NoLaunch) {
     Write-Info "server: http://127.0.0.1:$Port/v1"
     Write-Info "OpenCode config: $OpenCodeCfg"
     Write-Info "OpenCode model: strata/$modelId"
+
+    if ($Offline) {
+        Write-Info 'OpenCode web access: blocked (webfetch and websearch denied)'
+    }
+
     Write-Info 'stop the Strata server with: .\strata-coder.ps1 -Stop'
     exit 0
 }
@@ -2298,6 +2338,10 @@ Write-Info "OpenCode config: $OpenCodeCfg"
 Write-Info 'OpenCode provider: strata'
 Write-Info "OpenCode model: strata/$modelId"
 Write-Info "Strata endpoint: http://127.0.0.1:$Port/v1"
+
+if ($Offline) {
+    Write-Info 'OpenCode web access: blocked (webfetch and websearch denied)'
+}
 
 if (-not (Test-Path -LiteralPath $OpenCodeCfg)) {
     Fail "the generated OpenCode configuration file does not exist: $OpenCodeCfg"

@@ -30,6 +30,7 @@ For a permanent shortcut, run `strata-coder --alias`: it detects the calling she
 | `strata-coder -Family coder -Model IQ1_M` | Overrides the automatic model choice |
 | `strata-coder -Context 65536` / `-Port 8081` | Sets the context size and server port |
 | `strata-coder -Kv q4_0` | Sets the KV cache quant: `int8` (default), `k8v4`, or `q4_0` |
+| `strata-coder -Offline` | Blocks OpenCode's web tools; `-Offline:$false` turns the block off |
 | `strata-coder --alias` | Adds the permanent `scode` alias to the calling shell |
 | `strata-coder --help` | Shows all options |
 
@@ -58,11 +59,16 @@ for the port.
    save RAM and let you pick a larger context.
 5. **Server port** — default 8080.
 6. **Open OpenCode after setup?** — yes/no.
+7. **Stay fully local, block OpenCode web access?** — yes/no. On, OpenCode's `webfetch` and `websearch` tools are set to
+   `deny` in its config, so the assistant itself cannot browse the web or search. Combined with the already-disabled
+   autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Note this is a policy inside
+   OpenCode, not a sandbox: its `bash` tool can still run network commands like `curl`. A hard block needs an outbound
+   firewall rule for `opencode.exe`, which requires admin.
 
 The answers are saved to `setup.json` and every later run reuses them. `-Setup` re-asks and re-saves; if the saved
 context or KV cache differs from what the model was configured with, the next run reconfigures the model in place
 (no re-download). The same parameters can also be set without the menu via `-Family`, `-Model`, `-Context`, `-Kv`,
-`-DataDir`, and `-Port`.
+`-DataDir`, `-Port`, and `-Offline`.
 
 ## What it does
 
@@ -73,7 +79,7 @@ context or KV cache differs from what the model was configured with, the next ru
     `%APPDATA%\Strata\settings.json`), an already-prepared model, matching GGUFs in the Hugging Face cache, OpenCode, and a
     server already running. It skips whatever is there.
 3. **Checks disk space** before downloading. Model files go to the folder Strata used before, otherwise to
-   `%USERPROFILE%\ai-models\models`. The setup parameters (model, folder, context, KV cache, port, launch) are saved in
+   `%USERPROFILE%\ai-models\models`. The setup parameters (model, folder, context, KV cache, port, launch, offline) are saved in
    `%LOCALAPPDATA%\strata-coder\setup.json`; `strata-coder -Setup` asks for them again and re-saves the file, and
    every other run reads them to fill in whatever the command line did not decide.
 4. **Installs** Strata, the model, and OpenCode into `%LOCALAPPDATA%\strata-coder\`. If interrupted, run it again and the download resumes.
