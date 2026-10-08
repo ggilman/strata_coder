@@ -13,10 +13,10 @@
        in the folder this script was started from.
 
 .EXAMPLE
-    ai-coder.cmd               # set up whatever is missing, start the server, open OpenCode here
-    ai-coder.cmd -CheckOnly    # report what would happen, change nothing
-    ai-coder.cmd -Update       # move Strata and OpenCode to their newest releases
-    ai-coder.cmd -Stop         # stop the Strata server
+    strata-coder.cmd           # set up whatever is missing, start the server, open OpenCode here
+    strata-coder.cmd -CheckOnly # report what would happen, change nothing
+    strata-coder.cmd -Update    # move Strata and OpenCode to their newest releases
+    strata-coder.cmd -Stop      # stop the Strata server
 #>
 [CmdletBinding()]
 param(
@@ -156,7 +156,7 @@ function Invoke-Download($url, $out) {
 
 function Get-LatestRelease($repo) {
     try { return Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$repo/releases/latest" `
-                                   -Headers @{ 'User-Agent' = 'ai-coder' } }
+                                   -Headers @{ 'User-Agent' = 'strata-coder' } }
     catch { Fail "could not reach GitHub to look up $repo ($($_.Exception.Message))" "check the internet connection and try again" }
 }
 
@@ -349,14 +349,14 @@ if ($variant.Family -eq 'coder' -and -not $Family) {
 }
 
 # ------------------------------------------------------------------------------------------------ one run at a time
-# A second ai-coder started meanwhile waits here, then sees what the first one set up. The lock is released before
+# A second strata-coder started meanwhile waits here, then sees what the first one set up. The lock is released before
 # OpenCode opens, so several OpenCode sessions can share one server.
 $lock = $null
 if (-not $CheckOnly) {
-    $lock = New-Object Threading.Mutex($false, 'Local\ai-coder-setup')
+    $lock = New-Object Threading.Mutex($false, 'Local\strata-coder-setup')
     try {
         if (-not $lock.WaitOne(0)) {
-            Write-Step "Another ai-coder is setting things up: waiting for it to finish (Ctrl+C to give up)"
+            Write-Step "Another strata-coder is setting things up: waiting for it to finish (Ctrl+C to give up)"
             [void]$lock.WaitOne()
         }
     } catch [Threading.AbandonedMutexException] { }   # the other one was killed: the lock is ours now
@@ -703,7 +703,7 @@ if (-not $serverRunning) {
     if (Test-Path -LiteralPath $serverLog) { Move-Item -LiteralPath $serverLog -Destination (Join-Path $LogDir 'server.prev.log') -Force }
     $env:PYTHONUNBUFFERED = '1'
     $env:PYTHONIOENCODING = 'utf-8'
-    # hidden, with everything it prints in logs\server.log (a crash's last words are kept there); ai-coder -Stop ends it
+    # hidden, with everything it prints in logs\server.log (a crash's last words are kept there); strata-coder -Stop ends it
     $cmdArgs = '/d /s /c ""{0}" "{1}" --engine strata --config "{2}" --port {3} > "{4}" 2>&1"' -f `
                $python, (Join-Path $StrataRoot 'serve\server.py'), $cfgPath, $Port, $serverLog
     $proc = Start-Process -FilePath $env:ComSpec -ArgumentList $cmdArgs -WorkingDirectory $StrataRoot -WindowStyle Hidden -PassThru
@@ -721,7 +721,7 @@ if (-not $serverRunning) {
     Write-Step "Waiting for the running Strata server to finish loading"
     if (-not (Wait-StrataReady $null)) {
         Show-LogTail $serverLog
-        Fail "the running Strata server did not become ready within $LoadMinutes minutes." "stop it with: ai-coder -Stop, then run this again"
+        Fail "the running Strata server did not become ready within $LoadMinutes minutes." "stop it with: strata-coder -Stop, then run this again"
     }
 } else {
     Write-Skip "server already running"
@@ -762,7 +762,7 @@ if ($script:TranscriptPath) { try { Stop-Transcript | Out-Null } catch { } }   #
 
 if ($NoLaunch) {
     Write-Step "Ready"
-    Write-Info "server: http://127.0.0.1:$Port/v1  (stop it with: ai-coder -Stop)"
+    Write-Info "server: http://127.0.0.1:$Port/v1  (stop it with: strata-coder -Stop)"
     exit 0
 }
 Write-Step "Opening OpenCode in $ProjectDir"
@@ -772,4 +772,4 @@ try { & $OpenCodeExe $ProjectDir } finally { Pop-Location }
 
 Write-Host ""
 Write-Info "The Strata server is still running (it keeps the model loaded for next time)."
-Write-Info "Stop it with: ai-coder -Stop"
+Write-Info "Stop it with: strata-coder -Stop"
