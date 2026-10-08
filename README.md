@@ -21,6 +21,7 @@ For a permanent shortcut, run `strata-coder --alias`: it detects the calling she
 | `strata-coder` | Sets up whatever is missing, starts the server, and opens OpenCode in the current folder |
 | `strata-coder -CheckOnly` | Shows the specs, the chosen model, disk space, and what is installed. Changes nothing |
 | `strata-coder -NoLaunch` | Sets up and starts the server only |
+| `strata-coder -Launch` | Opens OpenCode even if a previous `-Setup` saved "do not open it" |
 | `strata-coder -Stop` | Stops the Strata server |
 | `strata-coder -Stats` | Shows the live tokens/sec of the running server (Ctrl+C to quit) |
 | `strata-coder -Setup` | Asks for the setup parameters (model, folder, context, port, launch), saves them to `setup.json`, then sets up |
@@ -54,7 +55,8 @@ For a permanent shortcut, run `strata-coder --alias`: it detects the calling she
 6. **Opens OpenCode** in the current folder. Its config is in `%LOCALAPPDATA%\strata-coder\opencode.json`, so nothing is
    written into your project.
 
-The server keeps running after you quit OpenCode, so the next start is instant. Use `strata-coder -Stop` to free the RAM and VRAM.
+When you quit OpenCode, the script stops the Strata server so RAM and VRAM are freed. With `-NoLaunch` the server keeps
+running after the script exits; stop it with `strata-coder -Stop`.
 
 ## Notes
 

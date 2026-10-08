@@ -11,6 +11,7 @@
     .\strata-coder.ps1 -Stop
     .\strata-coder.ps1 -Stats
     .\strata-coder.ps1 -Setup
+    .\strata-coder.ps1 -Launch
 #>
 
 [CmdletBinding()]
@@ -23,6 +24,7 @@ param(
     [string]$DataDir,
     [int]$Port = 8080,
     [switch]$NoLaunch,
+    [switch]$Launch,
     [switch]$Update,
     [switch]$Stop,
     [switch]$Stats,
@@ -31,6 +33,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+$FamilySpecified = $PSBoundParameters.ContainsKey('Family')
+$ModelSpecified = $PSBoundParameters.ContainsKey('Model')
+$ContextSpecified = $PSBoundParameters.ContainsKey('Context')
+$KvSpecified = $PSBoundParameters.ContainsKey('Kv')
+$DataDirSpecified = $PSBoundParameters.ContainsKey('DataDir')
+$PortSpecified = $PSBoundParameters.ContainsKey('Port')
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -466,7 +475,7 @@ function Test-PortInUse([int]$ServerPort) {
 }
 
 function Get-StrataServerProcesses {
-    Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
+    Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction SilentlyContinue |
         Where-Object {
             $_.CommandLine -and
             $_.CommandLine -match 'server\.py' -and
@@ -482,8 +491,16 @@ function Get-ServerPort($Process) {
     return 8080
 }
 
-function Stop-StrataServers {
+function Stop-StrataServers([int]$OnPort = 0) {
     $processes = @(Get-StrataServerProcesses)
+
+    if ($OnPort -gt 0) {
+        $processes = @(
+            $processes | Where-Object {
+                (Get-ServerPort $_) -eq $OnPort
+            }
+        )
+    }
 
     foreach ($process in $processes) {
         [void](Invoke-Native taskkill.exe @('/T', '/F', '/PID', $process.ProcessId))
@@ -555,7 +572,9 @@ function Prompt-SetupParams($Spec) {
 
     $defaultDataDir = $null
 
-    if ($saved -and $saved.dataDir) {
+    if ($DataDirSpecified -and $DataDir) {
+        $defaultDataDir = $DataDir
+    } elseif ($saved -and $saved.dataDir) {
         $defaultDataDir = $saved.dataDir
     }
 
@@ -605,6 +624,18 @@ function Prompt-SetupParams($Spec) {
         if ($saved.noLaunch -eq $true) {
             $defaultNoLaunch = $true
         }
+    }
+
+    if ($ContextSpecified) {
+        $defaultContext = $Context
+    }
+
+    if ($KvSpecified) {
+        $defaultKv = $Kv
+    }
+
+    if ($PortSpecified) {
+        $defaultPort = $Port
     }
 
     $selected = $null
@@ -692,7 +723,7 @@ function Prompt-SetupParams($Spec) {
 
     $selectedDataDir = $defaultDataDir
 
-    if (-not $DataDir) {
+    if (-not $DataDirSpecified) {
         $answer = Read-Host "Model folder [$defaultDataDir]"
 
         if ($answer.Trim() -ne '') {
@@ -703,7 +734,7 @@ function Prompt-SetupParams($Spec) {
     $contextChoices = @(4096, 8192, 16384, 32768, 65536, 131072, 262144)
     $selectedContext = $defaultContext
 
-    if (-not $Context) {
+    if (-not $ContextSpecified) {
         $contextNumber = 0
 
         foreach ($tokens in $contextChoices) {
@@ -758,7 +789,7 @@ function Prompt-SetupParams($Spec) {
     }
     $selectedKv = $defaultKv
 
-    if (-not $Kv) {
+    if (-not $KvSpecified) {
         $kvNumber = 0
 
         foreach ($opt in $kvChoices) {
@@ -809,7 +840,7 @@ function Prompt-SetupParams($Spec) {
 
     $selectedPort = $defaultPort
 
-    if ($Port -eq 8080) {
+    if (-not $PortSpecified) {
         while ($true) {
             $answer = Read-Host "Server port [$defaultPort]"
 
@@ -837,7 +868,9 @@ function Prompt-SetupParams($Spec) {
     # "no, do not open it" => noLaunch = true
     $selectedNoLaunch = $defaultNoLaunch
 
-    if ($NoLaunch) {
+    if ($Launch) {
+        $selectedNoLaunch = $false
+    } elseif ($NoLaunch) {
         $selectedNoLaunch = $true
     } else {
         $defaultAnswer = if ($selectedNoLaunch) { 'n' } else { 'y' }
@@ -1309,7 +1342,7 @@ if ($savedSetup) {
         $Model = $savedSetup.model
     }
 
-    if (-not $Context) {
+    if (-not $ContextSpecified) {
         try {
             if ($null -ne $savedSetup.context) {
                 $Context = [int]$savedSetup.context
@@ -1318,15 +1351,15 @@ if ($savedSetup) {
         }
     }
 
-    if (-not $Kv -and $savedSetup.kv) {
+    if (-not $KvSpecified -and $savedSetup.kv) {
         $Kv = [string]$savedSetup.kv
     }
 
-    if (-not $DataDir -and $savedSetup.dataDir) {
+    if (-not $DataDirSpecified -and $savedSetup.dataDir) {
         $DataDir = $savedSetup.dataDir
     }
 
-    if ($Port -eq 8080) {
+    if (-not $PortSpecified) {
         try {
             if ($savedSetup.port) {
                 $Port = [int]$savedSetup.port
@@ -1335,7 +1368,9 @@ if ($savedSetup) {
         }
     }
 
-    if (-not $NoLaunch -and ($savedSetup.noLaunch -eq $true)) {
+    if ($Launch) {
+        $NoLaunch = $false
+    } elseif (-not $NoLaunch -and ($savedSetup.noLaunch -eq $true)) {
         $NoLaunch = $true
     }
 }
@@ -1348,8 +1383,24 @@ $variant = @(
     }
 ) | Select-Object -First 1
 
+if (-not $variant -and -not ($FamilySpecified -or $ModelSpecified)) {
+    $variant = @(
+        $Variants | Where-Object {
+            $spec.RamGB -ge $_.MinRamGB
+        }
+    ) | Select-Object -First 1
+
+    if ($variant) {
+        Write-Warn "the saved variant no longer fits this PC's RAM; switching to $($variant.Title)"
+    }
+}
+
 if (-not $variant) {
-    $smallest = $candidates | Sort-Object MinRamGB | Select-Object -First 1
+    $smallest = if ($FamilySpecified -or $ModelSpecified) {
+        @($candidates) | Sort-Object MinRamGB | Select-Object -First 1
+    } else {
+        @($Variants) | Sort-Object MinRamGB | Select-Object -First 1
+    }
 
     $message = (
         '{0}/{1} needs about {2} GB RAM; this PC has {3} GB.' -f
@@ -1359,7 +1410,7 @@ if (-not $variant) {
         $spec.RamGB
     )
 
-    if ($Family -or $Model) {
+    if ($FamilySpecified -or $ModelSpecified) {
         Fail "the requested variant will not run properly here: $message" `
             'Run without -Family or -Model to select a fitting variant automatically.'
     }
@@ -1566,9 +1617,8 @@ if ($DataDir) {
 $ggufDir = $null
 
 if (-not $modelReady) {
-    $shards = 1..2 | ForEach-Object {
-        "Qwen3.8-Flash-Next-GSQ-RCO-$($variant.Model)-0000$_-of-00002.gguf"
-    }
+    $shardFilter = ('*{0}*00001-of-*.gguf' -f $variant.Model)
+    $anyShardFilter = ('*{0}*-of-*.gguf' -f $variant.Model)
 
     $hfHub = if ($env:HF_HUB_CACHE) {
         $env:HF_HUB_CACHE
@@ -1583,23 +1633,35 @@ if (-not $modelReady) {
     )
 
     if (Test-Path -LiteralPath (Join-Path $repoDir 'snapshots')) {
-        $ggufDir = Get-ChildItem `
-            -LiteralPath (Join-Path $repoDir 'snapshots') `
-            -Directory `
-            -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                Join-Path $_.FullName $variant.Model
-            } |
-            Where-Object {
-                $candidate = $_
+        $ggufDir = @(
+            Get-ChildItem `
+                -LiteralPath (Join-Path $repoDir 'snapshots') `
+                -Directory `
+                -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    @($_.FullName, (Join-Path $_.FullName $variant.Model))
+                }
+        ) | Where-Object {
+            $candidate = $_
 
+            (
                 @(
-                    $shards | Where-Object {
-                        Test-Path -LiteralPath (Join-Path $candidate $_)
-                    }
-                ).Count -eq $shards.Count
-            } |
-            Select-Object -First 1
+                    Get-ChildItem `
+                        -LiteralPath $candidate `
+                        -File `
+                        -Filter $shardFilter `
+                        -ErrorAction SilentlyContinue
+                ).Count -ge 1
+            ) -and (
+                @(
+                    Get-ChildItem `
+                        -LiteralPath $candidate `
+                        -File `
+                        -Filter $anyShardFilter `
+                        -ErrorAction SilentlyContinue
+                ).Count -ge 2
+            )
+        } | Select-Object -First 1
     }
 
     if (-not $ggufDir -and (Test-Path -LiteralPath $DataDir)) {
@@ -1607,13 +1669,19 @@ if (-not $modelReady) {
             -LiteralPath $DataDir `
             -Recurse `
             -File `
-            -Filter $shards[0] `
+            -Filter $shardFilter `
             -ErrorAction SilentlyContinue |
             Select-Object -First 1
 
         if (
             $firstShard -and
-            (Test-Path -LiteralPath (Join-Path $firstShard.DirectoryName $shards[1]))
+            @(
+                Get-ChildItem `
+                    -LiteralPath $firstShard.DirectoryName `
+                    -File `
+                    -Filter $anyShardFilter `
+                    -ErrorAction SilentlyContinue
+            ).Count -ge 2
         ) {
             $ggufDir = $firstShard.DirectoryName
         }
@@ -2272,6 +2340,6 @@ try {
 
 Write-Step 'Stopping the Strata server'
 
-if ((Stop-StrataServers) -eq 0) {
+if ((Stop-StrataServers $Port) -eq 0) {
     Write-Skip 'no Strata server process was found'
 }
