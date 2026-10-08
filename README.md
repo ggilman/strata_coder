@@ -23,6 +23,7 @@ For a permanent shortcut, run `strata-coder --alias`: it detects the calling she
 | `strata-coder -NoLaunch` | Sets up and starts the server only |
 | `strata-coder -Stop` | Stops the Strata server |
 | `strata-coder -Stats` | Shows the live tokens/sec of the running server (Ctrl+C to quit) |
+| `strata-coder -Setup` | Asks for the setup parameters (model, folder, context, port, launch), saves them to `setup.json`, then sets up |
 | `strata-coder -DataDir E:\models` | Puts the model files somewhere specific |
 | `strata-coder -Family coder -Model IQ1_M` | Overrides the automatic model choice |
 | `strata-coder -Context 65536` / `-Port 8081` | Sets the context size and server port |
@@ -35,7 +36,8 @@ For a permanent shortcut, run `strata-coder --alias`: it detects the calling she
 
     | RAM | Variant | Download |
     |---|---|---|
-    | 64 GB | Qwen3.8-Flash-Next IQ3_XXS | ~76 GB |
+    | 64 GB | Qwen3.8-Flash-Next IQ3_S | ~84 GB |
+    | 60 GB | Qwen3.8-Flash-Next IQ3_XXS | ~76 GB |
     | 48 GB | Qwen3.8-Flash-Next IQ2_XS | ~68 GB |
     | 32 GB | Qwen3.8-Flash-Next **Coder** IQ1_M | ~58 GB |
     | less | Stops: the PC can't run any variant properly | |
@@ -44,11 +46,13 @@ For a permanent shortcut, run `strata-coder --alias`: it detects the calling she
     `%APPDATA%\Strata\settings.json`), an already-prepared model, matching GGUFs in the Hugging Face cache, OpenCode, and a
     server already running. It skips whatever is there.
 3. **Checks disk space** before downloading. Model files go to the folder Strata used before, otherwise to
-    `<drive with most free space>:\ai-coder-models`.
-4. **Installs** Strata, the model, and OpenCode into `%LOCALAPPDATA%\ai-coder\`. If interrupted, run it again and the download resumes.
-5. **Starts the server** hidden on `http://127.0.0.1:8080/v1`, with its output in `%LOCALAPPDATA%\ai-coder\logs\server.log`. The server is OpenAI- and Anthropic-compatible. Each run also keeps a transcript in `logs\run-*.log`. A fresh install uses the tested Strata release (v0.1.40.3); `strata-coder -Update` moves Strata and OpenCode to their newest releases and keeps the old Strata if the new one fails to set up.
-6. **Opens OpenCode** in the current folder. Its config is in `%LOCALAPPDATA%\ai-coder\opencode.json`, so nothing is
-    written into your project.
+   `%USERPROFILE%\ai-models\models`. The setup parameters (model, folder, context, port, launch) are saved in
+   `%LOCALAPPDATA%\strata-coder\setup.json`; `strata-coder -Setup` asks for them again and re-saves the file, and
+   every other run reads them to fill in whatever the command line did not decide.
+4. **Installs** Strata, the model, and OpenCode into `%LOCALAPPDATA%\strata-coder\`. If interrupted, run it again and the download resumes.
+5. **Starts the server** hidden on `http://127.0.0.1:8080/v1`, with its output in `%LOCALAPPDATA%\strata-coder\logs\server.log`. The server is OpenAI- and Anthropic-compatible. Each run also keeps a transcript in `logs\run-*.log`. A fresh install uses the tested Strata release (v0.1.40.3); `strata-coder -Update` moves Strata and OpenCode to their newest releases and keeps the old Strata if the new one fails to set up.
+6. **Opens OpenCode** in the current folder. Its config is in `%LOCALAPPDATA%\strata-coder\opencode.json`, so nothing is
+   written into your project.
 
 The server keeps running after you quit OpenCode, so the next start is instant. Use `strata-coder -Stop` to free the RAM and VRAM.
 

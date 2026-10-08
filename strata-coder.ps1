@@ -6,7 +6,7 @@
 .DESCRIPTION
     1. Checks this PC (NVIDIA GPU, VRAM, driver, RAM, CPU) and picks the best Qwen3.8-Flash-Next variant
        it can run. If none fits, it says so and stops.
-    2. Looks for what already exists (Strata install, configured model, model files, HF cache, OpenCode,
+    2. Looks for what already exists (Strata install, configured model, already-downloaded model files, OpenCode,
        a running server) and skips those steps.
     3. Makes sure the disk has room for the model before downloading anything.
     4. Installs Strata, the model and OpenCode as needed, starts the Strata server and opens OpenCode
@@ -17,6 +17,7 @@
     strata-coder.cmd -CheckOnly # report what would happen, change nothing
     strata-coder.cmd -Update    # move Strata and OpenCode to their newest releases
     strata-coder.cmd -Stop      # stop the Strata server
+    strata-coder.cmd -Setup     # ask for the setup parameters, save them to setup.json, then set up
 #>
 [CmdletBinding()]
 param(
@@ -24,12 +25,13 @@ param(
     [ValidateSet('qwen', 'coder')][string]$Family,
     [string]$Model,                             # e.g. IQ2_XS; with -Family, overrides the automatic choice
     [int]$Context,                              # context tokens; default: Strata's recommendation for this PC
-    [string]$DataDir,                           # where the model files go (default: earlier choice, else roomiest drive)
+    [string]$DataDir,                           # where the model files go (default: earlier choice, else %USERPROFILE%\ai-models\models)
     [int]$Port = 8080,
     [switch]$NoLaunch,                          # set up and start the server, but do not open OpenCode
     [switch]$Update,                            # move Strata and OpenCode to their newest releases
     [switch]$Stop,                              # stop the Strata server
-    [switch]$Stats                              # live tokens/sec of the running server (Ctrl+C to quit)
+    [switch]$Stats,                            # live tokens/sec of the running server (Ctrl+C to quit)
+    [switch]$Setup                            # ask for the setup parameters, save them to setup.json, then set up
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,11 +40,12 @@ $ProgressPreference = 'SilentlyContinue'        # Invoke-WebRequest is very slow
 
 $ProjectDir = (Get-Location).ProviderPath       # the folder OpenCode works on
 
-$AppDir      = Join-Path $env:LOCALAPPDATA 'ai-coder'
+$AppDir      = Join-Path $env:LOCALAPPDATA 'strata-coder'
 $OpenCodeDir = Join-Path $AppDir 'opencode'
 $OpenCodeExe = Join-Path $OpenCodeDir 'opencode.exe'
 $OpenCodeCfg = Join-Path $AppDir 'opencode.json'
 $StatePath   = Join-Path $AppDir 'state.json'
+$SetupPath   = Join-Path $AppDir 'setup.json'
 $DownloadDir = Join-Path $AppDir 'downloads'
 $LogDir      = Join-Path $AppDir 'logs'
 $UnpackDir   = Join-Path $AppDir 'strata-unpack'
@@ -55,8 +58,11 @@ $PinnedStrata = 'v0.1.40.3'
 # Variants this script will pick, best first. Sizes are from Strata's setup.py (MODELS); MinRamGB sits ~2 GB
 # under Strata's stated requirement because e.g. 32 GB of RAM reports as ~31.4 GB.
 $Variants = @(
+    @{ Family = 'qwen';  Model = 'IQ3_S';   MinRamGB = 60; DownloadGB = 83.6; ArenaGB = 50.3
+       Title = 'Qwen3.8-Flash-Next IQ3_S (3.5-bit, best quality, slowest; needs ~62 GB of RAM)'
+       Repo = 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF' }
     @{ Family = 'qwen';  Model = 'IQ3_XXS'; MinRamGB = 58; DownloadGB = 75.8; ArenaGB = 42.9
-       Title = 'Qwen3.8-Flash-Next IQ3_XXS (3-bit, best quality that fits 64 GB)'
+       Title = 'Qwen3.8-Flash-Next IQ3_XXS (3-bit, the pick when IQ3_S is too tight)'
        Repo = 'ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF' }
     @{ Family = 'qwen';  Model = 'IQ2_XS';  MinRamGB = 46; DownloadGB = 68.0; ArenaGB = 35.5
        Title = 'Qwen3.8-Flash-Next IQ2_XS (2-bit, Strata''s recommended size for 48-64 GB)'
@@ -210,6 +216,104 @@ function Show-LogTail($path, $lines = 25) {
     }
 }
 
+# Ask for the setup parameters and save them to setup.json. The values this run would use anyway are the defaults, so
+# Enter keeps them. Only -Setup calls this (never with -CheckOnly); ordinary runs just read the saved file.
+function Prompt-SetupParams($spec) {
+    $saved = Read-Json $SetupPath
+
+    # model folder default: the saved one, else the folder Strata used before, else the user's own models folder
+    $defDir = $null
+    if ($saved -and $saved.dataDir) { $defDir = $saved.dataDir }
+    if (-not $defDir) {
+        $st = Read-Json $StrataSettingsPath
+        if ($st -and $st.data_dir -and (Test-Path -LiteralPath $st.data_dir)) { $defDir = $st.data_dir }
+    }
+    if (-not $defDir) { $defDir = Join-Path $env:USERPROFILE 'ai-models\models' }
+
+    $defCtx = 0
+    $defPort = 8080
+    if ($saved) {
+        try { if ($saved.context) { $defCtx = [int]$saved.context } } catch { }
+        try { if ($saved.port) { $defPort = [int]$saved.port } } catch { }
+    }
+    $defLaunch = if ($saved -and ($saved.noLaunch -eq $true)) { $true } else { $false }
+
+    $defVariant = $null
+    if ($saved -and $saved.family -and $saved.model) {
+        $defVariant = @($Variants | Where-Object { $_.Family -eq $saved.family -and $_.Model -eq $saved.model }) | Select-Object -First 1
+    }
+    if (-not $defVariant) { $defVariant = @($Variants | Where-Object { $spec.RamGB -ge $_.MinRamGB }) | Select-Object -First 1 }
+
+    Write-Step "Asking for the setup parameters (Enter keeps the default shown)"
+
+    # the variant, unless the command line already chose one
+    $sel = $defVariant
+    if (-not ($Family -or $Model)) {
+        $n = 0
+        foreach ($v in $Variants) {
+            $n++
+            Write-Info ("  {0}. {1}  (needs {2} GB of RAM)" -f $n, $v.Title, $v.MinRamGB)
+        }
+        Write-Info "  default: {0}. {1}" -f ($Variants.IndexOf($defVariant) + 1), $defVariant.Title
+        while (-not $sel) {
+            $ans = Read-Host "Variant"
+            if ($ans.Trim() -eq '') { $sel = $defVariant }
+            else {
+                $idx = 0
+                if ([int]::TryParse($ans.Trim(), [ref]$idx) -and $idx -ge 1 -and $idx -le $Variants.Count) { $sel = $Variants[$idx - 1] }
+                else { $sel = @($Variants | Where-Object { $_.Model.ToUpper() -eq $ans.Trim().ToUpper() }) | Select-Object -First 1 }
+            }
+        }
+    }
+
+    $dir = $defDir
+    if (-not $DataDir) {
+        $ans = Read-Host "Model folder [$defDir]"
+        if ($ans.Trim() -ne '') { $dir = [IO.Path]::GetFullPath($ans.Trim()) }
+    }
+
+    $ctx = $defCtx
+    if (-not $Context) {
+        while ($true) {
+            $ans = Read-Host "Context tokens [0 = Strata's recommendation]"
+            if ($ans.Trim() -eq '') { break }
+            $n = 0
+            if ([int]::TryParse($ans.Trim(), [ref]$n) -and $n -ge 0) { $ctx = $n; break }
+            Write-Warn "enter a whole number of tokens, or leave it blank for the default"
+        }
+    }
+
+    $port = $defPort
+    if ($Port -eq 8080) {
+        while ($true) {
+            $ans = Read-Host "Server port [$defPort]"
+            if ($ans.Trim() -eq '') { break }
+            $n = 0
+            if ([int]::TryParse($ans.Trim(), [ref]$n) -and $n -ge 1 -and $n -le 65535) { $port = $n; break }
+            Write-Warn "enter a port number (1-65535), or leave it blank for the default"
+        }
+    }
+
+    $launch = $defLaunch
+    if (-not $NoLaunch) {
+        $ans = Read-Host ("Open OpenCode after setup? (y/n, default {0})" -f (if ($defLaunch) { 'y' } else { 'n' }))
+        if ($ans.Trim() -ne '') { $launch = ($ans.Trim().ToUpper() -eq 'Y') }
+    }
+
+    $cfg = [ordered]@{
+        family   = $sel.Family
+        model    = $sel.Model
+        context  = $ctx
+        dataDir  = $dir
+        port     = $port
+        noLaunch = $launch
+    }
+    New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
+    Write-Utf8File $SetupPath ($cfg | ConvertTo-Json -Depth 5)
+    Write-Ok "setup saved to $SetupPath"
+    return $cfg
+}
+
 # ------------------------------------------------------------------------------------------------ -Stop
 if ($Stop) {
     Write-Step "Stopping the Strata server"
@@ -333,6 +437,19 @@ if ($spec.Gpu.ComputeCap -lt $MinComputeCap) {
 }
 if ($spec.Avx2 -eq $false) { Write-Warn "this CPU has no AVX2: Strata runs, but slowly" }
 
+# saved setup parameters (setup.json) fill in whatever the command line did not decide; -Setup asks for them
+# first and re-saves the file
+$cfg = Read-Json $SetupPath
+if ($Setup -and -not $CheckOnly) { $cfg = Prompt-SetupParams $spec }
+if ($cfg) {
+    if (-not $Family -and $cfg.family) { $Family = $cfg.family }
+    if (-not $Model -and $cfg.model) { $Model = $cfg.model }
+    if (-not $Context) { try { if ($cfg.context) { $Context = [int]$cfg.context } } catch { } }
+    if (-not $DataDir -and $cfg.dataDir) { $DataDir = $cfg.dataDir }
+    if ($Port -eq 8080) { try { if ($cfg.port) { $Port = [int]$cfg.port } } catch { } }
+    if (-not $NoLaunch -and ($cfg.noLaunch -eq $true)) { $NoLaunch = $true }
+}
+
 $candidates = @(Get-Candidates)
 $variant = $candidates | Where-Object { $spec.RamGB -ge $_.MinRamGB } | Select-Object -First 1
 if (-not $variant) {
@@ -407,21 +524,6 @@ if (-not $strataPresent) {
     else { Write-Ok "Strata is up to date ($latest)" }
 }
 
-# GGUF files already in the Hugging Face cache: handed to Strata instead of downloading again
-$ggufDir = $null
-if (-not $modelReady) {
-    $hfHub = if ($env:HF_HUB_CACHE) { $env:HF_HUB_CACHE } elseif ($env:HF_HOME) { Join-Path $env:HF_HOME 'hub' } `
-             else { Join-Path $env:USERPROFILE '.cache\huggingface\hub' }
-    $repoDir = Join-Path $hfHub ('models--' + ($variant.Repo -replace '/', '--'))
-    $shards = 1..2 | ForEach-Object { "Qwen3.8-Flash-Next-GSQ-RCO-$($variant.Model)-0000$_-of-00002.gguf" }
-    if (Test-Path -LiteralPath (Join-Path $repoDir 'snapshots')) {
-        $ggufDir = Get-ChildItem -LiteralPath (Join-Path $repoDir 'snapshots') -Directory | ForEach-Object {
-            Join-Path $_.FullName $variant.Model } | Where-Object {
-            $d = $_; @($shards | Where-Object { Test-Path -LiteralPath (Join-Path $d $_) }).Count -eq 2 } |
-            Select-Object -First 1
-    }
-    if ($ggufDir) { Write-Ok "model files found in the Hugging Face cache: $ggufDir" }
-}
 
 $openCodePresent = $false
 $ocVersion = $null
@@ -472,10 +574,30 @@ if ($DataDir) {
     $DataDir = $knownDataDir
     Write-Info "using the model folder Strata used before"
 } else {
-    # the local drive with the most free space
-    $best = [IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } |
-            Sort-Object AvailableFreeSpace -Descending | Select-Object -First 1
-    $DataDir = Join-Path $best.RootDirectory.FullName 'ai-coder-models'
+    # the user's own models folder
+    $DataDir = Join-Path $env:USERPROFILE 'ai-models\models'
+}
+
+# GGUF files that already exist: handed to Strata instead of downloading. Looked for in the Hugging
+# Face cache (what its own downloader writes), then in the model folder (where a hand download is).
+$ggufDir = $null
+if (-not $modelReady) {
+    $shards = 1..2 | ForEach-Object { "Qwen3.8-Flash-Next-GSQ-RCO-$($variant.Model)-0000$_-of-00002.gguf" }
+    $hfHub = if ($env:HF_HUB_CACHE) { $env:HF_HUB_CACHE } elseif ($env:HF_HOME) { Join-Path $env:HF_HOME 'hub' } `
+             else { Join-Path $env:USERPROFILE '.cache\huggingface\hub' }
+    $repoDir = Join-Path $hfHub ('models--' + ($variant.Repo -replace '/', '--'))
+    if (Test-Path -LiteralPath (Join-Path $repoDir 'snapshots')) {
+        $ggufDir = Get-ChildItem -LiteralPath (Join-Path $repoDir 'snapshots') -Directory | ForEach-Object {
+            Join-Path $_.FullName $variant.Model } | Where-Object {
+            $d = $_; @($shards | Where-Object { Test-Path -LiteralPath (Join-Path $d $_) }).Count -eq $shards.Count } |
+            Select-Object -First 1
+    }
+    if (-not $ggufDir -and (Test-Path -LiteralPath $DataDir)) {
+        # a manual download: the first shard anywhere in the model folder, the second must sit beside it
+        $first = Get-ChildItem -LiteralPath $DataDir -Recurse -File -Filter $shards[0] -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($first -and (Test-Path -LiteralPath (Join-Path $first.DirectoryName $shards[1]))) { $ggufDir = $first.DirectoryName }
+    }
+    if ($ggufDir) { Write-Ok "model files already downloaded: $ggufDir" }
 }
 
 $needGB = 0
@@ -499,7 +621,7 @@ Write-Info "model folder: $DataDir ($freeGB GB free, $needGB GB needed)"
 if ($freeGB -lt $needGB) {
     $alt = [IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady -and
             ($_.AvailableFreeSpace / 1GB) -ge $needGB } | ForEach-Object { $_.Name }
-    $hint = if ($alt) { "run again with -DataDir on a drive with room, e.g. -DataDir $($alt[0])ai-coder-models" }
+    $hint = if ($alt) { "run again with -DataDir on a drive with room, e.g. -DataDir $($alt[0])\ai-models\models" }
             else { "free up space (no local drive has $needGB GB free)" }
     Fail "not enough disk space: $needGB GB needed in $DataDir, $freeGB GB free." $hint
 }
@@ -513,7 +635,7 @@ if ($CheckOnly) {
     $strataLine = if (-not $strataPresent) { "would be installed ($PinnedStrata)" }
                   elseif ($strataTarget) { "would be updated to $strataTarget" } else { "installed ($strataVersion)" }
     Write-Info "Strata:   $strataLine"
-    Write-Info "Model:    $(if ($modelReady) { 'ready' } elseif ($ggufDir) { 'would be set up from the HF cache' } else { "would be downloaded (~$($variant.DownloadGB) GB)" })"
+    Write-Info "Model:    $(if ($modelReady) { 'ready' } elseif ($ggufDir) { 'would be set up from files already downloaded' } else { "would be downloaded (~$($variant.DownloadGB) GB)" })"
     Write-Info "OpenCode: $(if ($openCodeRelease) { "would be updated to $($openCodeRelease.tag_name)" } elseif ($openCodePresent) { 'installed' } else { 'would be installed' })"
     Write-Info "Server:   $(if ($serverRunning) { "running on port $Port" } else { "would be started on port $Port" })"
     Write-Info "Project:  $ProjectDir"
@@ -560,8 +682,10 @@ function Invoke-StrataSetup($root, $argList) {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
-    $psi.EnvironmentVariables['PYTHONUNBUFFERED'] = '1'
-    $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
+    # the child inherits this process's environment (as the server start below does); on Windows
+    # PowerShell 5.1 ProcessStartInfo.EnvironmentVariables has no dictionary to index into
+    $env:PYTHONUNBUFFERED = '1'
+    $env:PYTHONIOENCODING = 'utf-8'
     $p = [Diagnostics.Process]::Start($psi)
     $lastProgress = [DateTime]::MinValue
     while ($null -ne ($line = $p.StandardOutput.ReadLine())) {
