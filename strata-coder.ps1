@@ -779,6 +779,162 @@ function Get-SystemSpec {
 }
 
 # ----------------------------------------------------------------------------------------------------
+# Installation detection and setup helpers
+# ----------------------------------------------------------------------------------------------------
+
+function Test-StrataConfig([string]$Root) {
+    $config = Read-Json (Join-Path $Root "strata-$tag.json")
+
+    if (-not $config -or -not $config.exe) {
+        return $false
+    }
+
+    return (
+        (Test-Path -LiteralPath $config.exe) -and
+        (Test-Path -LiteralPath (Join-Path $Root '.venv\Scripts\python.exe'))
+    )
+}
+
+function Get-StrataVersion([string]$Root) {
+    if ((Split-Path $Root -Leaf) -match '^strata-(v[\d.]+)$') {
+        return $Matches[1]
+    }
+
+    if ($state -and $state.StrataRoot -eq $Root -and $state.StrataVersion) {
+        return $state.StrataVersion
+    }
+
+    return 'unknown'
+}
+
+function Install-StrataCode([string]$Version) {
+    $destination = Join-Path $AppDir "strata-$Version"
+
+    if (Test-Path -LiteralPath (Join-Path $destination 'setup.py')) {
+        return $destination
+    }
+
+    $zip = Join-Path $DownloadDir "strata-$Version.zip"
+
+    Invoke-Download `
+        "https://github.com/Niko1221/Strata/archive/refs/tags/$Version.zip" `
+        $zip
+
+    Remove-Item -LiteralPath $UnpackDir -Recurse -Force -ErrorAction SilentlyContinue
+
+    try {
+        Expand-Archive -LiteralPath $zip -DestinationPath $UnpackDir
+    } catch {
+        Remove-Item -LiteralPath $zip, $UnpackDir -Recurse -Force -ErrorAction SilentlyContinue
+
+        Fail "the Strata archive is damaged ($($_.Exception.Message)); it was removed." `
+            'Run the script again to download a fresh copy.'
+    }
+
+    $inner = Get-ChildItem -LiteralPath $UnpackDir -Directory | Select-Object -First 1
+
+    if (
+        -not $inner -or
+        -not (Test-Path -LiteralPath (Join-Path $inner.FullName 'setup.py')) -or
+        -not (Test-Path -LiteralPath (Join-Path $inner.FullName 'START-HERE.bat'))
+    ) {
+        Remove-Item -LiteralPath $zip, $UnpackDir -Recurse -Force -ErrorAction SilentlyContinue
+
+        Fail "the Strata $Version archive does not contain expected setup files." `
+            'Run the script again. If it repeats, verify the Strata release.'
+    }
+
+    Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
+
+    Move-Item -LiteralPath $inner.FullName -Destination $destination
+
+    Remove-Item -LiteralPath $UnpackDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+
+    return $destination
+}
+
+function Invoke-StrataSetup([string]$Root, [string[]]$ArgumentList) {
+    $quotedArguments = (
+        $ArgumentList | ForEach-Object {
+            if ("$_" -match '\s') {
+                "`"$_`""
+            } else {
+                "$_"
+            }
+        }
+    ) -join ' '
+
+    $processInfo = New-Object Diagnostics.ProcessStartInfo
+
+    $processInfo.FileName = $env:ComSpec
+    $processInfo.Arguments = '/d /s /c ""' +
+        (Join-Path $Root 'START-HERE.bat') +
+        '" ' +
+        $quotedArguments +
+        ' < NUL 2>&1"'
+
+    $processInfo.WorkingDirectory = $Root
+    $processInfo.UseShellExecute = $false
+    $processInfo.RedirectStandardOutput = $true
+    $processInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+
+    $env:PYTHONUNBUFFERED = '1'
+    $env:PYTHONIOENCODING = 'utf-8'
+
+    $process = [Diagnostics.Process]::Start($processInfo)
+    $lastProgress = [DateTime]::MinValue
+
+    while ($null -ne ($line = $process.StandardOutput.ReadLine())) {
+        if ($line -match 'has to be compiled|Install them now\?|Windows will ask for permission') {
+            [void](Invoke-Native taskkill.exe @('/T', '/F', '/PID', $process.Id))
+
+            Fail 'Strata has no ready-made engine for this GPU and is requesting build tools that require administrator rights.' `
+                "On a system where you have administrator rights, run $Root\START-HERE.bat manually."
+        }
+
+        if ($line -match '\d+%\|' -or $line -match '[\d.]+\s*[MG]B/s') {
+            if (((Get-Date) - $lastProgress).TotalSeconds -lt 5) {
+                continue
+            }
+
+            $lastProgress = Get-Date
+        }
+
+        if ($line.Trim()) {
+            Write-Host "    | $line"
+        }
+    }
+
+    $process.WaitForExit()
+
+    return $process.ExitCode
+}
+
+function Get-SetupArgs {
+    $arguments = @(
+        '--family', $variant.Family,
+        '--model', $variant.Model,
+        '--vision', 'no',
+        '--data-dir', $DataDir,
+        '--port', $Port,
+        '--no-browser',
+        '--no-start',
+        '--yes'
+    )
+
+    if ($Context) {
+        $arguments += @('--context', $Context)
+    }
+
+    if ($ggufDir) {
+        $arguments += @('--gguf-dir', $ggufDir)
+    }
+
+    return $arguments
+}
+
+# ----------------------------------------------------------------------------------------------------
 # Stop and statistics modes
 # ----------------------------------------------------------------------------------------------------
 
@@ -1049,31 +1205,6 @@ Write-Step 'Looking for existing installations'
 
 $strataSettings = Read-Json $StrataSettingsPath
 $state = Read-Json $StatePath
-
-function Test-StrataConfig([string]$Root) {
-    $config = Read-Json (Join-Path $Root "strata-$tag.json")
-
-    if (-not $config -or -not $config.exe) {
-        return $false
-    }
-
-    return (
-        (Test-Path -LiteralPath $config.exe) -and
-        (Test-Path -LiteralPath (Join-Path $Root '.venv\Scripts\python.exe'))
-    )
-}
-
-function Get-StrataVersion([string]$Root) {
-    if ((Split-Path $Root -Leaf) -match '^strata-(v[\d.]+)$') {
-        return $Matches[1]
-    }
-
-    if ($state -and $state.StrataRoot -eq $Root -and $state.StrataVersion) {
-        return $state.StrataVersion
-    }
-
-    return 'unknown'
-}
 
 $roots = @()
 
@@ -1423,133 +1554,6 @@ New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
 # ----------------------------------------------------------------------------------------------------
 # Strata installation
 # ----------------------------------------------------------------------------------------------------
-
-function Install-StrataCode([string]$Version) {
-    $destination = Join-Path $AppDir "strata-$Version"
-
-    if (Test-Path -LiteralPath (Join-Path $destination 'setup.py')) {
-        return $destination
-    }
-
-    $zip = Join-Path $DownloadDir "strata-$Version.zip"
-
-    Invoke-Download `
-        "https://github.com/Niko1221/Strata/archive/refs/tags/$Version.zip" `
-        $zip
-
-    Remove-Item -LiteralPath $UnpackDir -Recurse -Force -ErrorAction SilentlyContinue
-
-    try {
-        Expand-Archive -LiteralPath $zip -DestinationPath $UnpackDir
-    } catch {
-        Remove-Item -LiteralPath $zip, $UnpackDir -Recurse -Force -ErrorAction SilentlyContinue
-
-        Fail "the Strata archive is damaged ($($_.Exception.Message)); it was removed." `
-            'Run the script again to download a fresh copy.'
-    }
-
-    $inner = Get-ChildItem -LiteralPath $UnpackDir -Directory | Select-Object -First 1
-
-    if (
-        -not $inner -or
-        -not (Test-Path -LiteralPath (Join-Path $inner.FullName 'setup.py')) -or
-        -not (Test-Path -LiteralPath (Join-Path $inner.FullName 'START-HERE.bat'))
-    ) {
-        Remove-Item -LiteralPath $zip, $UnpackDir -Recurse -Force -ErrorAction SilentlyContinue
-
-        Fail "the Strata $Version archive does not contain expected setup files." `
-            'Run the script again. If it repeats, verify the Strata release.'
-    }
-
-    Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
-
-    Move-Item -LiteralPath $inner.FullName -Destination $destination
-
-    Remove-Item -LiteralPath $UnpackDir -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-
-    return $destination
-}
-
-function Invoke-StrataSetup([string]$Root, [string[]]$ArgumentList) {
-    $quotedArguments = (
-        $ArgumentList | ForEach-Object {
-            if ("$_" -match '\s') {
-                "`"$_`""
-            } else {
-                "$_"
-            }
-        }
-    ) -join ' '
-
-    $processInfo = New-Object Diagnostics.ProcessStartInfo
-
-    $processInfo.FileName = $env:ComSpec
-    $processInfo.Arguments = '/d /s /c ""' +
-        (Join-Path $Root 'START-HERE.bat') +
-        '" ' +
-        $quotedArguments +
-        ' < NUL 2>&1"'
-
-    $processInfo.WorkingDirectory = $Root
-    $processInfo.UseShellExecute = $false
-    $processInfo.RedirectStandardOutput = $true
-    $processInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
-
-    $env:PYTHONUNBUFFERED = '1'
-    $env:PYTHONIOENCODING = 'utf-8'
-
-    $process = [Diagnostics.Process]::Start($processInfo)
-    $lastProgress = [DateTime]::MinValue
-
-    while ($null -ne ($line = $process.StandardOutput.ReadLine())) {
-        if ($line -match 'has to be compiled|Install them now\?|Windows will ask for permission') {
-            [void](Invoke-Native taskkill.exe @('/T', '/F', '/PID', $process.Id))
-
-            Fail 'Strata has no ready-made engine for this GPU and is requesting build tools that require administrator rights.' `
-                "On a system where you have administrator rights, run $Root\START-HERE.bat manually."
-        }
-
-        if ($line -match '\d+%\|' -or $line -match '[\d.]+\s*[MG]B/s') {
-            if (((Get-Date) - $lastProgress).TotalSeconds -lt 5) {
-                continue
-            }
-
-            $lastProgress = Get-Date
-        }
-
-        if ($line.Trim()) {
-            Write-Host "    | $line"
-        }
-    }
-
-    $process.WaitForExit()
-
-    return $process.ExitCode
-}
-
-function Get-SetupArgs {
-    $arguments = @(
-        '--family', $variant.Family,
-        '--model', $variant.Model,
-        '--vision', 'no',
-        '--data-dir', $DataDir,
-        '--port', $Port,
-        '--no-browser',
-        '--no-start',
-        '--yes'
-    )
-
-    if ($Context) {
-        $arguments += @('--context', $Context)
-    }
-
-    if ($ggufDir) {
-        $arguments += @('--gguf-dir', $ggufDir)
-    }
-
-    return $arguments
-}
 
 if ($strataTarget) {
     $isUpdate = $strataPresent
@@ -2041,6 +2045,8 @@ try {
     Remove-Item Env:OPENCODE_CONFIG -ErrorAction SilentlyContinue
 }
 
-Write-Host ''
-Write-Info 'The Strata server remains running and retains the model for later sessions.'
-Write-Info 'Stop it with: .\strata-coder.ps1 -Stop'
+Write-Step 'Stopping the Strata server'
+
+if ((Stop-StrataServers) -eq 0) {
+    Write-Skip 'no Strata server process was found'
+}
