@@ -3,29 +3,53 @@
 This tool runs a local AI coding assistant: [OpenCode](https://opencode.ai), backed by **Qwen3.8-Flash-Next** served by
 [Strata](https://github.com/Niko1221/Strata). Everything installs per-user, so no admin rights and no Docker are needed.
 
-## Use
+## Install (once)
 
-Run it from the project folder you want OpenCode to work on:
+1. Clone this repo to a permanent location, e.g.:
+
+   ```
+   git clone https://github.com/ggilman/strata_coder.git D:\tools\strata_coder
+   ```
+
+2. Run the setup once, from Git Bash, PowerShell, or Command Prompt:
+
+   ```
+   D:\tools\strata_coder\strata-coder.cmd -Setup
+   ```
+
+   It checks the PC, installs Strata and OpenCode, downloads the model, and asks whether to add a
+   `scode` shortcut to the shell you ran it from, then stops without starting the server or opening
+   OpenCode. Open a new shell window afterwards so the shortcut is picked up, and run `scode` to
+   start using it.
+
+## Daily use
+
+Open a terminal (Git Bash, PowerShell, or Command Prompt), change to the project folder you want
+OpenCode to work on, and run:
 
 ```
 cd D:\path\to\my-project
-D:\...\strata_coder\strata-coder.cmd
+scode
 ```
 
-(Or put the `strata_coder` folder on your user PATH and just type `strata-coder`.)
+`scode` starts the server if needed and opens OpenCode in the current folder; when you quit
+OpenCode the server stops and RAM/VRAM are freed. Every command in the table below works the same
+way through `scode`.
 
-For a permanent shortcut, run `strata-coder --alias`: it detects the calling shell (Command Prompt, PowerShell, or Git Bash) and adds a `scode` alias to it, so you can type `scode` from then on. `--alias cmd`, `--alias powershell`, and `--alias bash` force a specific shell when detection picks the wrong one.
+If you skipped the shortcut, run the full path instead (`D:\...\strata_coder\strata-coder.cmd`),
+put the `strata_coder` folder on your user PATH and type `strata-coder`, or add the shortcut later
+with `strata-coder --alias`. `--alias cmd`, `--alias powershell`, and `--alias bash` force a
+specific shell when detection picks the wrong one.
 
 | Command | What it does |
 |---|---|
 | `strata-coder` | Sets up whatever is missing, starts the server, and opens OpenCode in the current folder |
 | `strata-coder -CheckOnly` | Shows the specs, the chosen model, disk space, and what is installed. Changes nothing |
 | `strata-coder -NoLaunch` | Sets up and starts the server only |
-| `strata-coder -Launch` | Opens OpenCode even if a previous `-Setup` saved "do not open it" |
 | `strata-coder -Stop` | Stops the Strata server |
 | `strata-coder -Stats` | Shows the live tokens/sec of the running server (Ctrl+C to quit) |
 | `strata-coder -Update` | Moves Strata and OpenCode to their newest releases |
-| `strata-coder -Setup` | Interactive menu for the setup parameters (see below), then sets up |
+| `strata-coder -Setup` | Interactive menu for the setup parameters (see below), then installs and configures everything and stops |
 | `strata-coder -DataDir E:\models` | Puts the model files somewhere specific |
 | `strata-coder -Family coder -Model IQ1_M` | Overrides the automatic model choice |
 | `strata-coder -Context 65536` / `-Port 8081` | Sets the context size and server port |
@@ -58,14 +82,16 @@ for the port.
 4. **KV cache** — `int8` (8-bit, default), `k8v4` (8-bit K, 4-bit V), or `q4_0` (4-bit, smallest). Lower quantizations
    save RAM and let you pick a larger context.
 5. **Server port** — default 8080.
-6. **Open OpenCode after setup?** — yes/no.
-7. **Stay fully local, block OpenCode web access?** — yes/no. On, OpenCode's `webfetch` and `websearch` tools are set to
+6. **Stay fully local, block OpenCode web access?** — yes/no. On, OpenCode's `webfetch` and `websearch` tools are set to
    `deny` in its config, so the assistant itself cannot browse the web or search. Combined with the already-disabled
    autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Note this is a policy inside
    OpenCode, not a sandbox: its `bash` tool can still run network commands like `curl`. A hard block needs an outbound
    firewall rule for `opencode.exe`, which requires admin.
+7. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
+   Git Bash), the same as `strata-coder --alias`. Open a new shell window afterwards to pick it up.
 
-The answers are saved to `setup.json` and every later run reuses them. `-Setup` re-asks and re-saves; if the saved
+The answers are saved to `setup.json` and every later run reuses them. `-Setup` re-asks and re-saves, then stops
+without starting the server or opening OpenCode; run `scode` afterwards to use it. If the saved
 context or KV cache differs from what the model was configured with, the next run reconfigures the model in place
 (no re-download). The same parameters can also be set without the menu via `-Family`, `-Model`, `-Context`, `-Kv`,
 `-DataDir`, `-Port`, and `-Offline`.
@@ -76,10 +102,10 @@ context or KV cache differs from what the model was configured with, the next ru
    then picks the best variant from the table above; `less than 30 GB` stops: the PC can't run any variant properly.
 
 2. **Finds what already exists.** It looks for a Strata install (including one you set up yourself, which Strata records in
-    `%APPDATA%\Strata\settings.json`), an already-prepared model, matching GGUFs in the Hugging Face cache, OpenCode, and a
-    server already running. It skips whatever is there.
+   `%APPDATA%\Strata\settings.json`), an already-prepared model, matching GGUFs in the Hugging Face cache, OpenCode, and a
+   server already running. It skips whatever is there.
 3. **Checks disk space** before downloading. Model files go to the folder Strata used before, otherwise to
-   `%USERPROFILE%\ai-models\models`. The setup parameters (model, folder, context, KV cache, port, launch, offline) are saved in
+   `%USERPROFILE%\ai-models\models`. The setup parameters (model, folder, context, KV cache, port, offline) are saved in
    `%LOCALAPPDATA%\strata-coder\setup.json`; `strata-coder -Setup` asks for them again and re-saves the file, and
    every other run reads them to fill in whatever the command line did not decide.
 4. **Installs** Strata, the model, and OpenCode into `%LOCALAPPDATA%\strata-coder\`. If interrupted, run it again and the download resumes.

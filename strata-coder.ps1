@@ -11,7 +11,6 @@
     .\strata-coder.ps1 -Stop
     .\strata-coder.ps1 -Stats
     .\strata-coder.ps1 -Setup
-    .\strata-coder.ps1 -Launch
     .\strata-coder.ps1 -Offline
 #>
 
@@ -25,7 +24,6 @@ param(
     [string]$DataDir,
     [int]$Port = 8080,
     [switch]$NoLaunch,
-    [switch]$Launch,
     [switch]$Update,
     [switch]$Stop,
     [switch]$Stats,
@@ -570,6 +568,58 @@ function Get-Candidates {
     return $candidates
 }
 
+function Get-CallingShell {
+    if ($env:MSYSTEM) {
+        return 'bash'
+    }
+
+    try {
+        $procId = $PID
+
+        for ($hop = 0; $hop -lt 6; $hop++) {
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $procId" -ErrorAction SilentlyContinue
+
+            if (-not $proc) {
+                break
+            }
+
+            $name = "$($proc.Name)".ToLowerInvariant()
+
+            if ($name -eq 'bash.exe' -or $name -eq 'sh.exe') {
+                return 'bash'
+            }
+
+            if (
+                ($name -eq 'powershell.exe' -or $name -eq 'pwsh.exe') -and
+                $procId -ne $PID
+            ) {
+                return 'powershell'
+            }
+
+            $procId = $proc.ParentProcessId
+        }
+    } catch {
+    }
+
+    return 'cmd'
+}
+
+function Install-ScodeAlias([string]$Shell) {
+    $cmdFile = Join-Path $PSScriptRoot 'strata-coder.cmd'
+
+    if (-not (Test-Path -LiteralPath $cmdFile)) {
+        Write-Warn "strata-coder.cmd was not found beside this script; add the shortcut later with 'strata-coder --alias $Shell'."
+        return
+    }
+
+    Write-Info "adding the scode shortcut to $Shell"
+    & $env:ComSpec /d /c "`"$cmdFile`" --alias $Shell"
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "the scode shortcut was not added; run 'strata-coder --alias $Shell' manually."
+    }
+}
+
 function Prompt-SetupParams($Spec) {
     $saved = Read-Json $SetupPath
 
@@ -600,7 +650,6 @@ function Prompt-SetupParams($Spec) {
     $defaultContext = 0
     $defaultKv = 'int8'
     $defaultPort = 8080
-    $defaultNoLaunch = $false
     $defaultOffline = $false
 
     if ($saved) {
@@ -623,10 +672,6 @@ function Prompt-SetupParams($Spec) {
                 $defaultPort = [int]$saved.port
             }
         } catch {
-        }
-
-        if ($saved.noLaunch -eq $true) {
-            $defaultNoLaunch = $true
         }
 
         if ($saved.offline -eq $true) {
@@ -871,24 +916,6 @@ function Prompt-SetupParams($Spec) {
         }
     }
 
-    # Correct logic:
-    # "yes, open OpenCode" => noLaunch = false
-    # "no, do not open it" => noLaunch = true
-    $selectedNoLaunch = $defaultNoLaunch
-
-    if ($Launch) {
-        $selectedNoLaunch = $false
-    } elseif ($NoLaunch) {
-        $selectedNoLaunch = $true
-    } else {
-        $defaultAnswer = if ($selectedNoLaunch) { 'n' } else { 'y' }
-        $answer = Read-Host "Open OpenCode after setup? (y/n, default $defaultAnswer)"
-
-        if ($answer.Trim() -ne '') {
-            $selectedNoLaunch = ($answer.Trim().ToUpper() -ne 'Y')
-        }
-    }
-
     $selectedOffline = $defaultOffline
 
     if ($Offline) {
@@ -904,6 +931,14 @@ function Prompt-SetupParams($Spec) {
         }
     }
 
+    $callingShell = Get-CallingShell
+    $addAlias = $true
+    $answer = Read-Host "Add the scode shortcut to $callingShell? (y/n, default y)"
+
+    if ($answer.Trim() -ne '') {
+        $addAlias = ($answer.Trim().ToUpper() -eq 'Y')
+    }
+
     $config = [ordered]@{
         family   = $selected.Family
         model    = $selected.Model
@@ -911,13 +946,16 @@ function Prompt-SetupParams($Spec) {
         kv       = $selectedKv
         dataDir  = $selectedDataDir
         port     = $selectedPort
-        noLaunch = $selectedNoLaunch
         offline  = $selectedOffline
     }
 
     New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
     Write-Utf8File $SetupPath ($config | ConvertTo-Json -Depth 5)
     Write-Ok "setup saved to $SetupPath"
+
+    if ($addAlias) {
+        Install-ScodeAlias $callingShell
+    }
 
     return $config
 }
@@ -1390,12 +1428,6 @@ if ($savedSetup) {
             }
         } catch {
         }
-    }
-
-    if ($Launch) {
-        $NoLaunch = $false
-    } elseif (-not $NoLaunch -and ($savedSetup.noLaunch -eq $true)) {
-        $NoLaunch = $true
     }
 
     if (-not $OfflineSpecified -and ($savedSetup.offline -eq $true)) {
@@ -2072,6 +2104,30 @@ if (-not $openCodePresent -or $openCodeRelease) {
     Write-Ok "OpenCode $($release.tag_name)"
 } else {
     Write-Skip 'OpenCode already installed'
+}
+
+# ----------------------------------------------------------------------------------------------------
+# -Setup stops here: install and configure only, no server, no OpenCode
+# ----------------------------------------------------------------------------------------------------
+
+if ($Setup) {
+    if ($lock) {
+        $lock.ReleaseMutex()
+        $lock.Dispose()
+        $lock = $null
+    }
+
+    if ($script:TranscriptPath) {
+        try {
+            Stop-Transcript | Out-Null
+        } catch {
+        }
+    }
+
+    Write-Step 'Setup complete'
+    Write-Info 'the server was not started and OpenCode was not opened'
+    Write-Info 'run scode (or strata-coder) in a project folder when you are ready to use it'
+    exit 0
 }
 
 # ----------------------------------------------------------------------------------------------------
