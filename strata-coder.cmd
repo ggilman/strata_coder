@@ -53,6 +53,15 @@ if not exist "%~dp0strata-coder.ps1" (
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0strata-coder.ps1" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
+rem Git Bash / MinTTY: OpenCode can leave DEC mouse-tracking modes enabled in
+rem MinTTY, so mouse movement afterwards prints escape sequences as text at the
+rem bash prompt. The PowerShell-side reset travels through the winpty/conpty
+rem layer and can be swallowed there, so also write the disable sequences from
+rem bash, which reaches the terminal directly.
+if defined MSYSTEM (
+    bash -c "printf '\033[?1000l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l\033[?2004l' >/dev/tty" 2>nul
+)
+
 endlocal & exit /b %EXIT_CODE%
 
 
@@ -207,7 +216,18 @@ rem Escape parentheses because this is generated inside a CMD block.
     echo P=$^(cygpath -u "%~f0"^)
     echo touch ~/.bash_profile
     echo sed -i '/^^alias scode=/d' ~/.bash_profile
-    echo printf "alias scode='\"%%s\"'\n" "$P" ^>^> ~/.bash_profile
+    echo sed -i '/^^# BEGIN strata-coder scode$/,/^^# END strata-coder scode$/d' ~/.bash_profile
+    echo unset -f scode 2^>/dev/null
+    echo echo '# BEGIN strata-coder scode' ^>^> ~/.bash_profile
+    echo printf 'SCODE_CMD=%%q\n' "$P" ^>^> ~/.bash_profile
+    echo echo 'unalias scode 2^>/dev/null' ^>^> ~/.bash_profile
+    echo echo 'scode^(^) {' ^>^> ~/.bash_profile
+    echo echo '    "$SCODE_CMD" "$@"' ^>^> ~/.bash_profile
+    echo echo '    local rc=$?' ^>^> ~/.bash_profile
+    echo echo '    printf "\033[?1000l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l\033[?2004l" ^>/dev/tty' ^>^> ~/.bash_profile
+    echo echo '    return $rc' ^>^> ~/.bash_profile
+    echo echo '}' ^>^> ~/.bash_profile
+    echo echo '# END strata-coder scode' ^>^> ~/.bash_profile
 )
 
 sh "%TMP_SH%"

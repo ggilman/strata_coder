@@ -226,13 +226,65 @@ function Reset-TerminalMouse {
         "$esc[?1000l",
         "$esc[?1002l",
         "$esc[?1003l",
+        "$esc[?1004l",
         "$esc[?1005l",
         "$esc[?1006l",
-        "$esc[?1015l"
+        "$esc[?1015l",
+        "$esc[?2004l"
     )
+    $payload = $sequences -join ''
+    $bytes = [Text.Encoding]::ASCII.GetBytes($payload)
 
-    [Console]::Out.Write(($sequences -join ''))
-    [Console]::Out.Flush()
+    try {
+        if (-not ('StrataCoder.ConsoleNative' -as [type])) {
+            Add-Type `
+                -Namespace StrataCoder `
+                -Name ConsoleNative `
+                -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern IntPtr GetStdHandle(int nStdHandle);
+
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+'@
+        }
+
+        $native = [StrataCoder.ConsoleNative]
+
+        # Output: when stdout is a real console (conhost), turn on virtual-terminal
+        # processing first so the disable sequences are interpreted instead of printed.
+        # When stdout is a pipe (Git Bash / MinTTY via conpty), there is no console
+        # mode to set; the raw bytes still travel down the pipe to the terminal.
+        $out = $native::GetStdHandle(-11)
+        [uint32] $outMode = 0
+
+        if ($native::GetConsoleMode($out, [ref] $outMode)) {
+            [void] $native::SetConsoleMode($out, [uint32] ($outMode -bor 0x0004))
+        }
+
+        # Write the raw bytes straight to stdout. This reaches the terminal in both
+        # cases: a console interprets them as VT, and a pipe carries them to the
+        # terminal emulator (MinTTY) that is still reporting mouse events.
+        $stdout = [Console]::OpenStandardOutput()
+        $stdout.Write($bytes, 0, $bytes.Length)
+        $stdout.Flush()
+
+        # Input: clear the flags that make the console deliver mouse and raw VT
+        # input, which is what leaks mouse events into the shell as text.
+        $in = $native::GetStdHandle(-10)
+        [uint32] $inMode = 0
+
+        if ($native::GetConsoleMode($in, [ref] $inMode)) {
+            $clear = [uint32] (0x0010 -bor 0x0200)
+            [void] $native::SetConsoleMode($in, [uint32] ($inMode -band (-bnot $clear)))
+        }
+    } catch {
+        [Console]::Out.Write($payload)
+        [Console]::Out.Flush()
+    }
 }
 
 function Get-FreeGB([string]$Path) {
