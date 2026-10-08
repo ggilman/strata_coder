@@ -19,6 +19,7 @@ param(
     [ValidateSet('qwen', 'coder')][string]$Family,
     [string]$Model,
     [int]$Context,
+    [string]$Kv,
     [string]$DataDir,
     [int]$Port = 8080,
     [switch]$NoLaunch,
@@ -523,6 +524,7 @@ function Prompt-SetupParams($Spec) {
     }
 
     $defaultContext = 0
+    $defaultKv = 'int8'
     $defaultPort = 8080
     $defaultNoLaunch = $false
 
@@ -530,6 +532,13 @@ function Prompt-SetupParams($Spec) {
         try {
             if ($null -ne $saved.context) {
                 $defaultContext = [int]$saved.context
+            }
+        } catch {
+        }
+
+        try {
+            if ($saved.kv) {
+                $defaultKv = [string]$saved.kv
             }
         } catch {
         }
@@ -689,6 +698,63 @@ function Prompt-SetupParams($Spec) {
         }
     }
 
+    $kvChoices = @('int8', 'k8v4', 'q4_0')
+    $kvLabels = [ordered]@{
+        int8  = 'int8 (8-bit, default)'
+        k8v4  = 'k8v4 (8-bit K, 4-bit V)'
+        q4_0  = 'q4_0 (4-bit, smallest)'
+    }
+    $selectedKv = $defaultKv
+
+    if (-not $Kv) {
+        $kvNumber = 0
+
+        foreach ($opt in $kvChoices) {
+            $kvNumber++
+            Write-Info "$kvNumber. $($kvLabels[$opt])"
+        }
+
+        $defaultKvIndex = [array]::IndexOf($kvChoices, $defaultKv) + 1
+
+        if ($defaultKvIndex -ge 1) {
+            Write-Info "Default: $defaultKvIndex. $($kvLabels[$defaultKv])"
+        } else {
+            Write-Info "Default: $defaultKv"
+        }
+
+        while ($true) {
+            $answer = Read-Host "KV cache [1-$($kvChoices.Count), Enter keeps the default]"
+
+            if ($answer.Trim() -eq '') {
+                break
+            }
+
+            $index = 0
+
+            if (
+                [int]::TryParse($answer.Trim(), [ref]$index) -and
+                $index -ge 1 -and
+                $index -le $kvChoices.Count
+            ) {
+                $selectedKv = $kvChoices[$index - 1]
+                break
+            }
+
+            $byName = @(
+                $kvChoices | Where-Object {
+                    $_ -eq $answer.Trim().ToLower()
+                }
+            ) | Select-Object -First 1
+
+            if ($byName) {
+                $selectedKv = $byName
+                break
+            }
+
+            Write-Warn "Enter a KV number from 1 through $($kvChoices.Count), a name such as q4_0, or leave the field blank."
+        }
+    }
+
     $selectedPort = $defaultPort
 
     if ($Port -eq 8080) {
@@ -734,6 +800,7 @@ function Prompt-SetupParams($Spec) {
         family   = $selected.Family
         model    = $selected.Model
         context  = $selectedContext
+        kv       = $selectedKv
         dataDir  = $selectedDataDir
         port     = $selectedPort
         noLaunch = $selectedNoLaunch
@@ -968,6 +1035,10 @@ function Get-SetupArgs {
         $arguments += @('--context', $Context)
     }
 
+    if ($Kv) {
+        $arguments += @('--kv', $Kv)
+    }
+
     if ($ggufDir) {
         $arguments += @('--gguf-dir', $ggufDir)
     }
@@ -1163,6 +1234,10 @@ if ($savedSetup) {
             }
         } catch {
         }
+    }
+
+    if (-not $Kv -and $savedSetup.kv) {
+        $Kv = [string]$savedSetup.kv
     }
 
     if (-not $DataDir -and $savedSetup.dataDir) {
