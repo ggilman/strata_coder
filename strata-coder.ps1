@@ -1522,8 +1522,12 @@ function Install-StrataCode([string]$Version) {
     return $destination
 }
 
-function Get-CmdCommandLine([string]$Inner) {
-    return '/d /s /c ""' + $Inner + '"'
+function New-CmdLauncher([string]$Path, [string]$Body) {
+    Set-Content -LiteralPath $Path -Value (
+        '@echo off' + [Environment]::NewLine + $Body
+    ) -Encoding ASCII
+
+    return $Path
 }
 
 function Set-PythonEnvironment {
@@ -1544,10 +1548,12 @@ function Invoke-StrataSetup([string]$Root, [string[]]$ArgumentList) {
 
     $processInfo = New-Object Diagnostics.ProcessStartInfo
 
-    $processInfo.FileName = $env:ComSpec
-    $processInfo.Arguments = Get-CmdCommandLine (
+    $launcher = New-CmdLauncher (Join-Path $LogDir 'start-setup.cmd') (
         '"' + (Join-Path $Root 'START-HERE.bat') + '" ' + $quotedArguments + ' < NUL 2>&1'
     )
+
+    $processInfo.FileName = $env:ComSpec
+    $processInfo.Arguments = '/d /c "' + $launcher + '"'
 
     $processInfo.WorkingDirectory = $Root
     $processInfo.UseShellExecute = $false
@@ -2743,7 +2749,7 @@ if (-not $serverRunning) {
 
     Set-PythonEnvironment
 
-    $commandArguments = Get-CmdCommandLine (
+    $launcher = New-CmdLauncher (Join-Path $LogDir 'start-server.cmd') (
         '"{0}" "{1}" --engine strata --config "{2}" --port {3} > "{4}" 2>&1' -f
         $python,
         (Join-Path $StrataRoot 'serve\server.py'),
@@ -2753,8 +2759,7 @@ if (-not $serverRunning) {
     )
 
     $serverProcess = Start-Process `
-        -FilePath $env:ComSpec `
-        -ArgumentList $commandArguments `
+        -FilePath $launcher `
         -WorkingDirectory $StrataRoot `
         -WindowStyle Hidden `
         -PassThru
