@@ -47,7 +47,7 @@ specific shell when detection picks the wrong one.
 | `strata-coder -CheckOnly` | Shows the specs, the chosen model, disk space, and what is installed. Changes nothing |
 | `strata-coder -NoLaunch` | Sets up and starts the server only |
 | `strata-coder -Stop` | Stops the Strata server |
-| `strata-coder -Stats` | Shows the live tokens/sec of the running server (Ctrl+C to quit) |
+| `strata-coder -Status` | Shows the live tokens/sec of the running server, refreshing in place (`--status` also works; Ctrl+C to quit) |
 | `strata-coder -Update` | Moves Strata and OpenCode to their newest releases |
 | `strata-coder -Setup` | Interactive menu for the setup parameters (see below), then installs and configures everything and stops |
 | `strata-coder -DataDir E:\models` | Puts the model files somewhere specific |
@@ -60,7 +60,9 @@ specific shell when detection picks the wrong one.
 
 ## The `-Setup` menu
 
-`strata-coder -Setup` walks you through the setup parameters one by one. Pressing Enter keeps the displayed default,
+`strata-coder -Setup` walks you through the setup parameters one by one. The menu uses
+[gum](https://github.com/charmbracelet/gum): it is downloaded once into `%LOCALAPPDATA%\strata-coder\gum\` if not already
+there, and if that download fails the plain text prompts are used instead. Pressing Enter keeps the displayed default,
 which is the value saved in `%LOCALAPPDATA%\strata-coder\setup.json` from a previous run (or the built-in default on
 the first run). A parameter given on the command line skips its question: `strata-coder -Setup -Port 8081` never asks
 for the port.

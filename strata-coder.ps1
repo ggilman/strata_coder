@@ -9,7 +9,7 @@
     .\strata-coder.ps1 -CheckOnly
     .\strata-coder.ps1 -Update
     .\strata-coder.ps1 -Stop
-    .\strata-coder.ps1 -Stats
+    .\strata-coder.ps1 -Status
     .\strata-coder.ps1 -Setup
     .\strata-coder.ps1 -Offline
 #>
@@ -26,7 +26,7 @@ param(
     [switch]$NoLaunch,
     [switch]$Update,
     [switch]$Stop,
-    [switch]$Stats,
+    [switch]$Status,
     [switch]$Setup,
     [switch]$Offline
 )
@@ -62,6 +62,8 @@ $SetupPath   = Join-Path $AppDir 'setup.json'
 $DownloadDir = Join-Path $AppDir 'downloads'
 $LogDir      = Join-Path $AppDir 'logs'
 $UnpackDir   = Join-Path $AppDir 'strata-unpack'
+$GumDir      = Join-Path $AppDir 'gum'
+$GumExe      = Join-Path $GumDir 'gum.exe'
 
 $StrataSettingsPath = Join-Path $env:APPDATA 'Strata\settings.json'
 
@@ -620,6 +622,111 @@ function Install-ScodeAlias([string]$Shell) {
     }
 }
 
+function Get-Gum {
+    if (Test-Path -LiteralPath $GumExe) {
+        return $GumExe
+    }
+
+    Write-Step 'Getting gum for the setup menus'
+
+    $release = $null
+
+    try {
+        $release = Invoke-RestMethod `
+            -UseBasicParsing `
+            -Uri 'https://api.github.com/repos/charmbracelet/gum/releases/latest' `
+            -Headers @{ 'User-Agent' = 'strata-coder' } `
+            -ErrorAction Stop
+    } catch {
+        Write-Warn "could not contact GitHub for gum ($($_.Exception.Message)); using plain prompts"
+        return $null
+    }
+
+    $asset = @(
+        $release.assets | Where-Object {
+            $_.name -like 'gum_*_Windows_x86_64.zip'
+        }
+    ) | Select-Object -First 1
+
+    if (-not $asset) {
+        Write-Warn "gum release $($release.tag_name) has no Windows x86_64 zip; using plain prompts"
+        return $null
+    }
+
+    $zip = Join-Path $DownloadDir $asset.name
+    $stage = Join-Path $AppDir 'gum-unpack'
+
+    New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
+
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $zip -ErrorAction Stop
+    } catch {
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+        Write-Warn "could not download gum ($($_.Exception.Message)); using plain prompts"
+        return $null
+    }
+
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+
+    try {
+        Expand-Archive -LiteralPath $zip -DestinationPath $stage
+    } catch {
+        Remove-Item -LiteralPath $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Warn 'the gum archive is damaged; using plain prompts'
+        return $null
+    }
+
+    $stagedExe = @(
+        Get-ChildItem -LiteralPath $stage -Filter 'gum.exe' -Recurse
+    ) | Select-Object -First 1
+
+    if (-not $stagedExe) {
+        Remove-Item -LiteralPath $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Warn 'gum.exe was not found in the gum archive; using plain prompts'
+        return $null
+    }
+
+    New-Item -ItemType Directory -Force -Path $GumDir | Out-Null
+    Move-Item -LiteralPath $stagedExe.FullName -Destination $GumExe -Force
+    Remove-Item -LiteralPath $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
+
+    Write-Ok "gum is ready at $GumExe"
+
+    return $GumExe
+}
+
+function Invoke-GumChoose([string]$Header, [string[]]$OrderedLabels) {
+    $choice = & $GumExe choose --header $Header --height 12 --cursor '>' $OrderedLabels
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn 'setup cancelled.'
+        exit 1
+    }
+
+    return [array]::IndexOf($OrderedLabels, $choice)
+}
+
+function Invoke-GumInput([string]$Header, [string]$Value) {
+    $answer = & $GumExe input --header $Header --value $Value
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn 'setup cancelled.'
+        exit 1
+    }
+
+    return "$answer".Trim()
+}
+
+function Invoke-GumConfirm([string]$Message, [bool]$Default) {
+    if ($Default) {
+        & $GumExe confirm --default $Message
+    } else {
+        & $GumExe confirm $Message
+    }
+
+    return ($LASTEXITCODE -eq 0)
+}
+
 function Prompt-SetupParams($Spec) {
     $saved = Read-Json $SetupPath
 
@@ -728,56 +835,89 @@ function Prompt-SetupParams($Spec) {
         Fail 'this PC does not have enough RAM for any configured Strata model variant.'
     }
 
-    Write-Step 'Asking for setup parameters (Enter keeps the displayed default)'
+    $gum = Get-Gum
+
+    if ($gum) {
+        Write-Step 'Asking for setup parameters (Enter picks the highlighted default)'
+    } else {
+        Write-Step 'Asking for setup parameters (Enter keeps the displayed default)'
+    }
 
     if (-not ($Family -or $Model)) {
-        $number = 0
+        if ($gum) {
+            $orderedVariants = @(
+                @($selected) + @(
+                    $Variants | Where-Object {
+                        -not (
+                            $_.Family -eq $selected.Family -and
+                            $_.Model -eq $selected.Model
+                        )
+                    }
+                )
+            )
 
-        foreach ($item in $Variants) {
-            $number++
-            Write-Info "$number. $($item.Title) (needs $($item.MinRamGB) GB RAM)"
-        }
-
-        $defaultIndex = [array]::IndexOf($Variants, $selected) + 1
-        Write-Info "Default: $defaultIndex. $($selected.Title)"
-
-        while ($true) {
-            $answer = Read-Host 'Variant'
-
-            if ($answer.Trim() -eq '') {
-                break
-            }
-
-            $index = 0
-
-            if (
-                [int]::TryParse($answer.Trim(), [ref]$index) -and
-                $index -ge 1 -and
-                $index -le $Variants.Count
-            ) {
-                $selected = $Variants[$index - 1]
-                break
-            }
-
-            $byName = @(
-                $Variants | Where-Object {
-                    $_.Model.ToUpper() -eq $answer.Trim().ToUpper()
+            $labels = @(
+                $orderedVariants | ForEach-Object {
+                    "$($_.Title) (needs $($_.MinRamGB) GB RAM)"
                 }
-            ) | Select-Object -First 1
+            )
 
-            if ($byName) {
-                $selected = $byName
-                break
+            $selected = $orderedVariants[
+                (Invoke-GumChoose 'Variant' $labels)
+            ]
+        } else {
+            $number = 0
+
+            foreach ($item in $Variants) {
+                $number++
+                Write-Info "$number. $($item.Title) (needs $($item.MinRamGB) GB RAM)"
             }
 
-            Write-Warn 'Enter a model number, a model name such as IQ2_XS, or leave the field blank.'
+            $defaultIndex = [array]::IndexOf($Variants, $selected) + 1
+            Write-Info "Default: $defaultIndex. $($selected.Title)"
+
+            while ($true) {
+                $answer = Read-Host 'Variant'
+
+                if ($answer.Trim() -eq '') {
+                    break
+                }
+
+                $index = 0
+
+                if (
+                    [int]::TryParse($answer.Trim(), [ref]$index) -and
+                    $index -ge 1 -and
+                    $index -le $Variants.Count
+                ) {
+                    $selected = $Variants[$index - 1]
+                    break
+                }
+
+                $byName = @(
+                    $Variants | Where-Object {
+                        $_.Model.ToUpper() -eq $answer.Trim().ToUpper()
+                    }
+                ) | Select-Object -First 1
+
+                if ($byName) {
+                    $selected = $byName
+                    break
+                }
+
+                Write-Warn 'Enter a model number, a model name such as IQ2_XS, or leave the field blank.'
+            }
         }
     }
 
     $selectedDataDir = $defaultDataDir
 
     if (-not $DataDirSpecified) {
-        $answer = Read-Host "Model folder [$defaultDataDir]"
+        if ($gum) {
+            $answer = Invoke-GumInput 'Model folder' $defaultDataDir
+        } else {
+            $answer = Read-Host "Model folder [$defaultDataDir]"
+        }
 
         if ($answer.Trim() -ne '') {
             $selectedDataDir = [IO.Path]::GetFullPath($answer.Trim())
@@ -788,49 +928,80 @@ function Prompt-SetupParams($Spec) {
     $selectedContext = $defaultContext
 
     if (-not $ContextSpecified) {
-        $contextNumber = 0
+        if ($gum) {
+            $contextOptions = @(
+                @{ Value = 0; Label = '0 (Strata recommendation)' }
+            )
 
-        foreach ($tokens in $contextChoices) {
-            $contextNumber++
-            Write-Info "$contextNumber. $([int]($tokens / 1024))k ($tokens tokens)"
-        }
+            foreach ($tokens in $contextChoices) {
+                $contextOptions += @{
+                    Value = $tokens
+                    Label = "$([int]($tokens / 1024))k ($tokens tokens)"
+                }
+            }
 
-        if ($defaultContext -eq 0) {
-            Write-Info 'Default: 0. Strata recommendation'
+            $defaultOption = @(
+                $contextOptions | Where-Object { $_.Value -eq $defaultContext }
+            ) | Select-Object -First 1
+
+            if (-not $defaultOption) {
+                $defaultOption = $contextOptions[0]
+            }
+
+            $ordered = @(
+                @($defaultOption) + @(
+                    $contextOptions | Where-Object { $_.Value -ne $defaultOption.Value }
+                )
+            )
+
+            $selectedContext = $ordered[
+                (Invoke-GumChoose 'Context' @($ordered | ForEach-Object { $_.Label }))
+            ].Value
         } else {
-            $defaultContextIndex = [array]::IndexOf($contextChoices, $defaultContext) + 1
+            $contextNumber = 0
 
-            if ($defaultContextIndex -ge 1) {
-                Write-Info "Default: $defaultContextIndex. $([int]($defaultContext / 1024))k"
+            foreach ($tokens in $contextChoices) {
+                $contextNumber++
+                Write-Info "$contextNumber. $([int]($tokens / 1024))k ($tokens tokens)"
+            }
+
+            if ($defaultContext -eq 0) {
+                Write-Info 'Default: 0. Strata recommendation'
             } else {
-                Write-Info "Default: $defaultContext tokens"
-            }
-        }
+                $defaultContextIndex = [array]::IndexOf($contextChoices, $defaultContext) + 1
 
-        while ($true) {
-            $answer = Read-Host "Context [0 = Strata recommendation, 1-$($contextChoices.Count) = 4k-256k]"
-
-            if ($answer.Trim() -eq '') {
-                break
-            }
-
-            $index = 0
-
-            if (
-                [int]::TryParse($answer.Trim(), [ref]$index) -and
-                $index -ge 0 -and
-                $index -le $contextChoices.Count
-            ) {
-                if ($index -eq 0) {
-                    $selectedContext = 0
+                if ($defaultContextIndex -ge 1) {
+                    Write-Info "Default: $defaultContextIndex. $([int]($defaultContext / 1024))k"
                 } else {
-                    $selectedContext = $contextChoices[$index - 1]
+                    Write-Info "Default: $defaultContext tokens"
+                }
+            }
+
+            while ($true) {
+                $answer = Read-Host "Context [0 = Strata recommendation, 1-$($contextChoices.Count) = 4k-256k]"
+
+                if ($answer.Trim() -eq '') {
+                    break
                 }
 
-                break
-            }
+                $index = 0
 
-            Write-Warn "Enter a context number from 0 through $($contextChoices.Count), or leave the field blank."
+                if (
+                    [int]::TryParse($answer.Trim(), [ref]$index) -and
+                    $index -ge 0 -and
+                    $index -le $contextChoices.Count
+                ) {
+                    if ($index -eq 0) {
+                        $selectedContext = 0
+                    } else {
+                        $selectedContext = $contextChoices[$index - 1]
+                    }
+
+                    break
+                }
+
+                Write-Warn "Enter a context number from 0 through $($contextChoices.Count), or leave the field blank."
+            }
         }
     }
 
@@ -843,76 +1014,125 @@ function Prompt-SetupParams($Spec) {
     $selectedKv = $defaultKv
 
     if (-not $KvSpecified) {
-        $kvNumber = 0
-
-        foreach ($opt in $kvChoices) {
-            $kvNumber++
-            Write-Info "$kvNumber. $($kvLabels[$opt])"
-        }
-
-        $defaultKvIndex = [array]::IndexOf($kvChoices, $defaultKv) + 1
-
-        if ($defaultKvIndex -ge 1) {
-            Write-Info "Default: $defaultKvIndex. $($kvLabels[$defaultKv])"
-        } else {
-            Write-Info "Default: $defaultKv"
-        }
-
-        while ($true) {
-            $answer = Read-Host "KV cache [1-$($kvChoices.Count), Enter keeps the default]"
-
-            if ($answer.Trim() -eq '') {
-                break
-            }
-
-            $index = 0
-
-            if (
-                [int]::TryParse($answer.Trim(), [ref]$index) -and
-                $index -ge 1 -and
-                $index -le $kvChoices.Count
-            ) {
-                $selectedKv = $kvChoices[$index - 1]
-                break
-            }
-
-            $byName = @(
-                $kvChoices | Where-Object {
-                    $_ -eq $answer.Trim().ToLower()
+        if ($gum) {
+            $kvOptions = @(
+                $kvChoices | ForEach-Object {
+                    @{ Value = $_; Label = $kvLabels[$_] }
                 }
+            )
+
+            $defaultOption = @(
+                $kvOptions | Where-Object { $_.Value -eq $defaultKv }
             ) | Select-Object -First 1
 
-            if ($byName) {
-                $selectedKv = $byName
-                break
+            if (-not $defaultOption) {
+                $defaultOption = $kvOptions[0]
             }
 
-            Write-Warn "Enter a KV number from 1 through $($kvChoices.Count), a name such as q4_0, or leave the field blank."
+            $ordered = @(
+                @($defaultOption) + @(
+                    $kvOptions | Where-Object { $_.Value -ne $defaultOption.Value }
+                )
+            )
+
+            $selectedKv = $ordered[
+                (Invoke-GumChoose 'KV cache' @($ordered | ForEach-Object { $_.Label }))
+            ].Value
+        } else {
+            $kvNumber = 0
+
+            foreach ($opt in $kvChoices) {
+                $kvNumber++
+                Write-Info "$kvNumber. $($kvLabels[$opt])"
+            }
+
+            $defaultKvIndex = [array]::IndexOf($kvChoices, $defaultKv) + 1
+
+            if ($defaultKvIndex -ge 1) {
+                Write-Info "Default: $defaultKvIndex. $($kvLabels[$defaultKv])"
+            } else {
+                Write-Info "Default: $defaultKv"
+            }
+
+            while ($true) {
+                $answer = Read-Host "KV cache [1-$($kvChoices.Count), Enter keeps the default]"
+
+                if ($answer.Trim() -eq '') {
+                    break
+                }
+
+                $index = 0
+
+                if (
+                    [int]::TryParse($answer.Trim(), [ref]$index) -and
+                    $index -ge 1 -and
+                    $index -le $kvChoices.Count
+                ) {
+                    $selectedKv = $kvChoices[$index - 1]
+                    break
+                }
+
+                $byName = @(
+                    $kvChoices | Where-Object {
+                        $_ -eq $answer.Trim().ToLower()
+                    }
+                ) | Select-Object -First 1
+
+                if ($byName) {
+                    $selectedKv = $byName
+                    break
+                }
+
+                Write-Warn "Enter a KV number from 1 through $($kvChoices.Count), a name such as q4_0, or leave the field blank."
+            }
         }
     }
 
     $selectedPort = $defaultPort
 
     if (-not $PortSpecified) {
-        while ($true) {
-            $answer = Read-Host "Server port [$defaultPort]"
+        if ($gum) {
+            while ($true) {
+                $answer = Invoke-GumInput 'Server port' "$defaultPort"
 
-            if ($answer.Trim() -eq '') {
-                break
+                if ($answer -eq '') {
+                    break
+                }
+
+                $number = 0
+
+                if (
+                    [int]::TryParse($answer, [ref]$number) -and
+                    $number -ge 1 -and
+                    $number -le 65535
+                ) {
+                    $selectedPort = $number
+                    break
+                }
+
+                Write-Warn 'Enter a port number from 1 through 65535 or leave the field blank.'
             }
+        } else {
+            while ($true) {
+                $answer = Read-Host "Server port [$defaultPort]"
 
-            $number = 0
+                if ($answer.Trim() -eq '') {
+                    break
+                }
 
-            if (
-                [int]::TryParse($answer.Trim(), [ref]$number) -and
-                $number -ge 1 -and
-                $number -le 65535
-            ) {
-                $selectedPort = $number
-                break
+                $number = 0
+
+                if (
+                    [int]::TryParse($answer.Trim(), [ref]$number) -and
+                    $number -ge 1 -and
+                    $number -le 65535
+                ) {
+                    $selectedPort = $number
+                    break
+                }
+
+                Write-Warn 'Enter a port number from 1 through 65535 or leave the field blank.'
             }
-
-            Write-Warn 'Enter a port number from 1 through 65535 or leave the field blank.'
         }
     }
 
@@ -923,20 +1143,31 @@ function Prompt-SetupParams($Spec) {
     } elseif ($OfflineSpecified) {
         $selectedOffline = $false
     } else {
-        $defaultAnswer = if ($selectedOffline) { 'y' } else { 'n' }
-        $answer = Read-Host "Stay fully local, block OpenCode web access? (y/n, default $defaultAnswer)"
+        if ($gum) {
+            $selectedOffline = Invoke-GumConfirm `
+                'Stay fully local, block OpenCode web access?' `
+                $selectedOffline
+        } else {
+            $defaultAnswer = if ($selectedOffline) { 'y' } else { 'n' }
+            $answer = Read-Host "Stay fully local, block OpenCode web access? (y/n, default $defaultAnswer)"
 
-        if ($answer.Trim() -ne '') {
-            $selectedOffline = ($answer.Trim().ToUpper() -eq 'Y')
+            if ($answer.Trim() -ne '') {
+                $selectedOffline = ($answer.Trim().ToUpper() -eq 'Y')
+            }
         }
     }
 
     $callingShell = Get-CallingShell
     $addAlias = $true
-    $answer = Read-Host "Add the scode shortcut to $callingShell? (y/n, default y)"
 
-    if ($answer.Trim() -ne '') {
-        $addAlias = ($answer.Trim().ToUpper() -eq 'Y')
+    if ($gum) {
+        $addAlias = Invoke-GumConfirm "Add the scode shortcut to $callingShell?" $true
+    } else {
+        $answer = Read-Host "Add the scode shortcut to $callingShell? (y/n, default y)"
+
+        if ($answer.Trim() -ne '') {
+            $addAlias = ($answer.Trim().ToUpper() -eq 'Y')
+        }
     }
 
     $config = [ordered]@{
@@ -1237,7 +1468,7 @@ if ($Stop) {
     exit 0
 }
 
-if ($Stats) {
+if ($Status) {
     $process = @(Get-StrataServerProcesses) | Select-Object -First 1
 
     if (-not (Get-StrataHealth $Port) -and $process) {
@@ -1250,9 +1481,24 @@ if ($Stats) {
         Fail "no Strata server is answering on port $Port."
     }
 
-    Write-Step "Strata speed on $base (Ctrl+C to quit)"
+    $width = [Math]::Min(66, [Console]::WindowWidth - 1)
+    $inner = $width - 2
 
-    $lastShown = $null
+    function Format-PanelRow([string]$Text) {
+        if ($Text.Length -gt $inner) {
+            $Text = $Text.Substring(0, $inner)
+        }
+        return ('|' + $Text.PadRight($inner) + '|')
+    }
+
+    $title  = " Strata speed  $base "
+    $top    = '+' + $title.PadRight($inner, '-') + '+'
+
+    $hint   = ' Ctrl+C to quit '
+    $bottom = '+' + $hint + ('-' * ($inner - $hint.Length)) + '+'
+
+    $panelLines = 6
+    $panelTop   = -1
 
     while ($true) {
         try {
@@ -1272,34 +1518,59 @@ if ($Stats) {
         $timing = $v1Status.last_timings
 
         if ($timing -and $timing.predicted_per_second) {
-            $last = (
-                'last answer: {0} tokens at {1} tok/s; prompt {2} tokens at {3} tok/s' -f
+            $answerLine = (
+                'answer:   {0} tokens at {1:N1} tok/s' -f
                 $timing.predicted_n,
-                $timing.predicted_per_second,
+                $timing.predicted_per_second
+            )
+            $promptLine = (
+                'prompt:   {0} tokens at {1:N1} tok/s' -f
                 $timing.prompt_n,
                 $timing.prompt_per_second
             )
         } else {
-            $last = 'last answer: none yet'
+            $answerLine = 'answer:   none yet'
+            $promptLine = 'prompt:   none yet'
         }
 
         if ($status.busy -and $status.tokens_per_s) {
-            $live = 'generating: {0} tok/s now' -f $status.tokens_per_s
+            $liveLine = ('status:   generating at {0:N1} tok/s' -f $status.tokens_per_s)
+            $liveColor = 'Green'
         } elseif ($status.busy) {
-            $live = 'busy'
+            $liveLine = 'status:   busy'
+            $liveColor = 'Yellow'
         } else {
-            $live = 'idle'
+            $liveLine = 'status:   idle'
+            $liveColor = 'DarkGray'
         }
 
-        Write-Host (
-            '{0}  {1,-48} {2}' -f
-            (Get-Date -Format 'HH:mm:ss'),
-            $live,
-            $last
-        )
+        $timeLine = ('updated:  {0}' -f (Get-Date -Format 'HH:mm:ss'))
 
-        if ($last -ne $lastShown) {
-            $lastShown = $last
+        if ($panelTop -ge 0) {
+            if ($panelTop + $panelLines -ge [Console]::BufferHeight) {
+                Clear-Host
+                $panelTop = 0
+            } else {
+                try {
+                    [Console]::SetCursorPosition(0, $panelTop)
+                } catch {
+                    Clear-Host
+                    $panelTop = 0
+                }
+            }
+        } elseif ([Console]::CursorTop + $panelLines -ge [Console]::BufferHeight) {
+            Clear-Host
+        }
+
+        Write-Host $top
+        Write-Host (Format-PanelRow $liveLine) -ForegroundColor $liveColor
+        Write-Host (Format-PanelRow $answerLine)
+        Write-Host (Format-PanelRow $promptLine)
+        Write-Host (Format-PanelRow $timeLine)
+        Write-Host $bottom
+
+        if ($panelTop -lt 0) {
+            $panelTop = [Console]::CursorTop - $panelLines
         }
 
         Start-Sleep -Seconds 2
