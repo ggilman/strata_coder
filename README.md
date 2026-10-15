@@ -48,7 +48,7 @@ specific shell when detection picks the wrong one.
 | `strata-coder -CheckOnly` | Shows the specs, the chosen model, disk space, and what is installed. Changes nothing |
 | `strata-coder -NoLaunch` | Sets up and starts the server only |
 | `strata-coder -Stop` | Stops the Strata server |
-| `strata-coder -Status` | Shows the live tokens/sec of the running server, refreshing in place (`--status` also works; Ctrl+C to quit) |
+| `strata-coder -Status` | Live dashboard of the running server: tokens/sec, context use, GPU/RAM, uptime (`--status` also works; Ctrl+C to quit) |
 | `strata-coder -Update` | Moves Strata and OpenCode to their newest releases |
 | `strata-coder -Setup` | Interactive menu for the setup parameters (see below), then installs and configures everything and stops |
 | `strata-coder -DataDir E:\models` | Puts the model files somewhere specific |
