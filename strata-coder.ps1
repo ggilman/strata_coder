@@ -1848,6 +1848,11 @@ function Show-StatusPanel([int]$ServerPort) {
             $panelLines = $bodyLines.Count + 4
             $maxLen = [Math]::Max(20, $width - 5)
 
+            # gum sizes a block to its longest line, so without a fixed width the
+            # panel grows and shrinks as values change and leaves stale cells from
+            # wider draws behind; pin every block to the same outer width.
+            $boxWidth = $maxLen + 4
+
             $bodyLines = @(
                 $bodyLines | ForEach-Object {
                     if ($_.Length -gt $maxLen) { $_.Substring(0, $maxLen) } else { $_ }
@@ -1860,9 +1865,9 @@ function Show-StatusPanel([int]$ServerPort) {
                 $titleText = $titleText.Substring(0, $maxLen + 2)
             }
 
-            $title = & $gum style --bold --foreground 212 --padding '0,1' $titleText
-            $body = & $gum style --border rounded --border-foreground $border256 --padding '0,1' --foreground 255 ($bodyLines -join "`n")
-            $foot = & $gum style --italic --foreground 241 --padding '0,1' (' Ctrl+C to quit   {0} ' -f (Get-Date -Format 'HH:mm:ss'))
+            $title = & $gum style --bold --foreground 212 --padding '0,1' --width $boxWidth $titleText
+            $body = & $gum style --border rounded --border-foreground $border256 --padding '0,1' --foreground 255 --width $boxWidth ($bodyLines -join "`n")
+            $foot = & $gum style --italic --foreground 241 --padding '0,1' --width $boxWidth (' Ctrl+C to quit   {0} ' -f (Get-Date -Format 'HH:mm:ss'))
         } else {
             $panelLines = $bodyLines.Count + 2
         }
