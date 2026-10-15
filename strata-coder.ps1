@@ -410,6 +410,21 @@ function Get-FolderGB([string]$Path) {
 function Invoke-Download([string]$Url, [string]$OutFile) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutFile) | Out-Null
 
+    if (Test-Path -LiteralPath $OutFile) {
+        $localSize = (Get-Item -LiteralPath $OutFile).Length
+
+        try {
+            $head = Invoke-WebRequest -UseBasicParsing -Method Head -Uri $Url
+            $remoteSize = @($head.Headers['Content-Length'])[0]
+
+            if ($remoteSize -and $localSize -gt 0 -and [int64]$remoteSize -eq $localSize) {
+                Write-Info 'the file is already fully downloaded'
+                return
+            }
+        } catch {
+        }
+    }
+
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
 
     if ($curl) {
@@ -428,9 +443,41 @@ function Invoke-Download([string]$Url, [string]$OutFile) {
     } catch {
         Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
 
-        Fail "could not download $Url ($($_.Exception.Message))" `
-            'Check network access and run the script again.'
+        throw "could not download $Url ($($_.Exception.Message))"
     }
+}
+
+function Get-DownloadedFile {
+    param(
+        [string]$Url,
+        [string]$Zip,
+        [string]$Stage,
+        [string]$FileFilter
+    )
+
+    Invoke-Download $Url $Zip
+
+    Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+
+    try {
+        Expand-Archive -LiteralPath $Zip -DestinationPath $Stage
+    } catch {
+        Remove-Item -LiteralPath $Zip, $Stage -Recurse -Force -ErrorAction SilentlyContinue
+
+        throw "the archive is damaged ($($_.Exception.Message)); it was removed"
+    }
+
+    $staged = @(
+        Get-ChildItem -LiteralPath $Stage -Filter $FileFilter -Recurse -ErrorAction SilentlyContinue
+    ) | Select-Object -First 1
+
+    if (-not $staged) {
+        Remove-Item -LiteralPath $Zip, $Stage -Recurse -Force -ErrorAction SilentlyContinue
+
+        throw "$FileFilter was not found in the archive"
+    }
+
+    return $staged.FullName
 }
 
 function Get-LatestRelease([string]$Repository) {
@@ -591,7 +638,12 @@ function Stop-StrataServers([int]$OnPort = 0) {
 
     foreach ($process in $processes) {
         [void](Invoke-Native taskkill.exe @('/T', '/F', '/PID', $process.ProcessId))
-        Write-Ok "stopped the Strata server (PID $($process.ProcessId))"
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "stopped the Strata server (PID $($process.ProcessId))"
+        } else {
+            Write-Warn "could not stop the Strata server (PID $($process.ProcessId)); taskkill exit code $LASTEXITCODE"
+        }
     }
 
     return $processes.Count
@@ -783,30 +835,34 @@ function Install-ScodeAlias([string]$Shell) {
 }
 
 function Show-Help {
-    Write-Host 'strata-coder - OpenCode launch and setup utility'
-    Write-Host ''
-    Write-Host 'Usage:'
-    Write-Host '  .\strata-coder.ps1 [options]'
-    Write-Host '  scode [options] after the shortcut is set up'
-    Write-Host ''
-    Write-Host 'Options:'
-    Write-Host '  -Help, --help, -h          Show this help.'
-    Write-Host '  -Setup                     Interactive setup menu, then install and stop.'
-    Write-Host '  -CheckOnly                 Show specs and installs; change nothing.'
-    Write-Host '  -NoLaunch                  Set up and start the server without OpenCode.'
-    Write-Host '  -Stop                      Stop the Strata server.'
-    Write-Host '  -Status                    Live tokens/sec panel, refreshing in place.'
-    Write-Host '  -Update                    Update Strata and OpenCode to newest releases.'
-    Write-Host '  -Alias [shell]             Add the scode shortcut. Shell: auto (default),'
-    Write-Host '                             cmd, powershell, or bash.'
-    Write-Host '  -Family qwen|coder         Model family.'
-    Write-Host '  -Model <name>              Model variant, e.g. IQ3_S or IQ1_M.'
-    Write-Host '  -Context <tokens>          Context size; 0 = Strata recommendation.'
-    Write-Host '  -Kv int8|k8v4|q4_0         KV cache quantization.'
-    Write-Host '  -DataDir <path>            Model folder.'
-    Write-Host '  -Port <port>               Server port, default 8080.'
-    Write-Host '  -Offline                   Block OpenCode web access;'
-    Write-Host '                             -Offline:$false turns the block off.'
+    $text = @'
+strata-coder - OpenCode launch and setup utility
+
+Usage:
+  .\strata-coder.ps1 [options]
+  scode [options] after the shortcut is set up
+
+Options:
+  -Help, --help, -h          Show this help.
+  -Setup                     Interactive setup menu, then install and stop.
+  -CheckOnly                 Show specs and installs; change nothing.
+  -NoLaunch                  Set up and start the server without OpenCode.
+  -Stop                      Stop the Strata server.
+  -Status                    Live tokens/sec panel, refreshing in place.
+  -Update                    Update Strata and OpenCode to newest releases.
+  -Alias [shell]             Add the scode shortcut. Shell: auto (default),
+                             cmd, powershell, or bash.
+  -Family qwen|coder         Model family.
+  -Model <name>              Model variant, e.g. IQ3_S or IQ1_M.
+  -Context <tokens>          Context size; 0 = Strata recommendation.
+  -Kv int8|k8v4|q4_0         KV cache quantization.
+  -DataDir <path>            Model folder.
+  -Port <port>               Server port, default 8080.
+  -Offline                   Block OpenCode web access;
+                             -Offline:$false turns the block off.
+'@
+
+    Write-Host $text
 }
 
 function Get-Gum {
@@ -846,35 +902,14 @@ function Get-Gum {
     New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
 
     try {
-        Invoke-WebRequest -UseBasicParsing -Uri $asset.browser_download_url -OutFile $zip -ErrorAction Stop
+        $stagedExe = Get-DownloadedFile $asset.browser_download_url $zip $stage 'gum.exe'
     } catch {
-        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-        Write-Warn "could not download gum ($($_.Exception.Message)); using plain prompts"
-        return $null
-    }
-
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-
-    try {
-        Expand-Archive -LiteralPath $zip -DestinationPath $stage
-    } catch {
-        Remove-Item -LiteralPath $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Warn 'the gum archive is damaged; using plain prompts'
-        return $null
-    }
-
-    $stagedExe = @(
-        Get-ChildItem -LiteralPath $stage -Filter 'gum.exe' -Recurse
-    ) | Select-Object -First 1
-
-    if (-not $stagedExe) {
-        Remove-Item -LiteralPath $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Warn 'gum.exe was not found in the gum archive; using plain prompts'
+        Write-Warn "could not prepare gum ($($_.Exception.Message)); using plain prompts"
         return $null
     }
 
     New-Item -ItemType Directory -Force -Path $GumDir | Out-Null
-    Move-Item -LiteralPath $stagedExe.FullName -Destination $GumExe -Force
+    Move-Item -LiteralPath $stagedExe -Destination $GumExe -Force
     Remove-Item -LiteralPath $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Ok "gum is ready at $GumExe"
@@ -947,6 +982,10 @@ function Prompt-Choice {
         $ordered = Select-OrderedDefault $Options $DefaultValue
         $index = Invoke-GumChoose $Header @($ordered | ForEach-Object { $_.Label })
 
+        if ($index -lt 0 -or $index -ge $ordered.Count) {
+            return $DefaultValue
+        }
+
         return $ordered[$index].Value
     }
 
@@ -1000,6 +1039,55 @@ function Prompt-Choice {
     }
 
     return $DefaultValue
+}
+
+function Prompt-Text([string]$Header, [string]$Default, [bool]$UseGum) {
+    if ($UseGum) {
+        return Invoke-GumInput $Header $Default
+    }
+
+    return (Read-Host "$Header [$Default]").Trim()
+}
+
+function Prompt-Port([string]$Header, [int]$DefaultPort, [bool]$UseGum) {
+    while ($true) {
+        if ($UseGum) {
+            $answer = Invoke-GumInput $Header "$DefaultPort"
+        } else {
+            $answer = (Read-Host "$Header [$DefaultPort]").Trim()
+        }
+
+        if ($answer -eq '') {
+            return $DefaultPort
+        }
+
+        $number = 0
+
+        if (
+            [int]::TryParse($answer, [ref] $number) -and
+            $number -ge 1 -and
+            $number -le 65535
+        ) {
+            return $number
+        }
+
+        Write-Warn 'Enter a port number from 1 through 65535 or leave the field blank.'
+    }
+}
+
+function Prompt-YesNo([string]$Message, [bool]$Default, [bool]$UseGum) {
+    if ($UseGum) {
+        return Invoke-GumConfirm $Message $Default
+    }
+
+    $defaultAnswer = if ($Default) { 'y' } else { 'n' }
+    $answer = Read-Host "$Message (y/n, default $defaultAnswer)"
+
+    if ($answer.Trim() -eq '') {
+        return $Default
+    }
+
+    return ($answer.Trim().ToUpperInvariant() -eq 'Y')
 }
 
 function Prompt-SetupParams($Spec) {
@@ -1111,17 +1199,13 @@ function Prompt-SetupParams($Spec) {
             }
         )
 
-        $selected = (Prompt-Choice 'Variant' $variantOptions $selected $gum).Value
+        $selected = Prompt-Choice 'Variant' $variantOptions $selected $gum
     }
 
     $selectedDataDir = $defaultDataDir
 
     if (-not $DataDirSpecified) {
-        if ($gum) {
-            $answer = Invoke-GumInput 'Model folder' $defaultDataDir
-        } else {
-            $answer = Read-Host "Model folder [$defaultDataDir]"
-        }
+        $answer = Prompt-Text 'Model folder' $defaultDataDir $gum
 
         if ($answer.Trim() -ne '') {
             $selectedDataDir = [IO.Path]::GetFullPath($answer.Trim())
@@ -1215,49 +1299,7 @@ function Prompt-SetupParams($Spec) {
     $selectedPort = $defaultPort
 
     if (-not $PortSpecified) {
-        if ($gum) {
-            while ($true) {
-                $answer = Invoke-GumInput 'Server port' "$defaultPort"
-
-                if ($answer -eq '') {
-                    break
-                }
-
-                $number = 0
-
-                if (
-                    [int]::TryParse($answer, [ref]$number) -and
-                    $number -ge 1 -and
-                    $number -le 65535
-                ) {
-                    $selectedPort = $number
-                    break
-                }
-
-                Write-Warn 'Enter a port number from 1 through 65535 or leave the field blank.'
-            }
-        } else {
-            while ($true) {
-                $answer = Read-Host "Server port [$defaultPort]"
-
-                if ($answer.Trim() -eq '') {
-                    break
-                }
-
-                $number = 0
-
-                if (
-                    [int]::TryParse($answer.Trim(), [ref]$number) -and
-                    $number -ge 1 -and
-                    $number -le 65535
-                ) {
-                    $selectedPort = $number
-                    break
-                }
-
-                Write-Warn 'Enter a port number from 1 through 65535 or leave the field blank.'
-            }
-        }
+        $selectedPort = Prompt-Port 'Server port' $defaultPort $gum
     }
 
     $selectedOffline = $defaultOffline
@@ -1267,32 +1309,13 @@ function Prompt-SetupParams($Spec) {
     } elseif ($OfflineSpecified) {
         $selectedOffline = $false
     } else {
-        if ($gum) {
-            $selectedOffline = Invoke-GumConfirm `
-                'Stay fully local, block OpenCode web access?' `
-                $selectedOffline
-        } else {
-            $defaultAnswer = if ($selectedOffline) { 'y' } else { 'n' }
-            $answer = Read-Host "Stay fully local, block OpenCode web access? (y/n, default $defaultAnswer)"
-
-            if ($answer.Trim() -ne '') {
-                $selectedOffline = ($answer.Trim().ToUpper() -eq 'Y')
-            }
-        }
+        $selectedOffline = Prompt-YesNo `
+            'Stay fully local, block OpenCode web access?' `
+            $selectedOffline $gum
     }
 
     $callingShell = Get-CallingShell
-    $addAlias = $true
-
-    if ($gum) {
-        $addAlias = Invoke-GumConfirm "Add the scode shortcut to $callingShell?" $true
-    } else {
-        $answer = Read-Host "Add the scode shortcut to $callingShell? (y/n, default y)"
-
-        if ($answer.Trim() -ne '') {
-            $addAlias = ($answer.Trim().ToUpper() -eq 'Y')
-        }
-    }
+    $addAlias = Prompt-YesNo "Add the scode shortcut to $callingShell?" $true $gum
 
     $config = [ordered]@{
         family   = $selected.Family
@@ -1456,9 +1479,14 @@ function Install-StrataCode([string]$Version) {
 
     $zip = Join-Path $DownloadDir "strata-$Version.zip"
 
-    Invoke-Download `
-        "https://github.com/Niko1221/Strata/archive/refs/tags/$Version.zip" `
-        $zip
+    try {
+        Invoke-Download `
+            "https://github.com/Niko1221/Strata/archive/refs/tags/$Version.zip" `
+            $zip
+    } catch {
+        Fail "could not download Strata $Version ($($_.Exception.Message))" `
+            'Check network access and run the script again.'
+    }
 
     Remove-Item -LiteralPath $UnpackDir -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -1494,6 +1522,15 @@ function Install-StrataCode([string]$Version) {
     return $destination
 }
 
+function Get-CmdCommandLine([string]$Inner) {
+    return '/d /s /c ""' + $Inner + '"'
+}
+
+function Set-PythonEnvironment {
+    $env:PYTHONUNBUFFERED = '1'
+    $env:PYTHONIOENCODING = 'utf-8'
+}
+
 function Invoke-StrataSetup([string]$Root, [string[]]$ArgumentList) {
     $quotedArguments = (
         $ArgumentList | ForEach-Object {
@@ -1508,19 +1545,16 @@ function Invoke-StrataSetup([string]$Root, [string[]]$ArgumentList) {
     $processInfo = New-Object Diagnostics.ProcessStartInfo
 
     $processInfo.FileName = $env:ComSpec
-    $processInfo.Arguments = '/d /s /c ""' +
-        (Join-Path $Root 'START-HERE.bat') +
-        '" ' +
-        $quotedArguments +
-        ' < NUL 2>&1"'
+    $processInfo.Arguments = Get-CmdCommandLine (
+        '"' + (Join-Path $Root 'START-HERE.bat') + '" ' + $quotedArguments + ' < NUL 2>&1'
+    )
 
     $processInfo.WorkingDirectory = $Root
     $processInfo.UseShellExecute = $false
     $processInfo.RedirectStandardOutput = $true
     $processInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
 
-    $env:PYTHONUNBUFFERED = '1'
-    $env:PYTHONIOENCODING = 'utf-8'
+    Set-PythonEnvironment
 
     $process = [Diagnostics.Process]::Start($processInfo)
     $lastProgress = [DateTime]::MinValue
@@ -2609,23 +2643,11 @@ if (-not $openCodePresent -or $openCodeRelease) {
     $zip = Join-Path $DownloadDir $assetName
     $stage = Join-Path $AppDir 'opencode-unpack'
 
-    Invoke-Download $asset.browser_download_url $zip
-
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-
     try {
-        Expand-Archive -LiteralPath $zip -DestinationPath $stage
+        $stagedExe = Get-DownloadedFile $asset.browser_download_url $zip $stage 'opencode.exe'
     } catch {
-        Remove-Item -LiteralPath $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
-
-        Fail "the OpenCode archive is damaged ($($_.Exception.Message)); it was removed." `
+        Fail "the OpenCode archive could not be prepared ($($_.Exception.Message)); it was removed." `
             'Run the script again to download a fresh copy.'
-    }
-
-    $stagedExe = Join-Path $stage 'opencode.exe'
-
-    if (-not (Test-Path -LiteralPath $stagedExe)) {
-        Fail 'opencode.exe was not found in the OpenCode archive.'
     }
 
     New-Item -ItemType Directory -Force -Path $OpenCodeDir | Out-Null
@@ -2710,11 +2732,10 @@ if (-not $serverRunning) {
             -Force
     }
 
-    $env:PYTHONUNBUFFERED = '1'
-    $env:PYTHONIOENCODING = 'utf-8'
+    Set-PythonEnvironment
 
-    $commandArguments = (
-        '/d /s /c ""{0}" "{1}" --engine strata --config "{2}" --port {3} > "{4}" 2>&1"' -f
+    $commandArguments = Get-CmdCommandLine (
+        '"{0}" "{1}" --engine strata --config "{2}" --port {3} > "{4}" 2>&1' -f
         $python,
         (Join-Path $StrataRoot 'serve\server.py'),
         $strataConfigPath,
