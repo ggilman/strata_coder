@@ -1710,6 +1710,10 @@ function Show-StatusPanel([int]$ServerPort) {
         return ('|' + $Text.PadRight($inner) + '|')
     }
 
+    if ($interactive) {
+        Clear-Host
+    }
+
     $panelTop = -1
     $failures = 0
 
