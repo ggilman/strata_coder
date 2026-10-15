@@ -11,10 +11,11 @@ This tool runs a local AI coding assistant: [OpenCode](https://opencode.ai), bac
    git clone https://github.com/ggilman/strata_coder.git D:\tools\strata_coder
    ```
 
-2. Run the setup once, from Git Bash, PowerShell, or Command Prompt:
+2. Run the setup once, from PowerShell (or from Git Bash / Command Prompt with
+   `powershell -NoProfile -ExecutionPolicy Bypass -File ...`):
 
    ```
-   D:\tools\strata_coder\strata-coder.cmd -Setup
+   D:\tools\strata_coder\strata-coder.ps1 -Setup
    ```
 
    It checks the PC, installs Strata and OpenCode, downloads the model, and asks whether to add a
@@ -36,9 +37,9 @@ scode
 OpenCode the server stops and RAM/VRAM are freed. Every command in the table below works the same
 way through `scode`.
 
-If you skipped the shortcut, run the full path instead (`D:\...\strata_coder\strata-coder.cmd`),
+If you skipped the shortcut, run the full path instead (`D:\...\strata_coder\strata-coder.ps1`),
 put the `strata_coder` folder on your user PATH and type `strata-coder`, or add the shortcut later
-with `strata-coder --alias`. `--alias cmd`, `--alias powershell`, and `--alias bash` force a
+with `strata-coder -Alias`. `-Alias cmd`, `-Alias powershell`, and `-Alias bash` force a
 specific shell when detection picks the wrong one.
 
 | Command | What it does |
@@ -55,8 +56,8 @@ specific shell when detection picks the wrong one.
 | `strata-coder -Context 65536` / `-Port 8081` | Sets the context size and server port |
 | `strata-coder -Kv q4_0` | Sets the KV cache quant: `int8` (default), `k8v4`, or `q4_0` |
 | `strata-coder -Offline` | Blocks OpenCode's web tools; `-Offline:$false` turns the block off |
-| `strata-coder --alias` | Adds the permanent `scode` alias to the calling shell |
-| `strata-coder --help` | Shows all options |
+| `strata-coder -Alias` | Adds the permanent `scode` alias to the calling shell |
+| `strata-coder -Help` | Shows all options (`--help` also works) |
 
 ## The `-Setup` menu
 
@@ -90,7 +91,7 @@ for the port.
    OpenCode, not a sandbox: its `bash` tool can still run network commands like `curl`. A hard block needs an outbound
    firewall rule for `opencode.exe`, which requires admin.
 7. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
-   Git Bash), the same as `strata-coder --alias`. Open a new shell window afterwards to pick it up.
+   Git Bash), the same as `strata-coder -Alias`. Open a new shell window afterwards to pick it up.
 
 The answers are saved to `setup.json` and every later run reuses them. `-Setup` re-asks and re-saves, then stops
 without starting the server or opening OpenCode; run `scode` afterwards to use it. If the saved

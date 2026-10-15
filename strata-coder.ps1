@@ -12,6 +12,8 @@
     .\strata-coder.ps1 -Status
     .\strata-coder.ps1 -Setup
     .\strata-coder.ps1 -Offline
+    .\strata-coder.ps1 -Alias
+    .\strata-coder.ps1 -Help
 #>
 
 [CmdletBinding()]
@@ -28,7 +30,9 @@ param(
     [switch]$Stop,
     [switch]$Status,
     [switch]$Setup,
-    [switch]$Offline
+    [switch]$Offline,
+    [switch]$Help,
+    [string]$Alias
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +45,7 @@ $KvSpecified = $PSBoundParameters.ContainsKey('Kv')
 $DataDirSpecified = $PSBoundParameters.ContainsKey('DataDir')
 $PortSpecified = $PSBoundParameters.ContainsKey('Port')
 $OfflineSpecified = $PSBoundParameters.ContainsKey('Offline')
+$AliasSpecified = $PSBoundParameters.ContainsKey('Alias')
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -607,19 +612,144 @@ function Get-CallingShell {
 }
 
 function Install-ScodeAlias([string]$Shell) {
-    $cmdFile = Join-Path $PSScriptRoot 'strata-coder.cmd'
-
-    if (-not (Test-Path -LiteralPath $cmdFile)) {
-        Write-Warn "strata-coder.cmd was not found beside this script; add the shortcut later with 'strata-coder --alias $Shell'."
-        return
-    }
+    $scriptFile = $PSCommandPath
+    $launcher = "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptFile`""
 
     Write-Info "adding the scode shortcut to $Shell"
-    & $env:ComSpec /d /c "`"$cmdFile`" --alias $Shell"
 
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warn "the scode shortcut was not added; run 'strata-coder --alias $Shell' manually."
+    if ($Shell -eq 'cmd') {
+        $macroDir = Join-Path $env:USERPROFILE 'bin'
+        $macroFile = Join-Path $macroDir 'cmd_macros.doskey'
+
+        New-Item -ItemType Directory -Force -Path $macroDir | Out-Null
+
+        $lines = @()
+
+        if (Test-Path -LiteralPath $macroFile) {
+            $lines = @(
+                Get-Content -LiteralPath $macroFile |
+                    Where-Object { $_ -notmatch '^\s*scode=' }
+            )
+        }
+
+        $lines += "scode=$launcher `$*"
+
+        Write-Utf8File $macroFile (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
+        Write-Ok "updated the DOSKEY macro: $macroFile"
+
+        $key = 'HKCU:\Software\Microsoft\Command Processor'
+        $loader = "doskey /macrofile=`"$macroFile`""
+        $old = (Get-ItemProperty -Path $key -Name AutoRun -ErrorAction SilentlyContinue).AutoRun
+
+        if ([string]::IsNullOrWhiteSpace($old)) {
+            $new = $loader
+        } elseif ($old.Contains($macroFile)) {
+            $new = $old
+        } else {
+            $new = $old + ' & ' + $loader
+        }
+
+        New-ItemProperty -Path $key -Name AutoRun -Value $new -PropertyType ExpandString -Force | Out-Null
+        Write-Ok 'preserved or updated the CMD AutoRun entry'
+    } elseif ($Shell -eq 'bash') {
+        $homeDir = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
+        $profileFile = Join-Path $homeDir '.bash_profile'
+
+        $begin = '# BEGIN strata-coder scode'
+        $end = '# END strata-coder scode'
+
+        $block = @(
+            $begin
+            "SCODE_CMD='$scriptFile'"
+            'unset -f scode 2>/dev/null'
+            'scode() {'
+            '    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SCODE_CMD" "$@"'
+            '    local rc=$?'
+            '    printf "\033[?1000l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l\033[?2004l" >/dev/tty'
+            '    return $rc'
+            '}'
+            $end
+        ) -join [Environment]::NewLine
+
+        $text = if (Test-Path -LiteralPath $profileFile) {
+            [IO.File]::ReadAllText($profileFile)
+        } else {
+            ''
+        }
+
+        $pattern = '(?ms)^\s*' + [regex]::Escape($begin) + '.*?^\s*' + [regex]::Escape($end) + '\s*\r?\n?'
+        $text = [regex]::Replace($text, $pattern, '')
+        $text = [regex]::Replace($text, '(?m)^\s*alias scode=.*\r?\n?', '')
+
+        if ($text.Length -gt 0 -and -not $text.EndsWith([Environment]::NewLine)) {
+            $text += [Environment]::NewLine
+        }
+
+        Write-Utf8File $profileFile ($text + $block + [Environment]::NewLine)
+        Write-Ok "updated the scode function in $profileFile"
+    } else {
+        $profileFile = $PROFILE.CurrentUserCurrentHost
+
+        if (-not $profileFile) {
+            $profileFile = $PROFILE
+        }
+
+        [IO.Directory]::CreateDirectory((Split-Path -Parent $profileFile)) | Out-Null
+
+        $begin = '# >>> strata-coder scode >>>'
+        $end = '# <<< strata-coder scode <<<'
+
+        $block = @(
+            $begin
+            "function scode { & $launcher @args }"
+            $end
+        ) -join [Environment]::NewLine
+
+        $text = if (Test-Path -LiteralPath $profileFile) {
+            [IO.File]::ReadAllText($profileFile)
+        } else {
+            ''
+        }
+
+        $pattern = '(?ms)^\s*' + [regex]::Escape($begin) + '.*?^\s*' + [regex]::Escape($end) + '\s*\r?\n?'
+        $text = [regex]::Replace($text, $pattern, '')
+
+        if ($text.Length -gt 0 -and -not $text.EndsWith([Environment]::NewLine)) {
+            $text += [Environment]::NewLine
+        }
+
+        Write-Utf8File $profileFile ($text + $block + [Environment]::NewLine)
+        Write-Ok "updated the scode function in $profileFile"
     }
+
+    Write-Info 'open a new shell window to pick up the shortcut'
+}
+
+function Show-Help {
+    Write-Host 'strata-coder - OpenCode launch and setup utility'
+    Write-Host ''
+    Write-Host 'Usage:'
+    Write-Host '  .\strata-coder.ps1 [options]'
+    Write-Host '  scode [options] after the shortcut is set up'
+    Write-Host ''
+    Write-Host 'Options:'
+    Write-Host '  -Help, --help, -h          Show this help.'
+    Write-Host '  -Setup                     Interactive setup menu, then install and stop.'
+    Write-Host '  -CheckOnly                 Show specs and installs; change nothing.'
+    Write-Host '  -NoLaunch                  Set up and start the server without OpenCode.'
+    Write-Host '  -Stop                      Stop the Strata server.'
+    Write-Host '  -Status                    Live tokens/sec panel, refreshing in place.'
+    Write-Host '  -Update                    Update Strata and OpenCode to newest releases.'
+    Write-Host '  -Alias [shell]             Add the scode shortcut. Shell: auto (default),'
+    Write-Host '                             cmd, powershell, or bash.'
+    Write-Host '  -Family qwen|coder         Model family.'
+    Write-Host '  -Model <name>              Model variant, e.g. IQ3_S or IQ1_M.'
+    Write-Host '  -Context <tokens>          Context size; 0 = Strata recommendation.'
+    Write-Host '  -Kv int8|k8v4|q4_0         KV cache quantization.'
+    Write-Host '  -DataDir <path>            Model folder.'
+    Write-Host '  -Port <port>               Server port, default 8080.'
+    Write-Host '  -Offline                   Block OpenCode web access;'
+    Write-Host '                             -Offline:$false turns the block off.'
 }
 
 function Get-Gum {
@@ -1455,8 +1585,36 @@ function Get-SetupArgs {
 }
 
 # ----------------------------------------------------------------------------------------------------
-# Stop and statistics modes
+# Help, alias, stop, and statistics modes
 # ----------------------------------------------------------------------------------------------------
+
+if ($Help) {
+    Show-Help
+    exit 0
+}
+
+if ($AliasSpecified) {
+    $target = if ([string]::IsNullOrWhiteSpace($Alias)) { 'auto' } else { $Alias.Trim().ToLowerInvariant() }
+
+    $shell = switch ($target) {
+        'auto' { Get-CallingShell }
+        'cmd' { 'cmd' }
+        'powershell' { 'powershell' }
+        'ps' { 'powershell' }
+        'pwsh' { 'powershell' }
+        'bash' { 'bash' }
+        'git-bash' { 'bash' }
+        'gitbash' { 'bash' }
+        default { $null }
+    }
+
+    if (-not $shell) {
+        Fail "unknown alias target '$Alias'" 'Valid targets: cmd, powershell, bash.'
+    }
+
+    Install-ScodeAlias $shell
+    exit 0
+}
 
 if ($Stop) {
     Write-Step 'Stopping the Strata server'
