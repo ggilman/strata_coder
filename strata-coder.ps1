@@ -22,9 +22,9 @@ param(
     [ValidateSet('qwen', 'coder')][string]$Family,
     [string]$Model,
     [int]$Context,
-    [string]$Kv,
+    [ValidateSet('int8', 'k8v4', 'q4_0')][string]$Kv,
     [string]$DataDir,
-    [int]$Port = 8080,
+    [ValidateRange(1, 65535)][int]$Port = 8080,
     [switch]$NoLaunch,
     [switch]$Update,
     [switch]$Stop,
@@ -32,7 +32,8 @@ param(
     [switch]$Setup,
     [switch]$Offline,
     [switch]$Help,
-    [string]$Alias
+    [switch]$Alias,
+    [ValidateSet('auto', 'cmd', 'powershell', 'ps', 'pwsh', 'bash', 'git-bash', 'gitbash')][string]$AliasShell
 )
 
 $ErrorActionPreference = 'Stop'
@@ -195,6 +196,7 @@ function Read-Json([string]$Path) {
     try {
         return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
     } catch {
+        Write-Warn "could not parse $Path ($($_.Exception.Message)); ignoring its contents"
         return $null
     }
 }
@@ -410,6 +412,8 @@ function Get-FolderGB([string]$Path) {
 function Invoke-Download([string]$Url, [string]$OutFile) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutFile) | Out-Null
 
+    $localSize = 0
+
     if (Test-Path -LiteralPath $OutFile) {
         $localSize = (Get-Item -LiteralPath $OutFile).Length
 
@@ -428,14 +432,24 @@ function Invoke-Download([string]$Url, [string]$OutFile) {
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
 
     if ($curl) {
-        & $curl.Source -L --fail --retry 3 --retry-delay 5 -C - -o $OutFile $Url
+        $httpCode = "$(& $curl.Source -L --fail --retry 3 --retry-delay 5 -C - -o $OutFile -w '%{http_code}' $Url)".Trim()
+        $curlExit = $LASTEXITCODE
 
-        if ($LASTEXITCODE -eq 0) {
+        if ($curlExit -eq 0) {
             return
         }
 
-        Write-Warn "curl failed with exit code $LASTEXITCODE; retrying with Invoke-WebRequest"
+        # 416 means the resume offset is already at or past the end of the
+        # remote file: the local copy is complete even when HEAD gave no size.
+        if ($curlExit -eq 22 -and $httpCode -eq '416' -and $localSize -gt 0) {
+            Write-Info 'the server reports the file is already fully downloaded'
+            return
+        }
+
+        Write-Warn "curl failed with exit code $curlExit; retrying with Invoke-WebRequest"
         Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Warn 'curl.exe was not found; the built-in downloader is much slower for large files'
     }
 
     try {
@@ -488,8 +502,8 @@ function Get-LatestRelease([string]$Repository) {
             -Headers @{ 'User-Agent' = 'strata-coder' } `
             -ErrorAction Stop
     } catch {
-        Fail "could not contact GitHub for $Repository ($($_.Exception.Message))" `
-            'Check network access and try again.'
+        Write-Warn "could not contact GitHub for $Repository ($($_.Exception.Message))"
+        return $null
     }
 }
 
@@ -675,21 +689,21 @@ function Wait-StrataReady($Process, [int]$ServerPort) {
 # Setup, candidates, and system discovery
 # ----------------------------------------------------------------------------------------------------
 
-function Get-Candidates {
+function Get-Candidates([string]$FamilyFilter, [string]$ModelFilter) {
     $candidates = $Variants
 
-    if ($Family) {
+    if ($FamilyFilter) {
         $candidates = @(
             $candidates | Where-Object {
-                $_.Family -eq $Family
+                $_.Family -eq $FamilyFilter
             }
         )
     }
 
-    if ($Model) {
+    if ($ModelFilter) {
         $candidates = @(
             $candidates | Where-Object {
-                $_.Model -eq $Model.ToUpper()
+                $_.Model -eq $ModelFilter.ToUpper()
             }
         )
     }
@@ -699,7 +713,7 @@ function Get-Candidates {
             "$($_.Family)/$($_.Model)"
         }) -join ', '
 
-        Fail "no model variant matches -Family '$Family' -Model '$Model'" `
+        Fail "no model variant matches -Family '$FamilyFilter' -Model '$ModelFilter'" `
             "Choose one of: $known"
     }
 
@@ -850,8 +864,9 @@ Options:
   -Stop                      Stop the Strata server.
   -Status                    Live tokens/sec panel, refreshing in place.
   -Update                    Update Strata and OpenCode to newest releases.
-  -Alias [shell]             Add the scode shortcut. Shell: auto (default),
-                             cmd, powershell, or bash.
+  -Alias                     Add the scode shortcut. Pick the shell with
+                             -AliasShell: auto (default), cmd, powershell,
+                             or bash.
   -Family qwen|coder         Model family.
   -Model <name>              Model variant, e.g. IQ3_S or IQ1_M.
   -Context <tokens>          Context size; 0 = Strata recommendation.
@@ -975,7 +990,7 @@ function Prompt-Choice {
         [string]$Header,
         [object[]]$Options,
         $DefaultValue,
-        [bool]$UseGum
+        $UseGum
     )
 
     if ($UseGum) {
@@ -1041,7 +1056,7 @@ function Prompt-Choice {
     return $DefaultValue
 }
 
-function Prompt-Text([string]$Header, [string]$Default, [bool]$UseGum) {
+function Prompt-Text([string]$Header, [string]$Default, $UseGum) {
     if ($UseGum) {
         return Invoke-GumInput $Header $Default
     }
@@ -1049,7 +1064,7 @@ function Prompt-Text([string]$Header, [string]$Default, [bool]$UseGum) {
     return (Read-Host "$Header [$Default]").Trim()
 }
 
-function Prompt-Port([string]$Header, [int]$DefaultPort, [bool]$UseGum) {
+function Prompt-Port([string]$Header, [int]$DefaultPort, $UseGum) {
     while ($true) {
         if ($UseGum) {
             $answer = Invoke-GumInput $Header "$DefaultPort"
@@ -1075,7 +1090,7 @@ function Prompt-Port([string]$Header, [int]$DefaultPort, [bool]$UseGum) {
     }
 }
 
-function Prompt-YesNo([string]$Message, [bool]$Default, [bool]$UseGum) {
+function Prompt-YesNo([string]$Message, [bool]$Default, $UseGum) {
     if ($UseGum) {
         return Invoke-GumConfirm $Message $Default
     }
@@ -1155,7 +1170,7 @@ function Prompt-SetupParams($Spec) {
     $selected = $null
 
     if ($Family -or $Model) {
-        $requested = @(Get-Candidates)
+        $requested = @(Get-Candidates $Family $Model)
         $selected = Select-FittingVariant $requested $Spec.RamGB
 
         if (-not $selected) {
@@ -1384,14 +1399,20 @@ function Get-SystemSpec {
 
         $gpus = foreach ($row in @($rows)) {
             $fields = $row -split '\s*,\s*'
+            $vramMiB = 0
+            $computeCap = 0.0
 
-            if ($fields.Count -ge 5) {
+            if (
+                $fields.Count -ge 5 -and
+                [int]::TryParse($fields[2], [ref] $vramMiB) -and
+                [double]::TryParse($fields[4], [ref] $computeCap)
+            ) {
                 [pscustomobject]@{
-                    Index      = [int]$fields[0]
+                    Index      = $fields[0].Trim()
                     Name       = $fields[1].Trim()
-                    VramMiB    = [int]$fields[2]
+                    VramMiB    = $vramMiB
                     Driver     = $fields[3].Trim()
-                    ComputeCap = [double]$fields[4]
+                    ComputeCap = $computeCap
                 }
             }
         }
@@ -1548,9 +1569,13 @@ function Invoke-StrataSetup([string]$Root, [string[]]$ArgumentList) {
 
     $processInfo = New-Object Diagnostics.ProcessStartInfo
 
-    $launcher = New-CmdLauncher (Join-Path $LogDir 'start-setup.cmd') (
+    # The command travels through an environment variable so non-ASCII paths
+    # survive: the launcher file itself stays pure ASCII for cmd.exe.
+    $env:STRATA_CODER_CMD = (
         '"' + (Join-Path $Root 'START-HERE.bat') + '" ' + $quotedArguments + ' < NUL 2>&1'
     )
+
+    $launcher = New-CmdLauncher (Join-Path $LogDir 'start-setup.cmd') '%STRATA_CODER_CMD%'
 
     $processInfo.FileName = $env:ComSpec
     $processInfo.Arguments = '/d /c "' + $launcher + '"'
@@ -1562,33 +1587,37 @@ function Invoke-StrataSetup([string]$Root, [string[]]$ArgumentList) {
 
     Set-PythonEnvironment
 
-    $process = [Diagnostics.Process]::Start($processInfo)
-    $lastProgress = [DateTime]::MinValue
+    try {
+        $process = [Diagnostics.Process]::Start($processInfo)
+        $lastProgress = [DateTime]::MinValue
 
-    while ($null -ne ($line = $process.StandardOutput.ReadLine())) {
-        if ($line -match 'has to be compiled|Install them now\?|Windows will ask for permission') {
-            [void](Invoke-Native taskkill.exe @('/T', '/F', '/PID', $process.Id))
+        while ($null -ne ($line = $process.StandardOutput.ReadLine())) {
+            if ($line -match 'has to be compiled|Install them now\?|Windows will ask for permission') {
+                [void](Invoke-Native taskkill.exe @('/T', '/F', '/PID', $process.Id))
 
-            Fail 'Strata has no ready-made engine for this GPU and is requesting build tools that require administrator rights.' `
-                "On a system where you have administrator rights, run $Root\START-HERE.bat manually."
-        }
-
-        if ($line -match '\d+%\|' -or $line -match '[\d.]+\s*[MG]B/s') {
-            if (((Get-Date) - $lastProgress).TotalSeconds -lt 5) {
-                continue
+                Fail 'Strata has no ready-made engine for this GPU and is requesting build tools that require administrator rights.' `
+                    "On a system where you have administrator rights, run $Root\START-HERE.bat manually."
             }
 
-            $lastProgress = Get-Date
+            if ($line -match '\d+%\|' -or $line -match '[\d.]+\s*[MG]B/s') {
+                if (((Get-Date) - $lastProgress).TotalSeconds -lt 5) {
+                    continue
+                }
+
+                $lastProgress = Get-Date
+            }
+
+            if ($line.Trim()) {
+                Write-Host "    | $line"
+            }
         }
 
-        if ($line.Trim()) {
-            Write-Host "    | $line"
-        }
+        $process.WaitForExit()
+
+        return $process.ExitCode
+    } finally {
+        Remove-Item Env:STRATA_CODER_CMD -ErrorAction SilentlyContinue
     }
-
-    $process.WaitForExit()
-
-    return $process.ExitCode
 }
 
 function Get-SetupArgs {
@@ -1627,6 +1656,30 @@ function Get-SetupArgs {
     return $arguments
 }
 
+function Invoke-ModelSetup {
+    param(
+        [string]$Root,
+        $Variant,
+        [string]$Dir,
+        [int]$ServerPort,
+        [int]$ContextTokens,
+        [string]$KvQuant,
+        [string]$GgufDir,
+        [string]$Tag
+    )
+
+    New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+
+    $exitCode = Invoke-StrataSetup $Root (
+        Get-SetupArgs $Variant $Dir $ServerPort $ContextTokens $KvQuant $GgufDir
+    )
+
+    return [pscustomobject]@{
+        ExitCode   = $exitCode
+        Configured = (Test-StrataConfig $Root $Tag)
+    }
+}
+
 # ----------------------------------------------------------------------------------------------------
 # Help, alias, stop, and statistics modes
 # ----------------------------------------------------------------------------------------------------
@@ -1637,7 +1690,7 @@ if ($Help) {
 }
 
 if ($AliasSpecified) {
-    $target = if ([string]::IsNullOrWhiteSpace($Alias)) { 'auto' } else { $Alias.Trim().ToLowerInvariant() }
+    $target = if ([string]::IsNullOrWhiteSpace($AliasShell)) { 'auto' } else { $AliasShell.Trim().ToLowerInvariant() }
 
     $shell = switch ($target) {
         'auto' { Get-CallingShell }
@@ -1652,7 +1705,7 @@ if ($AliasSpecified) {
     }
 
     if (-not $shell) {
-        Fail "unknown alias target '$Alias'" 'Valid targets: cmd, powershell, bash.'
+        Fail "unknown alias target '$AliasShell'" 'Valid targets: cmd, powershell, bash.'
     }
 
     Install-ScodeAlias $shell
@@ -1901,7 +1954,7 @@ function Show-StatusPanel([int]$ServerPort) {
         }
 
         if ($gum) {
-            & $gum join --vertical $title $body $foot
+            & $gum join --vertical ($title -join "`n") ($body -join "`n") ($foot -join "`n")
         } else {
             $head = " Strata speed  $base "
             Write-Host ('+' + $head.PadRight($inner, '-') + '+')
@@ -1993,7 +2046,8 @@ if ($spec.Gpu.VramMiB -lt $MinVramMiB) {
     )
 }
 
-$driverMajor = [int](($spec.Gpu.Driver -split '\.')[0])
+$driverMajor = 0
+[void][int]::TryParse(($spec.Gpu.Driver -split '\.')[0], [ref] $driverMajor)
 
 if ($driverMajor -lt $MinDriver) {
     Fail "NVIDIA driver $($spec.Gpu.Driver) is too old; Strata requires driver $MinDriver or newer." `
@@ -2019,13 +2073,16 @@ if ($Setup -and -not $CheckOnly) {
     $savedSetup = Prompt-SetupParams $spec
 }
 
+$FamilyFilter = $Family
+$ModelFilter = $Model
+
 if ($savedSetup) {
-    if (-not $Family -and $savedSetup.family) {
-        $Family = $savedSetup.family
+    if (-not $FamilyFilter -and $savedSetup.family) {
+        $FamilyFilter = $savedSetup.family
     }
 
-    if (-not $Model -and $savedSetup.model) {
-        $Model = $savedSetup.model
+    if (-not $ModelFilter -and $savedSetup.model) {
+        $ModelFilter = $savedSetup.model
     }
 
     if (-not $ContextSpecified) {
@@ -2053,7 +2110,7 @@ if ($savedSetup) {
     }
 }
 
-$candidates = @(Get-Candidates)
+$candidates = @(Get-Candidates $FamilyFilter $ModelFilter)
 
 $variant = Select-FittingVariant $candidates $spec.RamGB
 
@@ -2188,13 +2245,15 @@ $strataTarget = $null
 if (-not $strataPresent) {
     $strataTarget = $PinnedStrata
 } elseif ($Update) {
-    $latest = (Get-LatestRelease 'Niko1221/Strata').tag_name
+    $latestRelease = Get-LatestRelease 'Niko1221/Strata'
 
-    if ($latest -ne $strataVersion) {
-        $strataTarget = $latest
-        Write-Info "Strata update available: $strataVersion -> $latest"
+    if (-not $latestRelease) {
+        Write-Warn 'skipping the Strata update check; continuing with the installed version'
+    } elseif ($latestRelease.tag_name -ne $strataVersion) {
+        $strataTarget = $latestRelease.tag_name
+        Write-Info "Strata update available: $strataVersion -> $strataTarget"
     } else {
-        Write-Ok "Strata is up to date ($latest)"
+        Write-Ok "Strata is up to date ($($latestRelease.tag_name))"
     }
 }
 
@@ -2221,7 +2280,9 @@ $openCodeRelease = $null
 if ($openCodePresent -and $Update) {
     $openCodeRelease = Get-LatestRelease 'anomalyco/opencode'
 
-    if (
+    if (-not $openCodeRelease) {
+        Write-Warn 'skipping the OpenCode update check; continuing with the installed version'
+    } elseif (
         $openCodeRelease.tag_name.TrimStart('v') -eq
         "$openCodeVersion".Trim().TrimStart('v')
     ) {
@@ -2246,6 +2307,11 @@ if ($health) {
         $otherPort = Get-ServerPort $existingServer
 
         if ($otherPort -ne $Port) {
+            if ($PortSpecified) {
+                Fail "a Strata server is already running on port $otherPort, but port $Port was requested." `
+                    'Stop it with -Stop first, or run without -Port to use the running server.'
+            }
+
             Write-Warn "a Strata server is already running on port $otherPort; using it"
             $Port = $otherPort
         } else {
@@ -2510,16 +2576,12 @@ if ($strataTarget) {
             $serverRunning = $false
         }
 
-        New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+        $setupResult = Invoke-ModelSetup $newRoot $variant $DataDir $Port $Context $Kv $ggufDir $tag
 
-        $setupExitCode = Invoke-StrataSetup $newRoot (
-            Get-SetupArgs $variant $DataDir $Port $Context $Kv $ggufDir
-        )
-
-        if (-not (Test-StrataConfig $newRoot $tag)) {
+        if (-not $setupResult.Configured) {
             Remove-Item -LiteralPath $newRoot -Recurse -Force -ErrorAction SilentlyContinue
 
-            Fail "Strata $strataTarget setup did not finish successfully (exit code $setupExitCode)." `
+            Fail "Strata $strataTarget setup did not finish successfully (exit code $($setupResult.ExitCode))." `
                 'The previous version remains installed. Run without -Update to use it.'
         }
 
@@ -2600,14 +2662,10 @@ if (-not $modelReady -or $Setup -or $configDrift) {
         Write-Info 'If interrupted, run the script again; supported downloads resume.'
     }
 
-    New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+    $setupResult = Invoke-ModelSetup $StrataRoot $variant $DataDir $Port $Context $Kv $ggufDir $tag
 
-    $setupExitCode = Invoke-StrataSetup $StrataRoot (
-        Get-SetupArgs $variant $DataDir $Port $Context $Kv $ggufDir
-    )
-
-    if (-not (Test-StrataConfig $StrataRoot $tag)) {
-        Fail "Strata model setup did not finish successfully (exit code $setupExitCode)." `
+    if (-not $setupResult.Configured) {
+        Fail "Strata model setup did not finish successfully (exit code $($setupResult.ExitCode))." `
             'Review the setup output, correct the reported issue, and run the script again.'
     }
 
@@ -2639,6 +2697,11 @@ if (-not $openCodePresent -or $openCodeRelease) {
         $openCodeRelease
     } else {
         Get-LatestRelease 'anomalyco/opencode'
+    }
+
+    if (-not $release) {
+        Fail 'could not contact GitHub for the OpenCode release.' `
+            'Check network access and run the script again.'
     }
 
     $assetName = if ($spec.Avx2 -eq $false) {
@@ -2749,7 +2812,9 @@ if (-not $serverRunning) {
 
     Set-PythonEnvironment
 
-    $launcher = New-CmdLauncher (Join-Path $LogDir 'start-server.cmd') (
+    # The command travels through an environment variable so non-ASCII paths
+    # survive: the launcher file itself stays pure ASCII for cmd.exe.
+    $env:STRATA_CODER_CMD = (
         '"{0}" "{1}" --engine strata --config "{2}" --port {3} > "{4}" 2>&1' -f
         $python,
         (Join-Path $StrataRoot 'serve\server.py'),
@@ -2758,11 +2823,15 @@ if (-not $serverRunning) {
         $serverLog
     )
 
+    $launcher = New-CmdLauncher (Join-Path $LogDir 'start-server.cmd') '%STRATA_CODER_CMD%'
+
     $serverProcess = Start-Process `
         -FilePath $launcher `
         -WorkingDirectory $StrataRoot `
         -WindowStyle Hidden `
         -PassThru
+
+    Remove-Item Env:STRATA_CODER_CMD -ErrorAction SilentlyContinue
 
     Save-State @{
         Port = $Port
@@ -2785,7 +2854,7 @@ if (-not $serverRunning) {
         }
 
         if (-not $serverProcess.HasExited) {
-            [void](Stop-StrataServers)
+            [void](Stop-StrataServers $Port)
         }
 
         Fail "the Strata server did not come up: $reason." `
@@ -2980,9 +3049,18 @@ if (-not (Test-Path -LiteralPath $OpenCodeCfg)) {
 $debugConfigPath = Join-Path $LogDir 'opencode-resolved-config.log'
 
 try {
-    $debugOutput = @(
-        & $OpenCodeExe debug config 2>&1
-    )
+    # Native stderr must not become a terminating error here: opencode may
+    # write warnings to stderr while still producing a usable config dump.
+    $oldPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+
+    try {
+        $debugOutput = @(
+            & $OpenCodeExe debug config 2>&1
+        )
+    } finally {
+        $ErrorActionPreference = $oldPreference
+    }
 
     $debugText = $debugOutput -join [Environment]::NewLine
     Write-Utf8File $debugConfigPath $debugText
