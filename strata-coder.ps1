@@ -1246,7 +1246,7 @@ function Prompt-SetupParams($Spec) {
         }
     }
 
-    $contextChoices = @(4096, 8192, 16384, 32768, 65536, 131072, 262144)
+    $contextChoices = @(4096, 8192, 16384, 32768, 65536, 131072, 204800, 262144, 393216, 524288)
     $selectedContext = $defaultContext
 
     if (-not $ContextSpecified) {
@@ -1256,10 +1256,16 @@ function Prompt-SetupParams($Spec) {
             )
 
             foreach ($tokens in $contextChoices) {
+                $label = "$([int]($tokens / 1024))k ($tokens tokens)"
+
+                if ($tokens -gt 262144) {
+                    $label += ' (past trained, YaRN)'
+                }
+
                 $contextOptions += @{
                     Value = $tokens
                     Name  = "$([int]($tokens / 1024))k"
-                    Label = "$([int]($tokens / 1024))k ($tokens tokens)"
+                    Label = $label
                 }
             }
 
@@ -1269,7 +1275,13 @@ function Prompt-SetupParams($Spec) {
 
             foreach ($tokens in $contextChoices) {
                 $contextNumber++
-                Write-Info "$contextNumber. $([int]($tokens / 1024))k ($tokens tokens)"
+                $label = "$([int]($tokens / 1024))k ($tokens tokens)"
+
+                if ($tokens -gt 262144) {
+                    $label += ' (past trained, YaRN)'
+                }
+
+                Write-Info "$contextNumber. $label"
             }
 
             if ($defaultContext -eq 0) {
@@ -1285,7 +1297,7 @@ function Prompt-SetupParams($Spec) {
             }
 
             while ($true) {
-                $answer = Read-Host "Context [0 = Strata recommendation, 1-$($contextChoices.Count) = 4k-256k]"
+                $answer = Read-Host "Context [0 = Strata recommendation, 1-$($contextChoices.Count) = 4k-512k]"
 
                 if ($answer.Trim() -eq '') {
                     break
@@ -1725,8 +1737,9 @@ function Show-RamStability(
     $kvBaselineGB = $null
 
     if ($weightsPerToken -and $configured -gt 0) {
+        $baselineContext = if ($trained -gt 0) { $trained } else { $configured }
         $kvGB = Get-KvCacheGB $weightsPerToken $configured $KvQuant
-        $kvBaselineGB = Get-KvCacheGB $weightsPerToken ([math]::Max($trained, $configured)) 'int8'
+        $kvBaselineGB = Get-KvCacheGB $weightsPerToken $baselineContext 'int8'
         $estimated = [math]::Round($Variant.MinRamGB + $kvGB - $kvBaselineGB, 1)
     }
 

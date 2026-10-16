@@ -80,8 +80,9 @@ for the port.
 
 2. **Model folder** — where the model files live. Default: the folder Strata used before, otherwise
    `%USERPROFILE%\ai-models\models`.
-3. **Context** — `0` for the Strata recommendation, or a size from 4k up to 256k (4096, 8192, 16384, 32768, 65536,
-   131072, 262144 tokens).
+3. **Context** — `0` for the Strata recommendation, or a size from 4k up to 512k (4096, 8192, 16384, 32768, 65536,
+   131072, 204800, 262144, 393216, 524288 tokens). Sizes past the model's trained 262144 are rope-extended by Strata
+   (YaRN) automatically and need noticeably more RAM for the KV cache.
 4. **KV cache** — `int8` (8-bit, default), `k8v4` (8-bit K, 4-bit V), or `q4_0` (4-bit, smallest). Lower quantizations
    save RAM and let you pick a larger context.
 5. **Server port** — default 8080.
