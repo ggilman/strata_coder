@@ -122,6 +122,16 @@ $Margin        = 1.15
 $LoadMinutes   = 15
 $SlackGB       = 1
 $SetupMinutes  = 6
+
+# KV cache bytes per cached weight per quantization: q8_0 = 1.0625,
+# q4_0 = 0.5625, k8v4 averages the two.
+$KvBytesPerWeight = [ordered]@{
+    int8 = 1.0625
+    k8v4 = 0.8125
+    q4_0 = 0.5625
+}
+$ComfortableHeadroomGB = 8
+$TightHeadroomGB       = 2
 $LogKeep       = 20
 $StatusRetries = 3
 $DefaultContextLimit = 131072
@@ -650,17 +660,26 @@ function Stop-StrataServers([int]$OnPort = 0) {
         )
     }
 
+    $found = 0
+
     foreach ($process in $processes) {
+        if (-not (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue)) {
+            continue
+        }
+
+        $found += 1
+
         [void](Invoke-Native taskkill.exe @('/T', '/F', '/PID', $process.ProcessId))
 
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "stopped the Strata server (PID $($process.ProcessId))"
-        } else {
+        } elseif ($LASTEXITCODE -ne 128) {
+            # 128 means the process already exited between discovery and the kill.
             Write-Warn "could not stop the Strata server (PID $($process.ProcessId)); taskkill exit code $LASTEXITCODE"
         }
     }
 
-    return $processes.Count
+    return $found
 }
 
 function Wait-StrataReady($Process, [int]$ServerPort) {
@@ -1447,6 +1466,320 @@ function Test-StrataConfig([string]$Root, [string]$Tag) {
         (Test-Path -LiteralPath $config.exe) -and
         (Test-Path -LiteralPath (Join-Path $Root '.venv\Scripts\python.exe'))
     )
+}
+
+function Read-GgufString([IO.BinaryReader]$Reader) {
+    $length = $Reader.ReadUInt64()
+
+    if ($length -gt 1048576) {
+        throw "GGUF string length $length is out of range"
+    }
+
+    return [Text.Encoding]::UTF8.GetString($Reader.ReadBytes([int]$length))
+}
+
+function Get-GgufValueSize([uint32]$Type) {
+    switch ($Type) {
+        0 { return 1 }
+        1 { return 1 }
+        2 { return 2 }
+        3 { return 2 }
+        4 { return 4 }
+        5 { return 4 }
+        6 { return 4 }
+        7 { return 1 }
+        10 { return 8 }
+        11 { return 8 }
+        12 { return 8 }
+    }
+
+    return 0
+}
+
+function Read-GgufValue([IO.BinaryReader]$Reader, [uint32]$Type, [int]$Depth = 0) {
+    switch ($Type) {
+        0 { return $Reader.ReadByte() }
+        1 { return $Reader.ReadSByte() }
+        2 { return $Reader.ReadUInt16() }
+        3 { return $Reader.ReadInt16() }
+        4 { return $Reader.ReadUInt32() }
+        5 { return $Reader.ReadInt32() }
+        6 { return $Reader.ReadSingle() }
+        7 { return $Reader.ReadByte() -ne 0 }
+        8 { return Read-GgufString $Reader }
+        9 {
+            $elementType = $Reader.ReadUInt32()
+            $count = [long]$Reader.ReadUInt64()
+
+            if ($Depth -ge 2) {
+                throw 'GGUF array nesting is too deep'
+            }
+
+            $elementSize = Get-GgufValueSize $elementType
+
+            if ($elementSize -gt 0) {
+                [void]$Reader.BaseStream.Seek($count * $elementSize, [IO.SeekOrigin]::Current)
+            } else {
+                for ($i = 0; $i -lt $count; $i++) {
+                    [void](Read-GgufValue $Reader $elementType ($Depth + 1))
+                }
+            }
+
+            return $null
+        }
+        10 { return $Reader.ReadUInt64() }
+        11 { return $Reader.ReadInt64() }
+        12 { return $Reader.ReadDouble() }
+    }
+
+    throw "unknown GGUF value type $Type"
+}
+
+function Read-GgufMeta([string]$Path) {
+    $meta = @{}
+
+    try {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite
+        )
+        $reader = New-Object IO.BinaryReader($stream, [Text.Encoding]::UTF8)
+
+        try {
+            if ([Text.Encoding]::ASCII.GetString($reader.ReadBytes(4)) -ne 'GGUF') {
+                return $null
+            }
+
+            $version = $reader.ReadUInt32()
+
+            if ($version -lt 2 -or $version -gt 3) {
+                return $null
+            }
+
+            [void]$reader.ReadUInt64()
+            $nKv = [long]$reader.ReadUInt64()
+
+            if ($nKv -gt 1048576) {
+                return $null
+            }
+
+            for ($i = 0; $i -lt $nKv; $i++) {
+                $key = Read-GgufString $reader
+                $type = $reader.ReadUInt32()
+                $meta[$key] = Read-GgufValue $reader $type
+            }
+        } finally {
+            $reader.Dispose()
+            $stream.Dispose()
+        }
+    } catch {
+        return $null
+    }
+
+    return $meta
+}
+
+function Get-GgufArch($Meta) {
+    if (-not $Meta) {
+        return $null
+    }
+
+    $arch = "$($Meta['general.architecture'])".Trim()
+
+    if (-not $arch) {
+        return $null
+    }
+
+    return $arch
+}
+
+function Get-KvWeightsPerToken($Meta) {
+    $arch = Get-GgufArch $Meta
+
+    if (-not $arch) {
+        return $null
+    }
+
+    $layers  = Get-IntSetting $Meta["$arch.block_count"] 0
+    $heads   = Get-IntSetting $Meta["$arch.attention.head_count"] 0
+    $headsKv = Get-IntSetting $Meta["$arch.attention.head_count_kv"] 0
+    $embd    = Get-IntSetting $Meta["$arch.embedding_length"] 0
+
+    if ($layers -le 0 -or $heads -le 0 -or $headsKv -le 0 -or $embd -le 0) {
+        return $null
+    }
+
+    $headDim = [int][math]::Floor($embd / $heads)
+
+    if ($headDim -le 0) {
+        return $null
+    }
+
+    $interval = Get-IntSetting $Meta["$arch.full_attention_interval"] 1
+
+    if ($interval -lt 1) {
+        $interval = 1
+    }
+
+    $fullLayers = [math]::Max(1, [int][math]::Floor($layers / $interval))
+
+    return [long]2 * $fullLayers * $headsKv * $headDim
+}
+
+function Get-GgufTrainedContext($Meta) {
+    $arch = Get-GgufArch $Meta
+
+    if (-not $arch) {
+        return 0
+    }
+
+    return Get-IntSetting $Meta["$arch.context_length"] 0
+}
+
+function Get-KvCacheGB($WeightsPerToken, [long]$Tokens, [string]$KvQuant) {
+    if (-not $WeightsPerToken -or $Tokens -le 0) {
+        return $null
+    }
+
+    $bytesPerWeight = $KvBytesPerWeight[[string]$KvQuant]
+
+    if (-not $bytesPerWeight) {
+        $bytesPerWeight = $KvBytesPerWeight['int8']
+    }
+
+    return [math]::Round(($WeightsPerToken * $Tokens * $bytesPerWeight) / 1GB, 1)
+}
+
+function Get-ConfiguredContext([string]$Root, [string]$Tag) {
+    $config = Read-Json (Join-Path $Root "strata-$Tag.json")
+
+    if (-not $config -or -not $config.args) {
+        return 0
+    }
+
+    $cfgArgs = @($config.args)
+
+    for ($i = 0; $i -lt $cfgArgs.Count; $i++) {
+        if ("$($cfgArgs[$i])" -eq '--max-context' -and $i + 1 -lt $cfgArgs.Count) {
+            return Get-IntSetting $cfgArgs[$i + 1] 0
+        }
+    }
+
+    return 0
+}
+
+function Show-RamStability(
+    $Spec,
+    $Variant,
+    [int]$ContextTokens,
+    [string]$KvQuant,
+    [string]$Root,
+    [string]$Tag,
+    [string]$Dir,
+    $GgufDir
+) {
+    Write-Step 'Memory stability'
+
+    $shard = $null
+    $shardFilter = ('*{0}*00001-of-*.gguf' -f $Variant.Model)
+
+    foreach ($searchDir in @($GgufDir, $Dir)) {
+        if (-not $searchDir -or -not (Test-Path -LiteralPath $searchDir)) {
+            continue
+        }
+
+        $shard = Get-ChildItem `
+            -LiteralPath $searchDir `
+            -Recurse `
+            -File `
+            -Filter $shardFilter `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+        if ($shard) {
+            break
+        }
+    }
+
+    $meta = if ($shard) { Read-GgufMeta $shard.FullName } else { $null }
+
+    $weightsPerToken = Get-KvWeightsPerToken $meta
+    $trained = Get-GgufTrainedContext $meta
+
+    $configured = Get-ConfiguredContext $Root $Tag
+
+    if ($configured -le 0) {
+        $configured = $ContextTokens
+    }
+
+    if ($configured -le 0) {
+        $configured = $trained
+    }
+
+    # The published minimum is treated as covering the model at its trained
+    # context with int8 KV; a smaller context or a lower KV quant frees RAM.
+    $estimated = [double]$Variant.MinRamGB
+    $kvGB = $null
+    $kvBaselineGB = $null
+
+    if ($weightsPerToken -and $configured -gt 0) {
+        $kvGB = Get-KvCacheGB $weightsPerToken $configured $KvQuant
+        $kvBaselineGB = Get-KvCacheGB $weightsPerToken ([math]::Max($trained, $configured)) 'int8'
+        $estimated = [math]::Round($Variant.MinRamGB + $kvGB - $kvBaselineGB, 1)
+    }
+
+    Write-Info (
+        'this PC has {0} GB RAM; {1} needs at least {2} GB' -f
+        $Spec.RamGB,
+        $Variant.Model,
+        $Variant.MinRamGB
+    )
+
+    if ($null -ne $kvGB) {
+        Write-Info (
+            'the {0}-token context at {1} KV uses about {2} GB of it' -f
+            $configured,
+            $KvQuant,
+            $kvGB
+        )
+    } else {
+        Write-Info 'the KV cache size could not be measured; the estimate uses the published minimum'
+    }
+
+    $headroom = [math]::Round($Spec.RamGB - $estimated, 1)
+
+    Write-Info "estimated peak use at full context: about $estimated GB"
+
+    if ($headroom -ge $ComfortableHeadroomGB) {
+        Write-Ok "headroom of about $headroom GB: this setup should run comfortably"
+    } elseif ($headroom -ge $TightHeadroomGB) {
+        Write-Warn "headroom of about $headroom GB: close other large apps while the server runs"
+    } else {
+        Write-Host "    warn  headroom of about $headroom GB: the server may run out of RAM and crash" -ForegroundColor Red
+        Write-Host '          lower the context, pick q4_0 KV, or choose a smaller variant' -ForegroundColor Red
+    }
+
+    if ($headroom -lt $ComfortableHeadroomGB -and $weightsPerToken -and $kvBaselineGB) {
+        $bytesPerWeight = $KvBytesPerWeight[[string]$KvQuant]
+
+        if (-not $bytesPerWeight) {
+            $bytesPerWeight = $KvBytesPerWeight['int8']
+        }
+
+        $fitTokens = [long](
+            (
+                ($Spec.RamGB - $ComfortableHeadroomGB - $Variant.MinRamGB + $kvBaselineGB) * 1GB
+            ) / ($weightsPerToken * $bytesPerWeight)
+        )
+
+        if ($fitTokens -gt 0 -and $fitTokens -lt $configured) {
+            $fitTokens = [long]([math]::Floor($fitTokens / 1024) * 1024)
+
+            Write-Info "a context of $fitTokens tokens or less keeps about $ComfortableHeadroomGB GB of headroom"
+        }
+    }
 }
 
 function Test-SetupDrift([string]$Root, [string]$Tag, [int]$ContextTokens, [string]$KvQuant) {
@@ -2772,11 +3105,21 @@ if (-not $openCodePresent -or $openCodeRelease) {
 # ----------------------------------------------------------------------------------------------------
 
 if ($Setup) {
-    Close-SessionResources
-
     Write-Step 'Setup complete'
     Write-Info 'the server was not started and OpenCode was not opened'
     Write-Info 'run scode (or strata-coder) in a project folder when you are ready to use it'
+
+    Show-RamStability `
+        $spec `
+        $variant `
+        $Context `
+        $Kv `
+        $StrataRoot `
+        $tag `
+        $DataDir `
+        $ggufDir
+
+    Close-SessionResources
     exit 0
 }
 

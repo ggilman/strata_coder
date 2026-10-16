@@ -93,6 +93,13 @@ for the port.
 7. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
    Git Bash), the same as `strata-coder -Alias`. Open a new shell window afterwards to pick it up.
 
+When the install finishes, `-Setup` prints a **memory stability** summary: the estimated peak RAM the
+server will use with your chosen variant, context, and KV cache (the KV cache size is measured from the
+downloaded model file), compared against this PC's RAM. It is rated **comfortable** (8+ GB spare),
+**tight** (2-8 GB spare: close other large apps while the server runs), or **risky** (under 2 GB spare:
+the server can run out of RAM and crash). For tight or risky ratings it also suggests a context size
+that keeps a safe margin.
+
 The answers are saved to `setup.json` and every later run reuses them. `-Setup` re-asks and re-saves, then stops
 without starting the server or opening OpenCode; run `scode` afterwards to use it. If the saved
 context or KV cache differs from what the model was configured with, the next run reconfigures the model in place
