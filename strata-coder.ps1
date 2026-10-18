@@ -1397,6 +1397,62 @@ function Prompt-SetupParams($Spec) {
     return $config
 }
 
+$SmartAppControlHint = (
+    'Strata''s engine (strata.exe) is not code-signed, so Smart App Control blocks it. ' +
+    'Turn it off in Windows Security > App & browser control > Smart App Control settings, then run this script again.'
+)
+
+# 0 = off, 1 = on (enforced), 2 = evaluation; absent on Windows 10 and older Windows 11 builds.
+function Get-SmartAppControlState {
+    $value = (
+        Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction SilentlyContinue
+    ).VerifiedAndReputablePolicyState
+
+    switch ($value) {
+        0 { 'off' }
+        1 { 'on' }
+        2 { 'evaluation' }
+        default { $null }
+    }
+}
+
+# Files under $AppDir that Code Integrity refused to load since $Since. Event 3077 is an
+# enforced block; its message names the file by device path, so match on the drive-less tail.
+function Get-SmartAppControlBlocks([datetime]$Since) {
+    $tail = (Split-Path $AppDir -NoQualifier).TrimEnd('\')
+
+    try {
+        $events = Get-WinEvent -FilterHashtable @{
+            LogName   = 'Microsoft-Windows-CodeIntegrity/Operational'
+            Id        = 3077
+            StartTime = $Since
+        } -ErrorAction Stop
+    } catch {
+        return @()
+    }
+
+    @(
+        $events | ForEach-Object {
+            if ($_.Message -match 'attempted to load (.+?) that did not meet') {
+                $file = $Matches[1]
+                $index = $file.IndexOf($tail, [StringComparison]::OrdinalIgnoreCase)
+
+                if ($index -ge 0) {
+                    Join-Path $AppDir $file.Substring($index + $tail.Length).TrimStart('\')
+                }
+            }
+        } | Select-Object -Unique
+    )
+}
+
+function Assert-NotBlockedBySmartAppControl([datetime]$Since) {
+    $blocked = @(Get-SmartAppControlBlocks $Since)
+
+    if ($blocked.Count -gt 0) {
+        Fail "Windows Smart App Control blocked $($blocked -join ', ')." $SmartAppControlHint
+    }
+}
+
 function Get-SystemSpec {
     $spec = [ordered]@{}
 
@@ -2422,6 +2478,19 @@ if ($spec.Avx2 -eq $false) {
     Write-Warn 'this CPU has no AVX2 support; Strata may run slowly'
 }
 
+$smartAppControl = Get-SmartAppControlState
+
+if ($smartAppControl -eq 'on') {
+    Fail 'Windows Smart App Control is on and will stop the Strata server from starting.' $SmartAppControlHint
+}
+
+if ($smartAppControl -eq 'evaluation') {
+    Write-Warn 'Smart App Control is in evaluation mode; if Windows switches it on, it will block Strata''s unsigned engine'
+}
+
+# Start of this run, for finding Smart App Control blocks if setup or the server fails.
+$runStarted = Get-Date
+
 # ----------------------------------------------------------------------------------------------------
 # Saved setup settings
 # ----------------------------------------------------------------------------------------------------
@@ -2940,6 +3009,8 @@ if ($strataTarget) {
         if (-not $setupResult.Configured) {
             Remove-Item -LiteralPath $newRoot -Recurse -Force -ErrorAction SilentlyContinue
 
+            Assert-NotBlockedBySmartAppControl $runStarted
+
             Fail "Strata $strataTarget setup did not finish successfully (exit code $($setupResult.ExitCode))." `
                 'The previous version remains installed. Run without -Update to use it.'
         }
@@ -3024,6 +3095,8 @@ if (-not $modelReady -or $Setup -or $configDrift) {
     $setupResult = Invoke-ModelSetup $StrataRoot $variant $DataDir $Port $Context $Kv $ggufDir $tag
 
     if (-not $setupResult.Configured) {
+        Assert-NotBlockedBySmartAppControl $runStarted
+
         Fail "Strata model setup did not finish successfully (exit code $($setupResult.ExitCode))." `
             'Review the setup output, correct the reported issue, and run the script again.'
     }
@@ -3225,6 +3298,8 @@ if (-not $serverRunning) {
         if (-not $serverProcess.HasExited) {
             [void](Stop-StrataServers $Port)
         }
+
+        Assert-NotBlockedBySmartAppControl $runStarted
 
         Fail "the Strata server did not come up: $reason." `
             "Review the logs above and $StrataRoot\START-HERE.bat."

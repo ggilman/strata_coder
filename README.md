@@ -133,3 +133,6 @@ running after the script exits; stop it with `strata-coder -Stop`.
 - On a managed PC, the only thing that needs IT is a current NVIDIA driver (580 or newer).
 - If Strata has no ready-made engine for the GPU, it would want to install Visual Studio and the CUDA Toolkit, which needs admin. The script
   stops instead.
+- Strata's engine (`strata.exe`) is not code-signed, so Windows Smart App Control blocks it. The script stops at the PC check if
+  Smart App Control is on and tells you how to turn it off. If something still blocks the engine, the script checks the Windows
+  Code Integrity log and names the blocked file.
