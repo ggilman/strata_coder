@@ -745,6 +745,15 @@ function Get-CallingShell {
     }
 
     try {
+        # Run in-process from an interactive PowerShell (.\strata-coder.ps1), our own process is the
+        # calling shell. Only when PowerShell was launched just for this script (powershell -File from
+        # a cmd or bash launcher) does the parent process say which shell the user is in.
+        $self = Get-CimInstance Win32_Process -Filter "ProcessId = $PID" -ErrorAction SilentlyContinue
+
+        if ($self -and $PSCommandPath -and "$($self.CommandLine)" -notlike "*$(Split-Path -Leaf $PSCommandPath)*") {
+            return 'powershell'
+        }
+
         $procId = $PID
 
         for ($hop = 0; $hop -lt 6; $hop++) {
@@ -758,6 +767,10 @@ function Get-CallingShell {
 
             if ($name -eq 'bash.exe' -or $name -eq 'sh.exe') {
                 return 'bash'
+            }
+
+            if ($name -eq 'cmd.exe') {
+                return 'cmd'
             }
 
             if (
