@@ -48,8 +48,8 @@ specific shell when detection picks the wrong one.
 | `strata-coder -CheckOnly` | Shows the specs, the chosen model, disk space, and what is installed. Changes nothing |
 | `strata-coder -NoLaunch` | Sets up and starts the server only |
 | `strata-coder -Stop` | Stops the Strata server |
-| `strata-coder -Status` | Live dashboard of the running server: tokens/sec, context use, GPU/RAM, uptime (`--status` also works; Ctrl+C to quit) |
-| `strata-coder -Update` | Moves Strata and OpenCode to their newest releases |
+| `strata-coder -Status` | Live dashboard of the running server: tokens/sec for the current answer plus the average over all answers, context use, GPU/RAM, uptime (`--status` also works; Ctrl+C to quit) |
+| `strata-coder -Update` | Moves Strata, OpenCode, and ripgrep to their newest releases |
 | `strata-coder -Setup` | Interactive menu for the setup parameters (see below), then installs and configures everything and stops |
 | `strata-coder -DataDir E:\models` | Puts the model files somewhere specific |
 | `strata-coder -Family coder -Model IQ1_M` | Overrides the automatic model choice |
@@ -119,7 +119,7 @@ context or KV cache differs from what the model was configured with, the next ru
    `%USERPROFILE%\ai-models\models`. The setup parameters (model, folder, context, KV cache, port, offline) are saved in
    `%LOCALAPPDATA%\strata-coder\setup.json`; `strata-coder -Setup` asks for them again and re-saves the file, and
    every other run reads them to fill in whatever the command line did not decide.
-4. **Installs** Strata, the model, and OpenCode into `%LOCALAPPDATA%\strata-coder\`. If interrupted, run it again and the download resumes.
+4. **Installs** Strata, the model, OpenCode, and [ripgrep](https://github.com/BurntSushi/ripgrep) into `%LOCALAPPDATA%\strata-coder\`. If interrupted, run it again and the download resumes. ripgrep is the `rg` command OpenCode uses for content search; its folder is added to `PATH` when OpenCode starts, and a failed ripgrep download is only a warning (search still works, just slower).
 5. **Starts the server** hidden on `http://127.0.0.1:8080/v1`, with its output in `%LOCALAPPDATA%\strata-coder\logs\server.log`. The server is OpenAI- and Anthropic-compatible. Each run also keeps a transcript in `logs\run-*.log`. A fresh install uses the tested Strata release (v0.1.40.3); `strata-coder -Update` moves Strata and OpenCode to their newest releases and keeps the old Strata if the new one fails to set up.
 6. **Opens OpenCode** in the current folder. Its config is in `%LOCALAPPDATA%\strata-coder\opencode.json`, so nothing is
    written into your project.

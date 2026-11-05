@@ -33,7 +33,7 @@ param(
     [switch]$Offline,
     [switch]$Help,
     [switch]$Alias,
-    [ValidateSet('auto', 'cmd', 'powershell', 'ps', 'pwsh', 'bash', 'git-bash', 'gitbash')][string]$AliasShell
+    [string]$AliasShell
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,6 +70,8 @@ $LogDir      = Join-Path $AppDir 'logs'
 $UnpackDir   = Join-Path $AppDir 'strata-unpack'
 $GumDir      = Join-Path $AppDir 'gum'
 $GumExe      = Join-Path $GumDir 'gum.exe'
+$RgDir       = Join-Path $AppDir 'ripgrep'
+$RgExe       = Join-Path $RgDir 'rg.exe'
 
 $StrataSettingsPath = Join-Path $env:APPDATA 'Strata\settings.json'
 
@@ -177,6 +179,10 @@ function Fail([string]$Message, [string]$Hint = $null) {
         Write-Host "         Log: $script:TranscriptPath" -ForegroundColor DarkGray
     }
 
+    # Release the setup mutex and close the transcript even on failure paths;
+    # Close-SessionResources is defined below but resolves at call time.
+    Close-SessionResources
+
     exit 1
 }
 
@@ -211,18 +217,39 @@ function Read-Json([string]$Path) {
     }
 }
 
-function Write-Utf8File([string]$Path, [string]$Text) {
+function Write-TextFile([string]$Path, [string]$Text, $Encoding = $null) {
     $parent = Split-Path -Parent $Path
 
     if ($parent) {
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
     }
 
+    if (-not $Encoding) {
+        $Encoding = New-Object Text.UTF8Encoding($false)
+    }
+
     [IO.File]::WriteAllText(
         $Path,
         $Text,
-        (New-Object Text.UTF8Encoding($false))
+        $Encoding
     )
+}
+
+# cmd.exe and DOSKEY read their input in the system OEM codepage; writing those
+# files as UTF-8 mangles any non-ASCII path stored in them.
+function Get-OemEncoding {
+    try {
+        if (-not ('StrataCoder.OemNative' -as [type])) {
+            Add-Type `
+                -Namespace StrataCoder `
+                -Name OemNative `
+                -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint GetOEMCP();'
+        }
+
+        return [Text.Encoding]::GetEncoding([int]([StrataCoder.OemNative]::GetOEMCP()))
+    } catch {
+        return [Text.Encoding]::ASCII
+    }
 }
 
 function Update-ProfileBlock {
@@ -231,7 +258,8 @@ function Update-ProfileBlock {
         [string]$Begin,
         [string]$End,
         [string]$Block,
-        [string]$StripPattern = $null
+        [string]$StripPattern = $null,
+        [string]$NewLine = [Environment]::NewLine
     )
 
     $parent = Split-Path -Parent $Path
@@ -253,11 +281,11 @@ function Update-ProfileBlock {
         $text = [regex]::Replace($text, $StripPattern, '')
     }
 
-    if ($text.Length -gt 0 -and -not $text.EndsWith([Environment]::NewLine)) {
-        $text += [Environment]::NewLine
+    if ($text.Length -gt 0 -and -not $text.EndsWith("`n")) {
+        $text += $NewLine
     }
 
-    Write-Utf8File $Path ($text + $Block + [Environment]::NewLine)
+    Write-TextFile $Path ($text + $Block + $NewLine)
 }
 
 function Get-IntSetting($Value, [int]$Fallback) {
@@ -308,7 +336,7 @@ function Save-State([hashtable]$Changes) {
     }
 
     New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-    Write-Utf8File $StatePath ($state | ConvertTo-Json -Depth 8)
+    Write-TextFile $StatePath ($state | ConvertTo-Json -Depth 8)
 }
 
 function Invoke-Native([string]$Exe, [string[]]$ArgumentList) {
@@ -515,6 +543,61 @@ function Get-LatestRelease([string]$Repository) {
         Write-Warn "could not contact GitHub for $Repository ($($_.Exception.Message))"
         return $null
     }
+}
+
+# Download the release asset matching $AssetFilter, extract $ExeName, and move it
+# to $DestExe. Returns the release object on success, $null after warning with
+# $FailHint on any failure.
+function Install-ToolFromRelease {
+    param(
+        [string]$Repo,
+        $Release,
+        [string]$AssetFilter,
+        [string]$ExeName,
+        [string]$DestExe,
+        [string]$StageName,
+        [string]$FailHint
+    )
+
+    $release = if ($Release) {
+        $Release
+    } else {
+        Get-LatestRelease $Repo
+    }
+
+    if (-not $release) {
+        Write-Warn "could not install $Repo; $FailHint"
+        return $null
+    }
+
+    $asset = @(
+        $release.assets | Where-Object {
+            $_.name -like $AssetFilter
+        }
+    ) | Select-Object -First 1
+
+    if (-not $asset) {
+        Write-Warn "$Repo release $($release.tag_name) has no matching Windows x86_64 zip; $FailHint"
+        return $null
+    }
+
+    $zip = Join-Path $DownloadDir $asset.name
+    $stage = Join-Path $AppDir "$StageName-unpack"
+
+    New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
+
+    try {
+        $stagedExe = Get-DownloadedFile $asset.browser_download_url $zip $stage $ExeName
+    } catch {
+        Write-Warn "could not prepare $Repo ($($_.Exception.Message)); $FailHint"
+        return $null
+    }
+
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $DestExe) | Out-Null
+    Move-Item -LiteralPath $stagedExe -Destination $DestExe -Force
+    Remove-Item -LiteralPath $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
+
+    return $release
 }
 
 function Show-LogTail([string]$Path, [int]$Lines = 25) {
@@ -811,7 +894,7 @@ function Install-ScodeAlias([string]$Shell) {
 
         $lines += "scode=$launcher `$*"
 
-        Write-Utf8File $macroFile (($lines -join [Environment]::NewLine) + [Environment]::NewLine)
+        Write-TextFile $macroFile (($lines -join [Environment]::NewLine) + [Environment]::NewLine) (Get-OemEncoding)
         Write-Ok "updated the DOSKEY macro: $macroFile"
 
         $key = 'HKCU:\Software\Microsoft\Command Processor'
@@ -842,6 +925,8 @@ function Install-ScodeAlias([string]$Shell) {
         $esc = [string][char] 27
         $printfOff = ((Get-MouseOffSequences) | ForEach-Object { $_.Replace($esc, '\033') }) -join ''
 
+        # Bash parses CRLF line endings as literal \r and fails on them, so the
+        # block and the file's trailing newline must use LF.
         $block = @(
             $begin
             "SCODE_CMD='$scriptFile'"
@@ -849,13 +934,13 @@ function Install-ScodeAlias([string]$Shell) {
             'scode() {'
             '    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SCODE_CMD" "$@"'
             '    local rc=$?'
-            "    printf `"$printfOff`" >/dev/tty"
+            "    printf `"$printfOff`" >/dev/tty 2>/dev/null"
             '    return $rc'
             '}'
             $end
-        ) -join [Environment]::NewLine
+        ) -join "`n"
 
-        Update-ProfileBlock $profileFile $begin $end $block '(?m)^\s*alias scode=.*\r?\n?'
+        Update-ProfileBlock $profileFile $begin $end $block '(?m)^\s*alias scode=.*\r?\n?' "`n"
         Write-Ok "updated the scode function in $profileFile"
     } else {
         $profileFile = $PROFILE.CurrentUserCurrentHost
@@ -895,7 +980,8 @@ Options:
   -NoLaunch                  Set up and start the server without OpenCode.
   -Stop                      Stop the Strata server.
   -Status                    Live tokens/sec panel, refreshing in place.
-  -Update                    Update Strata and OpenCode to newest releases.
+  -Update                    Update Strata, OpenCode, and ripgrep to
+                             newest releases.
   -Alias                     Add the scode shortcut. Pick the shell with
                              -AliasShell: auto (default), cmd, powershell,
                              or bash.
@@ -919,49 +1005,45 @@ function Get-Gum {
 
     Write-Step 'Getting gum for the setup menus'
 
-    $release = $null
+    $release = Install-ToolFromRelease `
+        'charmbracelet/gum' `
+        $null `
+        'gum_*_Windows_x86_64.zip' `
+        'gum.exe' `
+        $GumExe `
+        'gum' `
+        'using plain prompts'
 
-    try {
-        $release = Invoke-RestMethod `
-            -UseBasicParsing `
-            -Uri 'https://api.github.com/repos/charmbracelet/gum/releases/latest' `
-            -Headers @{ 'User-Agent' = 'strata-coder' } `
-            -ErrorAction Stop
-    } catch {
-        Write-Warn "could not contact GitHub for gum ($($_.Exception.Message)); using plain prompts"
+    if (-not $release) {
         return $null
     }
-
-    $asset = @(
-        $release.assets | Where-Object {
-            $_.name -like 'gum_*_Windows_x86_64.zip'
-        }
-    ) | Select-Object -First 1
-
-    if (-not $asset) {
-        Write-Warn "gum release $($release.tag_name) has no Windows x86_64 zip; using plain prompts"
-        return $null
-    }
-
-    $zip = Join-Path $DownloadDir $asset.name
-    $stage = Join-Path $AppDir 'gum-unpack'
-
-    New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
-
-    try {
-        $stagedExe = Get-DownloadedFile $asset.browser_download_url $zip $stage 'gum.exe'
-    } catch {
-        Write-Warn "could not prepare gum ($($_.Exception.Message)); using plain prompts"
-        return $null
-    }
-
-    New-Item -ItemType Directory -Force -Path $GumDir | Out-Null
-    Move-Item -LiteralPath $stagedExe -Destination $GumExe -Force
-    Remove-Item -LiteralPath $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Ok "gum is ready at $GumExe"
 
     return $GumExe
+}
+
+function Install-Ripgrep($Release) {
+    $release = Install-ToolFromRelease `
+        'BurntSushi/ripgrep' `
+        $Release `
+        'ripgrep-*x86_64-pc-windows-msvc.zip' `
+        'rg.exe' `
+        $RgExe `
+        'ripgrep' `
+        'OpenCode content search will be slower'
+
+    if (-not $release) {
+        return $false
+    }
+
+    Save-State @{
+        RipgrepVersion = $release.tag_name
+    }
+
+    Write-Ok "ripgrep $($release.tag_name) is ready at $RgExe"
+
+    return $true
 }
 
 function Invoke-GumChoose([string]$Header, [string[]]$OrderedLabels) {
@@ -1387,7 +1469,7 @@ function Prompt-SetupParams($Spec) {
     }
 
     New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-    Write-Utf8File $SetupPath ($config | ConvertTo-Json -Depth 5)
+    Write-TextFile $SetupPath ($config | ConvertTo-Json -Depth 5)
     Write-Ok "setup saved to $SetupPath"
 
     if ($addAlias) {
@@ -1719,18 +1801,37 @@ function Get-GgufTrainedContext($Meta) {
     return Get-IntSetting $Meta["$arch.context_length"] 0
 }
 
-function Get-KvCacheGB($WeightsPerToken, [long]$Tokens, [string]$KvQuant) {
-    if (-not $WeightsPerToken -or $Tokens -le 0) {
-        return $null
-    }
-
+function Get-KvBytes([string]$KvQuant) {
     $bytesPerWeight = $KvBytesPerWeight[[string]$KvQuant]
 
     if (-not $bytesPerWeight) {
         $bytesPerWeight = $KvBytesPerWeight['int8']
     }
 
-    return [math]::Round(($WeightsPerToken * $Tokens * $bytesPerWeight) / 1GB, 1)
+    return $bytesPerWeight
+}
+
+function Get-KvCacheGB($WeightsPerToken, [long]$Tokens, [string]$KvQuant) {
+    if (-not $WeightsPerToken -or $Tokens -le 0) {
+        return $null
+    }
+
+    return [math]::Round(
+        ($WeightsPerToken * $Tokens * (Get-KvBytes $KvQuant)) / 1GB,
+        1
+    )
+}
+
+function Get-ConfigArgValue([object]$Config, [string]$Name) {
+    $cfgArgs = @($Config.args)
+
+    for ($i = 0; $i -lt $cfgArgs.Count; $i++) {
+        if ("$($cfgArgs[$i])" -eq $Name -and $i + 1 -lt $cfgArgs.Count) {
+            return "$($cfgArgs[$i + 1])"
+        }
+    }
+
+    return $null
 }
 
 function Get-ConfiguredContext([string]$Root, [string]$Tag) {
@@ -1740,15 +1841,30 @@ function Get-ConfiguredContext([string]$Root, [string]$Tag) {
         return 0
     }
 
-    $cfgArgs = @($config.args)
+    return Get-IntSetting (Get-ConfigArgValue $config '--max-context') 0
+}
 
-    for ($i = 0; $i -lt $cfgArgs.Count; $i++) {
-        if ("$($cfgArgs[$i])" -eq '--max-context' -and $i + 1 -lt $cfgArgs.Count) {
-            return Get-IntSetting $cfgArgs[$i + 1] 0
-        }
+# Glob filters for the first shard and for any shard of a model's split GGUF set.
+function Get-ModelShardFilter([string]$Model, [bool]$FirstShard) {
+    if ($FirstShard) {
+        return ('*{0}*00001-of-*.gguf' -f $Model)
     }
 
-    return 0
+    return ('*{0}*-of-*.gguf' -f $Model)
+}
+
+function Find-ModelShard([string]$Dir, [string]$Filter) {
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) {
+        return $null
+    }
+
+    return Get-ChildItem `
+        -LiteralPath $Dir `
+        -Recurse `
+        -File `
+        -Filter $Filter `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
 }
 
 function Show-RamStability(
@@ -1763,21 +1879,11 @@ function Show-RamStability(
 ) {
     Write-Step 'Memory stability'
 
+    $shardFilter = Get-ModelShardFilter $Variant.Model $true
     $shard = $null
-    $shardFilter = ('*{0}*00001-of-*.gguf' -f $Variant.Model)
 
     foreach ($searchDir in @($GgufDir, $Dir)) {
-        if (-not $searchDir -or -not (Test-Path -LiteralPath $searchDir)) {
-            continue
-        }
-
-        $shard = Get-ChildItem `
-            -LiteralPath $searchDir `
-            -Recurse `
-            -File `
-            -Filter $shardFilter `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+        $shard = Find-ModelShard $searchDir $shardFilter
 
         if ($shard) {
             break
@@ -1844,11 +1950,7 @@ function Show-RamStability(
     }
 
     if ($headroom -lt $ComfortableHeadroomGB -and $weightsPerToken -and $kvBaselineGB) {
-        $bytesPerWeight = $KvBytesPerWeight[[string]$KvQuant]
-
-        if (-not $bytesPerWeight) {
-            $bytesPerWeight = $KvBytesPerWeight['int8']
-        }
+        $bytesPerWeight = Get-KvBytes $KvQuant
 
         $fitTokens = [long](
             (
@@ -1871,17 +1973,8 @@ function Test-SetupDrift([string]$Root, [string]$Tag, [int]$ContextTokens, [stri
         return $false
     }
 
-    $cfgArgs = @($config.args)
-    $currentContext = $null
-    $currentKv = $null
-
-    for ($i = 0; $i -lt $cfgArgs.Count; $i++) {
-        if ("$($cfgArgs[$i])" -eq '--max-context' -and $i + 1 -lt $cfgArgs.Count) {
-            $currentContext = "$($cfgArgs[$i + 1])"
-        } elseif ("$($cfgArgs[$i])" -eq '--kv' -and $i + 1 -lt $cfgArgs.Count) {
-            $currentKv = "$($cfgArgs[$i + 1])"
-        }
-    }
+    $currentContext = Get-ConfigArgValue $config '--max-context'
+    $currentKv = Get-ConfigArgValue $config '--kv'
 
     if ($ContextTokens -and $currentContext -ne "$ContextTokens") {
         return $true
@@ -2137,6 +2230,134 @@ if ($Stop) {
     exit 0
 }
 
+# Turns one /status + /v1/status + /metrics snapshot into the panel text and colors.
+function Get-StatusDisplay($StatusInfo, $V1Status, $Totals) {
+    $timing = $V1Status.last_timings
+    $machine = $V1Status.machine
+    $activity = $V1Status.activity
+
+    if ($StatusInfo.busy -and $StatusInfo.tokens_per_s) {
+        $liveText = ('generating at {0:N1} tok/s' -f $StatusInfo.tokens_per_s)
+        $border256 = 46
+        $liveColor = 'Green'
+    } elseif ($StatusInfo.busy) {
+        $liveText = 'busy'
+        $border256 = 220
+        $liveColor = 'Yellow'
+    } else {
+        $liveText = 'idle'
+        $border256 = 241
+        $liveColor = 'DarkGray'
+    }
+
+    $phaseText = if ($StatusInfo.phase) { "  phase: $($StatusInfo.phase)" } else { '' }
+
+    $bodyLines = @(
+        ('status:   {0}{1}' -f $liveText, $phaseText)
+    )
+
+    if ($timing -and $timing.predicted_per_second) {
+        $bodyLines += (
+            'answer:   {0} tok at {1:N1} tok/s, cache {2}' -f
+            $timing.predicted_n,
+            $timing.predicted_per_second,
+            $timing.cache_n
+        )
+        $bodyLines += (
+            'prompt:   {0} tok at {1:N1} tok/s' -f
+            $timing.prompt_n,
+            $timing.prompt_per_second
+        )
+    } else {
+        $bodyLines += 'answer:   none yet'
+        $bodyLines += 'prompt:   none yet'
+    }
+
+    # Lifetime average over every finished answer since the server started,
+    # from the /metrics totals (output tokens over summed decode time).
+    if ($Totals -and [double]$Totals.output_tokens -gt 0 -and [double]$Totals.decode_ms -gt 0) {
+        $bodyLines += (
+            'average:  {0:N1} tok/s over {1} answers since start' -f
+            (1000 * [double]$Totals.output_tokens / [double]$Totals.decode_ms),
+            $Totals.requests
+        )
+    } else {
+        $bodyLines += 'average:  none yet'
+    }
+
+    if ($V1Status.cache_max_tokens -and $null -ne $StatusInfo.prompt_tokens) {
+        $bodyLines += (
+            'context:  {0} / {1} ({2:N0}%)' -f
+            $StatusInfo.prompt_tokens,
+            $V1Status.cache_max_tokens,
+            (100 * $StatusInfo.prompt_tokens / $V1Status.cache_max_tokens)
+        )
+    } else {
+        $bodyLines += 'context:  unknown'
+    }
+
+    $gpu = $machine.gpu
+
+    if ($gpu) {
+        $bodyLines += (
+            'gpu:      {0}% util, {1} C, {2:N0} W, VRAM {3:N1} / {4:N1} GiB' -f
+            [Math]::Round($gpu.util_pct),
+            [Math]::Round($gpu.temp_c),
+            $gpu.power_w,
+            ($gpu.used_mib / 1024),
+            ($gpu.total_mib / 1024)
+        )
+    } else {
+        $bodyLines += 'gpu:      n/a'
+    }
+
+    $ram = $machine.ram
+
+    if ($ram) {
+        $bodyLines += (
+            'ram:      {0:N1} / {1:N1} GiB' -f
+            $ram.used_gib,
+            $ram.total_gib
+        )
+    } else {
+        $bodyLines += 'ram:      n/a'
+    }
+
+    $bodyLines += (
+        'requests: {0} total, {1} in flight, {2} queued' -f
+        $activity.requests,
+        $activity.in_flight,
+        $StatusInfo.queued
+    )
+
+    $upS = [double]$V1Status.uptime_s
+    $upText = if ($upS -ge 3600) {
+        '{0}h {1}m' -f [Math]::Floor($upS / 3600), [Math]::Floor(($upS % 3600) / 60)
+    } else {
+        '{0}m' -f [Math]::Floor($upS / 60)
+    }
+
+    $mtpText = if ($timing -and $timing.draft_n) {
+        '  MTP accept {0:N0}%' -f (100 * $timing.draft_n_accepted / $timing.draft_n)
+    } else {
+        ''
+    }
+
+    $bodyLines += (
+        'uptime:   {0}  engine {1}{2}' -f
+        $upText,
+        $V1Status.engine,
+        $mtpText
+    )
+
+    return [pscustomobject]@{
+        BodyLines = $bodyLines
+        LiveColor = $liveColor
+        Border256 = $border256
+        ModelText = if ($V1Status.model) { $V1Status.model } else { 'model' }
+    }
+}
+
 function Show-StatusPanel([int]$ServerPort) {
     $process = @(Get-StrataServerProcesses) | Select-Object -First 1
 
@@ -2215,112 +2436,19 @@ function Show-StatusPanel([int]$ServerPort) {
             continue
         }
 
-        $timing = $v1Status.last_timings
-        $machine = $v1Status.machine
-        $activity = $v1Status.activity
-        $modelText = if ($v1Status.model) { $v1Status.model } else { 'model' }
-
-        if ($statusInfo.busy -and $statusInfo.tokens_per_s) {
-            $liveText = ('generating at {0:N1} tok/s' -f $statusInfo.tokens_per_s)
-            $border256 = 46
-            $liveColor = 'Green'
-        } elseif ($statusInfo.busy) {
-            $liveText = 'busy'
-            $border256 = 220
-            $liveColor = 'Yellow'
-        } else {
-            $liveText = 'idle'
-            $border256 = 241
-            $liveColor = 'DarkGray'
+        # The /metrics totals feed the lifetime average: optional, so an older
+        # server without the endpoint only loses that one panel line.
+        $totals = $null
+        try {
+            $totals = (Invoke-RestMethod `
+                -UseBasicParsing `
+                -Uri "$base/metrics" `
+                -TimeoutSec 5).totals
+        } catch {
         }
 
-        $phaseText = if ($statusInfo.phase) { "  phase: $($statusInfo.phase)" } else { '' }
-
-        $bodyLines = @(
-            ('status:   {0}{1}' -f $liveText, $phaseText)
-        )
-
-        if ($timing -and $timing.predicted_per_second) {
-            $bodyLines += (
-                'answer:   {0} tok at {1:N1} tok/s, cache {2}' -f
-                $timing.predicted_n,
-                $timing.predicted_per_second,
-                $timing.cache_n
-            )
-            $bodyLines += (
-                'prompt:   {0} tok at {1:N1} tok/s' -f
-                $timing.prompt_n,
-                $timing.prompt_per_second
-            )
-        } else {
-            $bodyLines += 'answer:   none yet'
-            $bodyLines += 'prompt:   none yet'
-        }
-
-        if ($v1Status.cache_max_tokens -and $null -ne $statusInfo.prompt_tokens) {
-            $bodyLines += (
-                'context:  {0} / {1} ({2:N0}%)' -f
-                $statusInfo.prompt_tokens,
-                $v1Status.cache_max_tokens,
-                (100 * $statusInfo.prompt_tokens / $v1Status.cache_max_tokens)
-            )
-        } else {
-            $bodyLines += 'context:  unknown'
-        }
-
-        $gpu = $machine.gpu
-
-        if ($gpu) {
-            $bodyLines += (
-                'gpu:      {0}% util, {1} C, {2:N0} W, VRAM {3:N1} / {4:N1} GiB' -f
-                [Math]::Round($gpu.util_pct),
-                [Math]::Round($gpu.temp_c),
-                $gpu.power_w,
-                ($gpu.used_mib / 1024),
-                ($gpu.total_mib / 1024)
-            )
-        } else {
-            $bodyLines += 'gpu:      n/a'
-        }
-
-        $ram = $machine.ram
-
-        if ($ram) {
-            $bodyLines += (
-                'ram:      {0:N1} / {1:N1} GiB' -f
-                $ram.used_gib,
-                $ram.total_gib
-            )
-        } else {
-            $bodyLines += 'ram:      n/a'
-        }
-
-        $bodyLines += (
-            'requests: {0} total, {1} in flight, {2} queued' -f
-            $activity.requests,
-            $activity.in_flight,
-            $statusInfo.queued
-        )
-
-        $upS = [double]$v1Status.uptime_s
-        $upText = if ($upS -ge 3600) {
-            '{0}h {1}m' -f [Math]::Floor($upS / 3600), [Math]::Floor(($upS % 3600) / 60)
-        } else {
-            '{0}m' -f [Math]::Floor($upS / 60)
-        }
-
-        $mtpText = if ($timing -and $timing.draft_n) {
-            '  MTP accept {0:N0}%' -f (100 * $timing.draft_n_accepted / $timing.draft_n)
-        } else {
-            ''
-        }
-
-        $bodyLines += (
-            'uptime:   {0}  engine {1}{2}' -f
-            $upText,
-            $v1Status.engine,
-            $mtpText
-        )
+        $display = Get-StatusDisplay $statusInfo $v1Status $totals
+        $bodyLines = @($display.BodyLines)
 
         if ($gum) {
             $panelLines = $bodyLines.Count + 4
@@ -2337,14 +2465,14 @@ function Show-StatusPanel([int]$ServerPort) {
                 }
             )
 
-            $titleText = " Strata  $modelText  $base "
+            $titleText = " Strata  $($display.ModelText)  $base "
 
             if ($titleText.Length -gt ($maxLen + 2)) {
                 $titleText = $titleText.Substring(0, $maxLen + 2)
             }
 
             $title = & $gum style --bold --foreground 212 --padding '0,1' --width $boxWidth $titleText
-            $body = & $gum style --border rounded --border-foreground $border256 --padding '0,1' --foreground 255 --width $boxWidth ($bodyLines -join "`n")
+            $body = & $gum style --border rounded --border-foreground $display.Border256 --padding '0,1' --foreground 255 --width $boxWidth ($bodyLines -join "`n")
             $foot = & $gum style --italic --foreground 241 --padding '0,1' --width $boxWidth (' Ctrl+C to quit   {0} ' -f (Get-Date -Format 'HH:mm:ss'))
         } else {
             $panelLines = $bodyLines.Count + 2
@@ -2376,7 +2504,7 @@ function Show-StatusPanel([int]$ServerPort) {
 
             for ($i = 0; $i -lt $bodyLines.Count; $i++) {
                 if ($i -eq 0) {
-                    Write-Host (Format-PanelRow $bodyLines[$i]) -ForegroundColor $liveColor
+                    Write-Host (Format-PanelRow $bodyLines[$i]) -ForegroundColor $display.LiveColor
                 } else {
                     Write-Host (Format-PanelRow $bodyLines[$i])
                 }
@@ -2394,6 +2522,18 @@ function Show-StatusPanel([int]$ServerPort) {
 }
 
 if ($Status) {
+    if (-not $PortSpecified) {
+        $statusSetup = Read-Json $SetupPath
+
+        if ($statusSetup) {
+            $statusPort = Get-IntSetting $statusSetup.port 0
+
+            if ($statusPort -gt 0) {
+                $Port = $statusPort
+            }
+        }
+    }
+
     Show-StatusPanel $Port
     exit 0
 }
@@ -2499,6 +2639,8 @@ $savedSetup = Read-Json $SetupPath
 
 if ($Setup -and -not $CheckOnly) {
     $savedSetup = Prompt-SetupParams $spec
+} elseif ($Setup) {
+    Write-Warn 'the -Setup menu was skipped because -CheckOnly changes nothing'
 }
 
 $FamilyFilter = $Family
@@ -2721,6 +2863,28 @@ if ($openCodePresent -and $Update) {
     }
 }
 
+$rgPresent = Test-Path -LiteralPath $RgExe
+$rgRelease = $null
+
+if ($rgPresent) {
+    Write-Ok "ripgrep installed ($RgDir)"
+
+    if ($Update) {
+        $rgRelease = Get-LatestRelease 'BurntSushi/ripgrep'
+
+        if (-not $rgRelease) {
+            Write-Warn 'skipping the ripgrep update check; continuing with the installed version'
+        } elseif ($rgRelease.tag_name.TrimStart('v') -eq "$($state.RipgrepVersion)".Trim().TrimStart('v')) {
+            Write-Ok 'ripgrep is up to date'
+            $rgRelease = $null
+        } else {
+            Write-Info "ripgrep update available: $($state.RipgrepVersion) -> $($rgRelease.tag_name)"
+        }
+    }
+} else {
+    Write-Info "ripgrep: not installed (target: $RgDir)"
+}
+
 $serverRunning = $false
 $health = Get-StrataHealth $Port
 
@@ -2779,8 +2943,8 @@ if ($DataDir) {
 $ggufDir = $null
 
 if (-not $modelReady) {
-    $shardFilter = ('*{0}*00001-of-*.gguf' -f $variant.Model)
-    $anyShardFilter = ('*{0}*-of-*.gguf' -f $variant.Model)
+    $shardFilter = Get-ModelShardFilter $variant.Model $true
+    $anyShardFilter = Get-ModelShardFilter $variant.Model $false
 
     $hfHub = if ($env:HF_HUB_CACHE) {
         $env:HF_HUB_CACHE
@@ -2827,13 +2991,7 @@ if (-not $modelReady) {
     }
 
     if (-not $ggufDir -and (Test-Path -LiteralPath $DataDir)) {
-        $firstShard = Get-ChildItem `
-            -LiteralPath $DataDir `
-            -Recurse `
-            -File `
-            -Filter $shardFilter `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
+        $firstShard = Find-ModelShard $DataDir $shardFilter
 
         if (
             $firstShard -and
@@ -2962,6 +3120,14 @@ if ($CheckOnly) {
         'would be installed'
     }
 
+    $rgLine = if ($rgRelease) {
+        "would be updated to $($rgRelease.tag_name)"
+    } elseif ($rgPresent) {
+        'installed'
+    } else {
+        'would be installed'
+    }
+
     $serverLine = if ($serverRunning) {
         "running on port $Port"
     } else {
@@ -2971,6 +3137,7 @@ if ($CheckOnly) {
     Write-Info "Strata:   $strataLine"
     Write-Info "Model:    $modelLine"
     Write-Info "OpenCode: $openCodeLine"
+    Write-Info "ripgrep:  $rgLine"
     Write-Info "Server:   $serverLine"
     Write-Info "Project:  $ProjectDir"
 
@@ -3200,6 +3367,22 @@ if (-not $openCodePresent -or $openCodeRelease) {
 }
 
 # ----------------------------------------------------------------------------------------------------
+# ripgrep installation: OpenCode's content search invokes rg directly
+# ----------------------------------------------------------------------------------------------------
+
+if (-not $rgPresent -or $rgRelease) {
+    Write-Step $(if ($rgRelease) {
+        'Updating ripgrep'
+    } else {
+        'Installing ripgrep'
+    })
+
+    [void](Install-Ripgrep $rgRelease)
+} else {
+    Write-Skip 'ripgrep already installed'
+}
+
+# ----------------------------------------------------------------------------------------------------
 # -Setup stops here: install and configure only, no server, no OpenCode
 # ----------------------------------------------------------------------------------------------------
 
@@ -3274,10 +3457,6 @@ if (-not $serverRunning) {
         -PassThru
 
     Remove-Item Env:STRATA_CODER_CMD -ErrorAction SilentlyContinue
-
-    Save-State @{
-        Port = $Port
-    }
 
     Write-Info 'loading the model; the first start may take several minutes'
     Write-Info "server output: $serverLog"
@@ -3441,7 +3620,7 @@ $oldOpenCodeJson = if (Test-Path -LiteralPath $OpenCodeCfg) {
 }
 
 if ("$oldOpenCodeJson".Trim() -ne $openCodeJson.Trim()) {
-    Write-Utf8File $OpenCodeCfg $openCodeJson
+    Write-TextFile $OpenCodeCfg $openCodeJson
     Write-Ok "OpenCode config written: $OpenCodeCfg"
 } else {
     Write-Skip 'OpenCode config is already current'
@@ -3471,6 +3650,14 @@ Write-Step "Opening OpenCode in $ProjectDir"
 
 # OPENCODE_CONFIG allows inspection of the generated file.
 $env:OPENCODE_CONFIG = $OpenCodeCfg
+
+# OpenCode's content search invokes rg directly: put the installed ripgrep
+# folder on PATH so it is found even when ripgrep is not installed system-wide.
+if (Test-Path -LiteralPath $RgExe) {
+    if (";$env:PATH;" -notlike "*;$RgDir;*") {
+        $env:PATH = "$RgDir;$env:PATH"
+    }
+}
 
 # OPENCODE_CONFIG_CONTENT is an inline runtime override. It prevents another
 # OpenCode config in the project tree from replacing the local Strata provider
@@ -3507,7 +3694,7 @@ try {
     }
 
     $debugText = $debugOutput -join [Environment]::NewLine
-    Write-Utf8File $debugConfigPath $debugText
+    Write-TextFile $debugConfigPath $debugText
 
     if ($debugText -notmatch [regex]::Escape('"strata"')) {
         Write-Warn 'OpenCode resolved configuration did not show the Strata provider.'
