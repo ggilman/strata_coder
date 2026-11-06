@@ -90,33 +90,160 @@ def kv_options():
 GRADE_LETTERS = {"green": "+", "yellow": "!", "red": "x"}
 GUI_GRADE_COLORS = {"green": "#0a7d28", "yellow": "#a06b00", "red": "#c00000"}
 
+FASTEST_ICON = "\u26a1"
+QUALITY_STARS = {"best": "\u2605\u2605\u2605", "above IQ3_S": "\u2605\u2605\u2605",
+                 "great": "\u2605\u2605", "better": "\u2605\u2605",
+                 "good": "\u2605", "code only": "\u2605"}
 
-def variant_label(variant, grade="", note="", is_best=False):
-    """The one-line label of a variant; grade and note come from the CLI's grade_variant()
-    (green/yellow/red plus why), is_best marks the one this PC runs best."""
-    facts = "needs %d GB RAM" % variant["min_ram_gb"]
+
+def quality_stars(variant, star="\u2605"):
+    return QUALITY_STARS.get(variant.get("quality_word"), "").replace("\u2605", star)
+
+
+def variant_label(variant, grade="", fastest=False, star="\u2605",
+                  fastest_icon=FASTEST_ICON):
+    """The one-line label of a variant: '+ Qwen3.8-Flash-Next IQ3_S (60 GB, ~53 tok/s) \u2605\u2605\u2605'.
+    grade and fastest come from the CLI (grade_variant() plus the fastest variant this PC can
+    run); everything the short label drops - the full title, the grade reason, the best marker -
+    lives in the info popup (GUI) or the advice line (console)."""
+    facts = "%d GB" % variant["min_ram_gb"]
 
     if variant.get("speed_tok_s"):
-        facts += ", ~%d tok/s" % variant["speed_tok_s"]
+        facts += ", ~%d tok/s%s" % (variant["speed_tok_s"],
+                                    " " + fastest_icon if fastest else "")
 
-    text = "%s (%s)" % (variant["title"], facts)
+    text = "%s (%s) %s" % (short_name(variant), facts, quality_stars(variant, star))
 
     if grade in GRADE_LETTERS:
         text = "%s %s" % (GRADE_LETTERS[grade], text)
 
-    if grade == "red":
-        text += "  -  NOT ENOUGH RAM ON THIS PC"
-    elif note:
-        text += "  -  " + note
-
-    if is_best:
-        text += "   <- best this PC can run"
-
     return text
 
 
-GRADE_LEGEND = ["+ full speed   ! runs with a cost   x not enough RAM here",
-                "tok/s = answers per second (60+ is faster than reading)"]
+def grade_legend(star="\u2605", fastest_icon=FASTEST_ICON):
+    return ["+ full speed   ! runs with a cost   x not enough RAM here",
+            "quality: %s good   %s%s better   %s%s%s best    %s = the fastest this PC can run"
+            % (star, star, star, star, star, star, fastest_icon),
+            "tok/s = answers per second (60+ is faster than reading)"]
+
+
+def scode_info_text():
+    return "\n".join([
+        "The scode shortcut",
+        "",
+        "Adds a command named scode so Strata Coder starts from any shell window by just typing "
+        "scode - no paths to remember. It runs this same script, so scode -Status, scode -Stop "
+        "and scode -Setup work from anywhere.",
+        "",
+        "Where the shortcut lands depends on the shell chosen next to this button:",
+        "  PowerShell:  a scode function in your current-user profile file.",
+        "  cmd:         a DOSKEY macro file in %USERPROFILE%\\bin, loaded by a Command Processor "
+        "AutoRun entry (any AutoRun value you already have is kept, not replaced).",
+        "  bash / zsh:  a marked scode function block in ~/.bashrc, ~/.bash_profile or ~/.zshrc.",
+        "",
+        "auto picks the shell that opened this setup window. Pressing the button again just "
+        "rewrites the block, so it also repairs the shortcut if this script is ever moved. "
+        "Close and reopen a shell window before scode works.",
+    ])
+
+
+def engine_info_text():
+    return "\n".join([
+        "Delete the Strata engine",
+        "",
+        "Removes the downloaded Strata engine program (strata.exe on Windows, strata on Linux) "
+        "from the engine folder and the model folder. The downloaded model files are NOT touched.",
+        "",
+        "Use it when Windows Smart App Control or your antivirus blocked or quarantined the "
+        "engine, when the engine misbehaves and a clean copy should replace it, or when you are "
+        "about to run offline isolation, which deletes and rebuilds it itself.",
+        "",
+        "The next -Setup downloads the engine again, so that part needs network.",
+    ])
+
+
+def context_info_text():
+    return "\n".join([
+        "Context size",
+        "",
+        "How much the model can keep in mind at once: the conversation so far, opened files, "
+        "tool results. A token is roughly four characters of English, so 32K tokens is a few "
+        "hundred pages.",
+        "",
+        "0 lets Strata pick its recommendation for this model and PC.",
+        "",
+        "A bigger context costs two things:",
+        "  - RAM: the KV cache reserves memory for the whole context and grows in a straight "
+        "line with it - at 128K and above that is tens of GB on top of the model. The RAM "
+        "grading on this screen counts it; if it comes up tight, lower the context or step "
+        "the KV cache down.",
+        "  - time: a long prompt must first be read (a 32K prompt takes about 10-20 seconds "
+        "depending on the variant); the speed of answers afterwards does not change.",
+        "",
+        "The models were trained on 256K tokens. Past that Strata stretches them with YaRN: "
+        "it works, but very long contexts answer weaker. Most coding work fits comfortably "
+        "in 64K-128K.",
+    ])
+
+
+def kv_info_text():
+    return "\n".join([
+        "KV cache quantization",
+        "",
+        "The KV cache is the memory holding every token the model has already read. This "
+        "setting chooses how precisely it is kept: less precision means a smaller cache - the "
+        "same context in less RAM - at the price of a little answer quality.",
+        "",
+        "  int8:  full precision. The default; pick it while RAM has room.",
+        "  k8v4:  keeps the cache about a quarter smaller; the quality change is rarely "
+        "noticeable.",
+        "  q4_0:  about half the cache, the biggest saving; long or very detailed answers can "
+        "degrade slightly.",
+        "",
+        "Rule of thumb: stay on int8; step down a notch when a large context no longer fits, "
+        "before you shrink the context itself.",
+    ])
+
+
+def offline_info_text():
+    return "\n".join([
+        "Fully local",
+        "",
+        "Nothing leaves this PC. While OpenCode runs:",
+        "  - OpenCode and every process it starts get a dead proxy (http://127.0.0.1:9), so "
+        "any web request dies instantly;",
+        "  - OpenCode's webfetch and websearch tools are switched off;",
+        "  - its bash gets a deny list for network tools: curl, wget, ssh, git push/pull/"
+        "clone, npm, pip, uv, conda, winget installs and friends. All other commands keep "
+        "working.",
+        "",
+        "Local traffic stays exempt (NO_PROXY covers 127.0.0.1 and localhost), so OpenCode "
+        "still reaches the model server on this PC. Everything is undone the moment OpenCode "
+        "exits; no permanent machine changes are made.",
+        "",
+        "Use it for sensitive code you never want this machine to be able to send out.",
+    ])
+
+
+def sandbox_info_text():
+    return "\n".join([
+        "Docker sandbox",
+        "",
+        "The stronger wall: OpenCode itself runs inside a Docker container instead of on this "
+        "PC.",
+        "  - the container sits on an internal Docker network with no route to the internet;",
+        "  - it reaches the model only through a small relay on that network, and the model "
+        "still runs on this PC;",
+        "  - only the project folder you open is mounted inside the container - the rest of "
+        "this PC is invisible to it;",
+        "  - inside the container the same dead proxy and network-tool deny list as Fully "
+        "local apply.",
+        "",
+        "Even a misbehaving or compromised OpenCode cannot reach your other files or your "
+        "network. Needs Docker (Desktop or Engine); the image is built on first use, Fully "
+        "local is switched on together with it, and OpenCode's history is kept in a named "
+        "volume that survives restarts.",
+    ])
 
 
 def speed_nudge(variant, peers, ram_gb):
@@ -152,32 +279,57 @@ def short_name(variant):
     return variant["title"].rsplit(" (", 1)[0]
 
 
-def variant_advice_text(sc, variant, grade, note, ram_gb, is_best, peers):
-    """the one- or two-line explanation under the variant list."""
-    name = short_name(variant)
+def variant_info_text(sc, variant, grade, note, ram_gb, is_best, fastest, peers):
+    """the full details behind one variant, shown in the GUI's info popup."""
+    lines = [variant["title"], ""]
 
     if grade == "green":
-        text = "%s runs at full speed on this PC." % name
+        lines.append("Runs at full speed on this PC.")
     elif grade == "yellow":
-        text = "%s runs here, but %s." % (name, note)
+        lines.append("Runs here, but %s." % note)
     else:
-        text = "%s needs about %d GB RAM; this PC has %s GB." % (
-            name, variant["min_ram_gb"], ram_gb)
-
-    if variant.get("speed_tok_s"):
-        text += ("  Answers ~%d tokens per second; a 32K prompt reads in about %d seconds; "
-                 "quality: %s.%s"
-                 % (variant["speed_tok_s"],
-                    max(1, int(round(32768.0 / (variant.get("prompt_tok_s") or 1600)))),
-                    variant.get("quality_word", ""), speed_nudge(variant, peers, ram_gb)))
-    elif grade == "yellow" and variant.get("budget"):
-        text += ("  Measured about 8 tokens per second on a 64 GB PC (IQ3_S: ~53); it needs about "
-                 "%d GB of RAM to hold all of its experts." % sc.SSD_BUDGET_RAM_GB)
+        lines.append("Will NOT run: this PC does not have the RAM it needs.")
 
     if is_best:
-        text += "  (best this PC can run)"
+        lines[-1] += "  It is the best this PC can run."
 
-    return text
+    if variant.get("speed_tok_s"):
+        lines.append("")
+        lines.append("Answers ~%d tokens per second (60+ is faster than reading); a 32K-token "
+                     "prompt reads in about %d seconds."
+                     % (variant["speed_tok_s"],
+                        max(1, int(round(32768.0 / (variant.get("prompt_tok_s") or 1600))))))
+
+        if fastest:
+            lines.append("This is the fastest variant this PC can run.")
+    elif variant.get("budget"):
+        lines.append("")
+
+        if ram_gb < sc.SSD_BUDGET_RAM_GB:
+            lines.append("Measured about 8 tokens per second on a 64 GB PC (IQ3_S: ~53): it keeps "
+                         "only part of its experts in RAM and reads the rest from the SSD; about "
+                         "%d GB of RAM is needed to hold all of them." % sc.SSD_BUDGET_RAM_GB)
+        else:
+            lines.append("No published speed yet (close to IQ3_S when all its experts fit in "
+                         "RAM); Strata marks this quant experimental.")
+
+    lines.append("")
+    lines.append("Quality: %s. More stars answer better but run slower; fewer stars run faster."
+                 % variant.get("quality_word", ""))
+    lines.append("Model files: about %s GB to download; uses about %d GB of RAM while running."
+                 % (variant["download_gb"], variant["arena_gb"]))
+    lines.append("Needs about %d GB RAM; this PC has %s GB."
+                 % (variant["min_ram_gb"], ram_gb))
+    lines.append("Trained context: 262144 tokens (256k); beyond that Strata stretches it with "
+                 "YaRN and answers get weaker.")
+
+    nudge = speed_nudge(variant, peers, ram_gb).strip()
+
+    if nudge:
+        lines.append("")
+        lines.append(nudge)
+
+    return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -313,10 +465,13 @@ def run_setup_gui(sc, overrides=None):
 
     default_kv_label = next((l for l in kv_labels if kv_values[l] == default_kv), kv_labels[0])
 
-    variant_rows = list(sc.VARIANTS)
+    variant_rows = sorted(sc.VARIANTS, key=lambda v: -v["quality"])
     best_variant = sc.pick_best_variant(variant_rows, ram_gb)
     grades = {i: sc.grade_variant(v, ram_gb) for i, v in enumerate(variant_rows)}
     default_index = next((i for i, v in enumerate(variant_rows) if v is default_variant), 0)
+
+    fitting = [v for v in variant_rows if ram_gb >= v["min_ram_gb"] and v.get("speed_tok_s")]
+    fastest_variant = max(fitting, key=lambda v: v["speed_tok_s"]) if fitting else None
 
     alias_shells = ("auto", "cmd", "powershell") if sc.IS_WINDOWS else ("auto", "bash", "zsh")
     shell_names = {"cmd": "Command Prompt", "powershell": "PowerShell",
@@ -353,40 +508,51 @@ def run_setup_gui(sc, overrides=None):
 
     variant_list = tk.Listbox(body, width=86, height=len(variant_rows),
                               activestyle="dotbox", exportselection=False)
-    variant_list.grid(row=1, column=1, columnspan=3, rowspan=2, sticky="w")
+    variant_list.grid(row=1, column=1, columnspan=2, rowspan=2, sticky="w")
 
     for index, v in enumerate(variant_rows):
-        grade, note = grades[index]
-        variant_list.insert(tk.END, variant_label(v, grade, note, v is best_variant))
+        grade, _note = grades[index]
+        variant_list.insert(tk.END, variant_label(v, grade, v is fastest_variant))
         variant_list.itemconfig(index, foreground=GUI_GRADE_COLORS[grade])
 
     variant_list.selection_set(default_index)
     variant_list.see(default_index)
 
-    variant_advice = ttk.Label(body, text="", foreground="#666666", wraplength=700,
-                               justify="left")
-    variant_advice.grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 4))
-
-    def show_variant_advice(*_args):
+    def selected_index():
         selection = variant_list.curselection()
 
         if not selection:
             variant_list.selection_set(default_index)
             selection = variant_list.curselection()
 
-        v = variant_rows[selection[0]]
-        grade, note = grades[selection[0]]
+        return selection[0]
 
-        variant_advice.configure(
-            text=variant_advice_text(sc, v, grade, note, ram_gb, v is best_variant, variant_rows),
-            foreground=GUI_GRADE_COLORS[grade])
+    def info_popup(title, text, color="black"):
+        popup = tk.Toplevel(root)
+        popup.title(title)
+        popup.resizable(False, False)
 
-    variant_list.bind("<<ListboxSelect>>", show_variant_advice)
-    show_variant_advice()
+        ttk.Label(popup, text=text, foreground=color, wraplength=560,
+                  justify="left").pack(padx=14, pady=(12, 4))
+        ttk.Button(popup, text="Close", command=popup.destroy).pack(padx=14, pady=(4, 12))
+        popup.transient(root)
 
-    add_label("Model folder:", 4)
+    def show_variant_info():
+        index = selected_index()
+        v = variant_rows[index]
+        grade, note = grades[index]
+
+        info_popup(short_name(v),
+                   variant_info_text(sc, v, grade, note, ram_gb, v is best_variant,
+                                     v is fastest_variant, variant_rows),
+                   GUI_GRADE_COLORS[grade])
+
+    ttk.Button(body, text="\u24d8", width=4, command=show_variant_info).grid(
+        row=1, column=3, sticky="nw", padx=(6, 0))
+
+    add_label("Model folder:", 3)
     data_dir_var = tk.StringVar(value=default_data_dir)
-    ttk.Entry(body, textvariable=data_dir_var, width=72).grid(row=4, column=1, sticky="w")
+    ttk.Entry(body, textvariable=data_dir_var, width=72).grid(row=3, column=1, sticky="w")
 
     def browse():
         picked = filedialog.askdirectory(title="Model folder",
@@ -394,30 +560,46 @@ def run_setup_gui(sc, overrides=None):
         if picked:
             data_dir_var.set(os.path.normpath(picked))
 
-    ttk.Button(body, text="Browse...", width=10, command=browse).grid(row=4, column=2,
+    ttk.Button(body, text="Browse...", width=10, command=browse).grid(row=3, column=2,
                                                                       sticky="w", padx=(6, 0))
 
-    add_label("Context:", 5)
+    add_label("Context:", 4)
     context_var = tk.StringVar(value=default_context_label)
-    ttk.Combobox(body, textvariable=context_var, values=context_labels,
-                 state="readonly", width=34).grid(row=5, column=1, columnspan=3, sticky="w")
+    context_row = ttk.Frame(body)
+    context_row.grid(row=4, column=1, sticky="w")
+    ttk.Combobox(context_row, textvariable=context_var, values=context_labels,
+                 state="readonly", width=34).pack(side="left")
+    ttk.Button(context_row, text="\u24d8", width=4,
+               command=lambda: info_popup("Context size", context_info_text())).pack(
+        side="left", padx=(6, 0))
 
-    add_label("KV cache:", 6)
+    add_label("KV cache:", 5)
     kv_var = tk.StringVar(value=default_kv_label)
-    ttk.Combobox(body, textvariable=kv_var, values=kv_labels,
-                 state="readonly", width=34).grid(row=6, column=1, columnspan=3, sticky="w")
+    kv_row = ttk.Frame(body)
+    kv_row.grid(row=5, column=1, sticky="w")
+    ttk.Combobox(kv_row, textvariable=kv_var, values=kv_labels,
+                 state="readonly", width=34).pack(side="left")
+    ttk.Button(kv_row, text="\u24d8", width=4,
+               command=lambda: info_popup("KV cache", kv_info_text())).pack(side="left",
+                                                                            padx=(6, 0))
 
-    add_label("Server port:", 7)
+    add_label("Server port:", 6)
     port_var = tk.StringVar(value=str(default_port))
-    ttk.Entry(body, textvariable=port_var, width=10).grid(row=7, column=1, sticky="w")
+    ttk.Entry(body, textvariable=port_var, width=10).grid(row=6, column=1, sticky="w")
 
     offline_var = tk.BooleanVar(value=default_offline)
-    ttk.Checkbutton(body, text=QUESTIONS["offline"], variable=offline_var).grid(
-        row=8, column=0, columnspan=4, sticky="w", pady=3)
+    ttk.Checkbutton(body, text="Fully local", variable=offline_var).grid(
+        row=7, column=0, sticky="w", pady=3)
+    ttk.Button(body, text="\u24d8", width=4,
+               command=lambda: info_popup("Fully local", offline_info_text())).grid(
+        row=7, column=1, sticky="w", pady=3)
 
     sandbox_var = tk.BooleanVar(value=default_sandbox)
-    ttk.Checkbutton(body, text=QUESTIONS["sandbox"], variable=sandbox_var).grid(
-        row=9, column=0, columnspan=4, sticky="w", pady=3)
+    ttk.Checkbutton(body, text="Docker sandbox", variable=sandbox_var).grid(
+        row=8, column=0, sticky="w", pady=3)
+    ttk.Button(body, text="\u24d8", width=4,
+               command=lambda: info_popup("Docker sandbox", sandbox_info_text())).grid(
+        row=8, column=1, sticky="w", pady=3)
 
     def on_sandbox_toggle(*_args):
         if sandbox_var.get():
@@ -425,14 +607,13 @@ def run_setup_gui(sc, overrides=None):
 
     sandbox_var.trace_add("write", on_sandbox_toggle)
 
-    add_label("scode shortcut:", 10)
+    add_label("scode shortcut:", 9)
     shell_var = tk.StringVar(value="auto")
     ttk.Combobox(body, textvariable=shell_var, values=alias_shells,
-                 state="readonly", width=12).grid(row=10, column=1, sticky="w")
+                 state="readonly", width=12).grid(row=9, column=1, sticky="w")
 
-    alias_status = ttk.Label(body, text="adds the scode alias to the chosen shell; safe to press again",
-                             foreground="#666666")
-    alias_status.grid(row=10, column=3, sticky="w", padx=(10, 0))
+    alias_status = ttk.Label(body, text="", foreground="#666666", wraplength=240, justify="left")
+    alias_status.grid(row=10, column=1, sticky="w", padx=(12, 0))
 
     def do_alias():
         shell = sc.get_calling_shell() if shell_var.get() == "auto" else shell_var.get()
@@ -449,15 +630,15 @@ def run_setup_gui(sc, overrides=None):
             text="scode shortcut added to %s - open a new shell window to use it"
                  % shell_names.get(shell, shell))
 
-    ttk.Button(body, text="Set scode shortcut", width=18, command=do_alias).grid(
-        row=10, column=2, sticky="w", padx=(6, 0))
+    scode_row = ttk.Frame(body)
+    scode_row.grid(row=10, column=0, sticky="w")
+    ttk.Button(scode_row, text="Set Alias", width=10, command=do_alias).pack(side="left")
+    ttk.Button(scode_row, text="\u24d8", width=4,
+               command=lambda: info_popup("scode shortcut", scode_info_text())).pack(
+        side="left", padx=(6, 0))
 
-    add_label("Strata engine:", 11)
-
-    engine_status = ttk.Label(body,
-                              text="removes the downloaded engine; the next -Setup re-creates it (needs network)",
-                              foreground="#666666")
-    engine_status.grid(row=11, column=1, sticky="w")
+    engine_status = ttk.Label(body, text="", foreground="#666666", wraplength=240, justify="left")
+    engine_status.grid(row=11, column=1, sticky="w", padx=(12, 0))
 
     def do_purge_engine():
         state_json = sc.read_json(sc.STATE_PATH) or {}
@@ -497,8 +678,13 @@ def run_setup_gui(sc, overrides=None):
             engine_status.configure(foreground="#666666",
                                     text="no downloaded Strata engine found - nothing to delete")
 
-    ttk.Button(body, text="Delete Strata engine", width=18, command=do_purge_engine).grid(
-        row=11, column=2, sticky="w", padx=(6, 0))
+    engine_row = ttk.Frame(body)
+    engine_row.grid(row=11, column=0, sticky="w")
+    ttk.Button(engine_row, text="Delete Strata", width=14,
+               command=do_purge_engine).pack(side="left")
+    ttk.Button(engine_row, text="\u24d8", width=4,
+               command=lambda: info_popup("Strata engine", engine_info_text())).pack(
+        side="left", padx=(6, 0))
 
     outcome = {}
 

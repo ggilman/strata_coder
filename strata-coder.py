@@ -1691,20 +1691,25 @@ def prompt_setup_params(spec, state):
     write_step(menu.STEP_TEXT)
 
     if not (state["family"] or state["model"]):
-        best_variant = pick_best_variant(VARIANTS, spec["ram_gb"])
+        variant_rows = sorted(VARIANTS, key=lambda v: -v["quality"])
+        fitting = [v for v in variant_rows
+                   if spec["ram_gb"] >= v["min_ram_gb"] and v.get("speed_tok_s")]
+        fastest_variant = max(fitting, key=lambda v: v["speed_tok_s"]) if fitting else None
+        star = "\u2605" if _encodable("\u2605") else "*"
+        fastest_icon = "\u26a1" if _encodable("\u26a1") else ">>"
         variant_options = []
 
-        for v in VARIANTS:
-            grade, note = grade_variant(v, spec["ram_gb"])
+        for v in variant_rows:
+            grade, _note = grade_variant(v, spec["ram_gb"])
             variant_options.append({
                 "value": v,
                 "name": v["model"],
-                "label": menu.variant_label(v, grade, note, v is best_variant),
+                "label": menu.variant_label(v, grade, v is fastest_variant, star, fastest_icon),
                 "color": GRADE_COLORS[grade] if COLOR_ON else None,
             })
 
         selected = prompt_choice(menu.QUESTIONS["variant"], variant_options, selected,
-                                 menu.GRADE_LEGEND)
+                                 menu.grade_legend(star, fastest_icon))
 
     selected_data_dir = default_data_dir
 

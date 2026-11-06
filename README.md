@@ -88,8 +88,10 @@ run (or the built-in default on the first run). A parameter given on the command
 `strata-coder -Setup -Port 8081` never asks for the port. If the console cannot display Unicode box characters,
 plain `+ - |` frames are used instead.
 
-1. **Variant** — pick a model by number or by name (e.g. `IQ2_XS`). The list is graded against this
-   PC's RAM and the best one it can run is pre-selected and marked `<- best this PC can run`:
+1. **Variant** — pick a model by number or by name (e.g. `IQ2_XS`). The list is sorted with the best
+   quality on top, and each row grades itself against this PC's RAM and shows its cost and speed:
+   `+ Qwen3.8-Flash-Next IQ3_S (60 GB, ~53 tok/s) ★★★` — the fastest one this PC can run carries a
+   `⚡`, and the best pick for this PC is pre-selected:
 
      | Variant | Needs RAM | Download | Answers | Quality |
      |---|---|---|---|---|
@@ -104,15 +106,17 @@ plain `+ - |` frames are used instead.
      | Qwen3.8-Flash-Next (Unsloth) UD-Q4_K_XL (4-bit, experimental) | 48 GB | ~111 GB | see below | best |
 
     Speeds are Strata's published figures for an RTX 5070 (12 GB) with 64 GB of RAM; the percentage in
-    brackets is against IQ3_S. Under the variant list the setup window spells out the trade-off for this
-    PC: answers per second, how long a 32K-token prompt takes to read, the quality word, and what a step
-    down in size would buy ("IQ3_XXS is +17% (frees 7 GB RAM)").
+    brackets is against IQ3_S. The `ⓘ` button beside the list opens a popup with everything the
+    short row leaves out for the highlighted model: the full variant title, why it got its mark, how
+    long a 32K-token prompt takes to read, download and running-RAM sizes, the trained 256k context
+    limit, and what a step down in size would buy ("IQ3_XXS is +17% (frees 7 GB RAM)").
 
     Colors and markers: green `+` runs at full speed on this PC, yellow `!` runs but pays for it
-    (tight RAM, experts read from the SSD, or experimental), red `x` has too little RAM. The GUI shows
-    the same grading as a colored list with a one-line explanation under it. The Unsloth variants keep
-    a RAM budget of their experts and read the rest from the SSD on PCs with less than about 80 GB of
-    RAM, so they are only recommended on large-RAM PCs; pick them explicitly with `-Family unsloth`.
+    (tight RAM, experts read from the SSD, or experimental), red `x` has too little RAM. Quality stars
+    read ★ good, ★★ better, ★★★ best. The GUI shows the same grading as a colored list; the console
+    prints the marks and stars under it as a legend. The Unsloth variants keep a RAM budget of their
+    experts and read the rest from the SSD on PCs with less than about 80 GB of RAM, so they are only
+    recommended on large-RAM PCs; pick them explicitly with `-Family unsloth`.
 
 
 2. **Model folder** — where the model files live. Default: the folder Strata used before, otherwise
@@ -131,7 +135,7 @@ plain `+ - |` frames are used instead.
    unaffected. Turning the setting off restores the normal config and clears the proxy. The isolation covers
    OpenCode's use of the machine, not the setup itself, and it never removes `strata.exe` on its own — a fully
    offline PC could not re-download or rebuild it afterwards. To stop trusting the downloaded binary and force a
-   fresh one, press **Delete Strata engine** in the setup window and run `-Setup` while the PC has network
+   fresh one, press **Delete Strata** in the setup window and run `-Setup` while the PC has network
    access (see the GUI section). Isolation never blocks that rebuild: Strata's own setup runs with the dead proxy
    stripped from its environment, and the block starts when OpenCode starts after it. Combined with the already-disabled
    autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Note this is still a policy
@@ -177,15 +181,17 @@ The same menu also exists as one Tkinter window, opened directly with `python se
 `strata-coder -Setup` when the machine can display one (it needs tkinter, which ships with the standard Python
 installers). The window opens **detached**: the command you typed finishes right away and the window lives on its
 own, so your terminal is free; close the window to back out. The form has a variant dropdown (variants that don't
-fit this PC's RAM are marked), model folder with a **Browse…** button, context and KV-cache dropdowns, port, and
-*Stay fully local* and *Docker sandbox* checkboxes. Fields come up pre-filled from `setup.json`, and command-line
-parameters (e.g. `strata-coder -Setup -Port 8081`) pre-fill over the saved values.
+fit this PC's RAM are marked), model folder with a **Browse…** button, port, and **Context**, **KV cache**,
+*Fully local* and *Docker sandbox* controls — every one of them has an **ⓘ** popup that spells out its trade-offs.
+Fields come up pre-filled from `setup.json`, and command-line parameters (e.g. `strata-coder -Setup -Port 8081`)
+pre-fill over the saved values.
 
 In the window the `scode` shortcut is an **action**, not a question: pick the shell (`auto`, `cmd`, `powershell` —
-`auto`, `bash`, `zsh` on Linux) and press **Set scode shortcut** to add it right away; an inline note confirms
-"open a new shell window to use it". Press it as often as you like — it replaces the previous entry.
+`auto`, `bash`, `zsh` on Linux) and press **Set Alias** to add it right away; a short inline note confirms
+"open a new shell window to use it". The **ⓘ** button next to it opens a popup explaining exactly which profile,
+macro or registry entry each shell gets and why. Press it as often as you like — it replaces the previous entry.
 
-**Delete Strata engine** is an instant action too: it removes the downloaded `strata.exe` (including any copy under
+**Delete Strata** is an instant action too: it removes the downloaded `strata.exe` (including any copy under
 the model folder) and an inline note confirms it, so the next `-Setup` re-creates the engine from a fresh download
 instead of trusting the binary on disk. Press it only when that next `-Setup` can reach the network — the re-download
 is Strata's only way back.
@@ -253,7 +259,7 @@ mode.
   is on, the server listens on all interfaces of this PC so the relay can reach it, and Windows Firewall is what keeps
   other devices out; `-Setup` restarts a running server once so it picks this up. The script reports a clear error
   instead of running unprotected if Docker is missing.
-- **Delete Strata engine** (the setup-window button) — a one-shot action, not a setting.
+- **Delete Strata** (the setup-window button) — a one-shot action, not a setting.
   It removes the downloaded `strata.exe` (and any copy under the model folder) so the next `-Setup` rebuilds the engine
   from a fresh download instead of trusting the binary on disk — the way to stop trusting an unsigned download.
   Isolation never deletes the engine on its own, because a fully offline PC could not get it back; press it only when
