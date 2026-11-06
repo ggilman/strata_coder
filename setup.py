@@ -87,8 +87,97 @@ def kv_options():
     return [{"value": k, "name": k, "label": KV_LABELS[k]} for k in KV_CHOICES]
 
 
-def variant_label(variant):
-    return "%s (needs %d GB RAM)" % (variant["title"], variant["min_ram_gb"])
+GRADE_LETTERS = {"green": "+", "yellow": "!", "red": "x"}
+GUI_GRADE_COLORS = {"green": "#0a7d28", "yellow": "#a06b00", "red": "#c00000"}
+
+
+def variant_label(variant, grade="", note="", is_best=False):
+    """The one-line label of a variant; grade and note come from the CLI's grade_variant()
+    (green/yellow/red plus why), is_best marks the one this PC runs best."""
+    facts = "needs %d GB RAM" % variant["min_ram_gb"]
+
+    if variant.get("speed_tok_s"):
+        facts += ", ~%d tok/s" % variant["speed_tok_s"]
+
+    text = "%s (%s)" % (variant["title"], facts)
+
+    if grade in GRADE_LETTERS:
+        text = "%s %s" % (GRADE_LETTERS[grade], text)
+
+    if grade == "red":
+        text += "  -  NOT ENOUGH RAM ON THIS PC"
+    elif note:
+        text += "  -  " + note
+
+    if is_best:
+        text += "   <- best this PC can run"
+
+    return text
+
+
+GRADE_LEGEND = ["+ full speed   ! runs with a cost   x not enough RAM here",
+                "tok/s = answers per second (60+ is faster than reading)"]
+
+
+def speed_nudge(variant, peers, ram_gb):
+    """plain words: what a smaller size of the same family would buy in speed."""
+    speed = variant.get("speed_tok_s")
+
+    if not speed:
+        return ""
+
+    steps = sorted(
+        (s for s in peers
+         if s is not variant and s["family"] == variant["family"] and ram_gb >= s["min_ram_gb"]
+         and s.get("speed_tok_s", 0) > speed),
+        key=lambda s: s["speed_tok_s"])[:2]
+
+    if not steps:
+        return ""
+
+    parts = []
+
+    for s in steps:
+        freed = int(round(variant["arena_gb"] - s["arena_gb"]))
+        parts.append("%s is %+d%%%s"
+                     % (s["model"], round(100.0 * (s["speed_tok_s"] / speed - 1)),
+                        " (frees %d GB RAM)" % freed if freed >= 3 else ""))
+
+    return ("  Faster in this family: %s - each step is one down in quality."
+            % ", ".join(parts))
+
+
+def short_name(variant):
+    """the variant's name without its trailing parenthetical: 'Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS'."""
+    return variant["title"].rsplit(" (", 1)[0]
+
+
+def variant_advice_text(sc, variant, grade, note, ram_gb, is_best, peers):
+    """the one- or two-line explanation under the variant list."""
+    name = short_name(variant)
+
+    if grade == "green":
+        text = "%s runs at full speed on this PC." % name
+    elif grade == "yellow":
+        text = "%s runs here, but %s." % (name, note)
+    else:
+        text = "%s needs about %d GB RAM; this PC has %s GB." % (
+            name, variant["min_ram_gb"], ram_gb)
+
+    if variant.get("speed_tok_s"):
+        text += ("  Answers ~%d tokens per second; a 32K prompt reads in about %d seconds; "
+                 "quality: %s.%s"
+                 % (variant["speed_tok_s"],
+                    max(1, int(round(32768.0 / (variant.get("prompt_tok_s") or 1600)))),
+                    variant.get("quality_word", ""), speed_nudge(variant, peers, ram_gb)))
+    elif grade == "yellow" and variant.get("budget"):
+        text += ("  Measured about 8 tokens per second on a 64 GB PC (IQ3_S: ~53); it needs about "
+                 "%d GB of RAM to hold all of its experts." % sc.SSD_BUDGET_RAM_GB)
+
+    if is_best:
+        text += "  (best this PC can run)"
+
+    return text
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -183,7 +272,7 @@ def run_setup_gui(sc, overrides=None):
                       and (not model or v["model"] == model)]
 
         if candidates:
-            default_variant = sc.select_fitting_variant(candidates, ram_gb) or candidates[0]
+            default_variant = sc.pick_best_variant(candidates, ram_gb) or candidates[0]
 
     if not default_variant and saved.get("family") and saved.get("model"):
         default_variant = next(
@@ -192,7 +281,7 @@ def run_setup_gui(sc, overrides=None):
             None)
 
     if not default_variant:
-        default_variant = sc.select_fitting_variant(sc.VARIANTS, ram_gb) or sc.VARIANTS[0]
+        default_variant = sc.pick_best_variant(sc.VARIANTS, ram_gb) or sc.VARIANTS[0]
 
     context_values = {}
     context_labels = []
@@ -224,18 +313,10 @@ def run_setup_gui(sc, overrides=None):
 
     default_kv_label = next((l for l in kv_labels if kv_values[l] == default_kv), kv_labels[0])
 
-    variant_values = {}
-    variant_labels = []
-
-    for v in sc.VARIANTS:
-        fits = ram_gb >= v["min_ram_gb"]
-        label = "%s  [needs %d GB RAM%s]" % (
-            v["title"], v["min_ram_gb"], "" if fits else " - NOT ENOUGH RAM ON THIS PC")
-        variant_values[label] = v
-        variant_labels.append(label)
-
-    default_variant_label = next(
-        (l for l in variant_labels if variant_values[l] is default_variant), variant_labels[0])
+    variant_rows = list(sc.VARIANTS)
+    best_variant = sc.pick_best_variant(variant_rows, ram_gb)
+    grades = {i: sc.grade_variant(v, ram_gb) for i, v in enumerate(variant_rows)}
+    default_index = next((i for i, v in enumerate(variant_rows) if v is default_variant), 0)
 
     alias_shells = ("auto", "cmd", "powershell") if sc.IS_WINDOWS else ("auto", "bash", "zsh")
     shell_names = {"cmd": "Command Prompt", "powershell": "PowerShell",
@@ -252,23 +333,60 @@ def run_setup_gui(sc, overrides=None):
     fits_any = ram_gb >= min(v["min_ram_gb"] for v in sc.VARIANTS)
     info_text = "This PC has %s GB RAM." % ram_gb
 
+    if best_variant:
+        info_text += "  Best it can run: %s%s." % (
+            short_name(best_variant),
+            " (~%d tok/s)" % best_variant["speed_tok_s"]
+            if best_variant.get("speed_tok_s") else "")
+
     if not fits_any:
         info_text += "  WARNING: not enough RAM for any variant - setup will refuse to install."
 
-    ttk.Label(body, text=info_text, foreground="red" if not fits_any else "black").grid(
-        row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+    ttk.Label(body, text=info_text,
+              foreground="red" if not fits_any else GUI_GRADE_COLORS["green"] if best_variant
+              else "black").grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
     def add_label(text, line):
         ttk.Label(body, text=text).grid(row=line, column=0, sticky="w", padx=(0, 8), pady=3)
 
     add_label("Model variant:", 1)
-    variant_var = tk.StringVar(value=default_variant_label)
-    ttk.Combobox(body, textvariable=variant_var, values=variant_labels,
-                 state="readonly", width=86).grid(row=1, column=1, columnspan=3, sticky="w")
 
-    add_label("Model folder:", 2)
+    variant_list = tk.Listbox(body, width=86, height=len(variant_rows),
+                              activestyle="dotbox", exportselection=False)
+    variant_list.grid(row=1, column=1, columnspan=3, rowspan=2, sticky="w")
+
+    for index, v in enumerate(variant_rows):
+        grade, note = grades[index]
+        variant_list.insert(tk.END, variant_label(v, grade, note, v is best_variant))
+        variant_list.itemconfig(index, foreground=GUI_GRADE_COLORS[grade])
+
+    variant_list.selection_set(default_index)
+    variant_list.see(default_index)
+
+    variant_advice = ttk.Label(body, text="", foreground="#666666", wraplength=700,
+                               justify="left")
+    variant_advice.grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 4))
+
+    def show_variant_advice(*_args):
+        selection = variant_list.curselection()
+
+        if not selection:
+            variant_list.selection_set(default_index)
+            selection = variant_list.curselection()
+
+        v = variant_rows[selection[0]]
+        grade, note = grades[selection[0]]
+
+        variant_advice.configure(
+            text=variant_advice_text(sc, v, grade, note, ram_gb, v is best_variant, variant_rows),
+            foreground=GUI_GRADE_COLORS[grade])
+
+    variant_list.bind("<<ListboxSelect>>", show_variant_advice)
+    show_variant_advice()
+
+    add_label("Model folder:", 4)
     data_dir_var = tk.StringVar(value=default_data_dir)
-    ttk.Entry(body, textvariable=data_dir_var, width=72).grid(row=2, column=1, sticky="w")
+    ttk.Entry(body, textvariable=data_dir_var, width=72).grid(row=4, column=1, sticky="w")
 
     def browse():
         picked = filedialog.askdirectory(title="Model folder",
@@ -276,30 +394,30 @@ def run_setup_gui(sc, overrides=None):
         if picked:
             data_dir_var.set(os.path.normpath(picked))
 
-    ttk.Button(body, text="Browse...", width=10, command=browse).grid(row=2, column=2,
+    ttk.Button(body, text="Browse...", width=10, command=browse).grid(row=4, column=2,
                                                                       sticky="w", padx=(6, 0))
 
-    add_label("Context:", 3)
+    add_label("Context:", 5)
     context_var = tk.StringVar(value=default_context_label)
     ttk.Combobox(body, textvariable=context_var, values=context_labels,
-                 state="readonly", width=34).grid(row=3, column=1, columnspan=3, sticky="w")
+                 state="readonly", width=34).grid(row=5, column=1, columnspan=3, sticky="w")
 
-    add_label("KV cache:", 4)
+    add_label("KV cache:", 6)
     kv_var = tk.StringVar(value=default_kv_label)
     ttk.Combobox(body, textvariable=kv_var, values=kv_labels,
-                 state="readonly", width=34).grid(row=4, column=1, columnspan=3, sticky="w")
+                 state="readonly", width=34).grid(row=6, column=1, columnspan=3, sticky="w")
 
-    add_label("Server port:", 5)
+    add_label("Server port:", 7)
     port_var = tk.StringVar(value=str(default_port))
-    ttk.Entry(body, textvariable=port_var, width=10).grid(row=5, column=1, sticky="w")
+    ttk.Entry(body, textvariable=port_var, width=10).grid(row=7, column=1, sticky="w")
 
     offline_var = tk.BooleanVar(value=default_offline)
     ttk.Checkbutton(body, text=QUESTIONS["offline"], variable=offline_var).grid(
-        row=6, column=0, columnspan=4, sticky="w", pady=3)
+        row=8, column=0, columnspan=4, sticky="w", pady=3)
 
     sandbox_var = tk.BooleanVar(value=default_sandbox)
     ttk.Checkbutton(body, text=QUESTIONS["sandbox"], variable=sandbox_var).grid(
-        row=7, column=0, columnspan=4, sticky="w", pady=3)
+        row=9, column=0, columnspan=4, sticky="w", pady=3)
 
     def on_sandbox_toggle(*_args):
         if sandbox_var.get():
@@ -307,14 +425,14 @@ def run_setup_gui(sc, overrides=None):
 
     sandbox_var.trace_add("write", on_sandbox_toggle)
 
-    add_label("scode shortcut:", 8)
+    add_label("scode shortcut:", 10)
     shell_var = tk.StringVar(value="auto")
     ttk.Combobox(body, textvariable=shell_var, values=alias_shells,
-                 state="readonly", width=12).grid(row=8, column=1, sticky="w")
+                 state="readonly", width=12).grid(row=10, column=1, sticky="w")
 
     alias_status = ttk.Label(body, text="adds the scode alias to the chosen shell; safe to press again",
                              foreground="#666666")
-    alias_status.grid(row=8, column=3, sticky="w", padx=(10, 0))
+    alias_status.grid(row=10, column=3, sticky="w", padx=(10, 0))
 
     def do_alias():
         shell = sc.get_calling_shell() if shell_var.get() == "auto" else shell_var.get()
@@ -332,14 +450,14 @@ def run_setup_gui(sc, overrides=None):
                  % shell_names.get(shell, shell))
 
     ttk.Button(body, text="Set scode shortcut", width=18, command=do_alias).grid(
-        row=8, column=2, sticky="w", padx=(6, 0))
+        row=10, column=2, sticky="w", padx=(6, 0))
 
-    add_label("Strata engine:", 9)
+    add_label("Strata engine:", 11)
 
     engine_status = ttk.Label(body,
                               text="removes the downloaded engine; the next -Setup re-creates it (needs network)",
                               foreground="#666666")
-    engine_status.grid(row=9, column=1, sticky="w")
+    engine_status.grid(row=11, column=1, sticky="w")
 
     def do_purge_engine():
         state_json = sc.read_json(sc.STATE_PATH) or {}
@@ -380,16 +498,18 @@ def run_setup_gui(sc, overrides=None):
                                     text="no downloaded Strata engine found - nothing to delete")
 
     ttk.Button(body, text="Delete Strata engine", width=18, command=do_purge_engine).grid(
-        row=9, column=2, sticky="w", padx=(6, 0))
+        row=11, column=2, sticky="w", padx=(6, 0))
 
     outcome = {}
 
     def on_ok():
-        variant = variant_values.get(variant_var.get())
+        selection = variant_list.curselection()
 
-        if not variant:
+        if not selection:
             messagebox.showerror("Strata Coder setup", "Pick a model variant.")
             return
+
+        variant = variant_rows[selection[0]]
 
         data_dir = data_dir_var.get().strip()
 
@@ -428,8 +548,10 @@ def run_setup_gui(sc, overrides=None):
 
         root.destroy()
 
+    variant_list.bind("<Double-Button-1>", lambda _event: on_ok())
+
     buttons = ttk.Frame(body)
-    buttons.grid(row=10, column=0, columnspan=4, sticky="e", pady=(14, 0))
+    buttons.grid(row=12, column=0, columnspan=4, sticky="e", pady=(14, 0))
     ttk.Button(buttons, text="Cancel", command=root.destroy).pack(side="right", padx=(8, 0))
     ttk.Button(buttons, text="OK", command=on_ok).pack(side="right")
 

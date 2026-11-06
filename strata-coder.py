@@ -4,7 +4,7 @@
 Runs identically on Windows (cmd, PowerShell, Git Bash) and Linux. Installs per-user.
 
 Modes:
-    strata-coder.py [-CheckOnly] [-Family qwen|coder] [-Model NAME] [-Context N]
+    strata-coder.py [-CheckOnly] [-Family qwen|swift|coder|unsloth] [-Model NAME] [-Context N]
         [-Kv int8|k8v4|q4_0] [-DataDir PATH] [-Port N] [-NoLaunch] [-Update]
         [-Stop] [-Status] [-Setup] [-Offline [true|false]] [-Sandbox [true|false]] [-Alias] [-NoAlias] [-NoGui]
         [-AliasShell auto|cmd|powershell|bash|zsh] [-Help]
@@ -84,13 +84,20 @@ STATUS_PATH = os.path.join(os.path.dirname(SCRIPT_PATH), "status.py")
 PINNED_STRATA = "v0.1.40.3"
 
 VARIANTS = [
+    # "speed_tok_s": answers written per second in a short chat, "prompt_tok_s": tokens/s read on a
+    # 32K prompt (Strata's published measurements on an RTX 5070 12 GB with 64 GB RAM; other cards
+    # land within about +-20%, more VRAM is faster), "quality": Strata's own one-word quality rating.
     {
         "family": "qwen",
         "model": "IQ3_S",
         "min_ram_gb": 60,
         "download_gb": 83.6,
         "arena_gb": 50.3,
-        "title": "Qwen3.8-Flash-Next IQ3_S (3.5-bit, best quality; needs about 62 GB RAM)",
+        "quality": 90,
+        "speed_tok_s": 53,
+        "prompt_tok_s": 1620,
+        "quality_word": "best",
+        "title": "Qwen3.8-Flash-Next IQ3_S (3.5-bit, best quality)",
         "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
     },
     {
@@ -99,6 +106,10 @@ VARIANTS = [
         "min_ram_gb": 58,
         "download_gb": 75.8,
         "arena_gb": 42.9,
+        "quality": 80,
+        "speed_tok_s": 62,
+        "prompt_tok_s": 1750,
+        "quality_word": "great",
         "title": "Qwen3.8-Flash-Next IQ3_XXS (3-bit)",
         "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
     },
@@ -108,8 +119,51 @@ VARIANTS = [
         "min_ram_gb": 46,
         "download_gb": 68.0,
         "arena_gb": 35.5,
+        "quality": 70,
+        "speed_tok_s": 79,
+        "prompt_tok_s": 2090,
+        "quality_word": "better",
         "title": "Qwen3.8-Flash-Next IQ2_XS (2-bit; recommended for 48-64 GB RAM)",
         "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+    },
+    {
+        "family": "qwen",
+        "model": "Q2_0",
+        "min_ram_gb": 48,
+        "download_gb": 66.4,
+        "arena_gb": 34.0,
+        "quality": 65,
+        "speed_tok_s": 94,
+        "prompt_tok_s": 2650,
+        "quality_word": "good",
+        "title": "Qwen3.8-Flash-Next Q2_0 (2-bit, the fastest)",
+        "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+    },
+    {
+        "family": "swift",
+        "model": "IQ3_XXS",
+        "min_ram_gb": 60,
+        "download_gb": 75.8,
+        "arena_gb": 42.9,
+        "quality": 79,
+        "speed_tok_s": 62,
+        "prompt_tok_s": 1750,
+        "quality_word": "great",
+        "title": "Swift 1.5 IQ3_XXS (3-bit; Qwen3.8-Flash-Next fine-tune, much shorter thinking)",
+        "repo": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+    },
+    {
+        "family": "swift",
+        "model": "IQ2_XS",
+        "min_ram_gb": 48,
+        "download_gb": 68.0,
+        "arena_gb": 35.5,
+        "quality": 69,
+        "speed_tok_s": 79,
+        "prompt_tok_s": 2090,
+        "quality_word": "better",
+        "title": "Swift 1.5 IQ2_XS (2-bit i-quant; Qwen3.8-Flash-Next fine-tune, much shorter thinking)",
+        "repo": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
     },
     {
         "family": "coder",
@@ -117,8 +171,37 @@ VARIANTS = [
         "min_ram_gb": 30,
         "download_gb": 58.4,
         "arena_gb": 23.4,
+        "quality": 60,
+        "speed_tok_s": 55,
+        "prompt_tok_s": 2180,
+        "quality_word": "code only",
         "title": "Qwen3.8-Flash-Next Coder IQ1_M (code-focused; fits 32 GB RAM)",
         "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF",
+    },
+    {
+        "family": "unsloth",
+        "model": "UD-IQ4_XS",
+        "min_ram_gb": 48,
+        "download_gb": 93.7,
+        "arena_gb": 59.5,
+        "quality": 95,
+        "budget": True,
+        "quality_word": "above IQ3_S",
+        "title": "Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS (~4-bit, quality between IQ3_S and UD-Q4_K_XL)",
+        "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    },
+    {
+        "family": "unsloth",
+        "model": "UD-Q4_K_XL",
+        "min_ram_gb": 48,
+        "download_gb": 111.3,
+        "arena_gb": 77.0,
+        "quality": 98,
+        "budget": True,
+        "experimental": True,
+        "quality_word": "best",
+        "title": "Qwen3.8-Flash-Next (Unsloth) UD-Q4_K_XL (4-bit, the best quality)",
+        "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
     },
 ]
 
@@ -134,6 +217,9 @@ SETUP_MINUTES = 6
 KV_BYTES_PER_WEIGHT = {"int8": 1.0625, "k8v4": 0.8125, "q4_0": 0.5625}
 COMFORTABLE_HEADROOM_GB = 8
 TIGHT_HEADROOM_GB = 2
+# below this RAM the budget variants (Unsloth) keep only part of their experts in RAM and read
+# the rest from the SSD, which is much slower than the smaller quantizations held entirely in RAM
+SSD_BUDGET_RAM_GB = 80
 LOG_KEEP = 20
 DEFAULT_CONTEXT_LIMIT = 131072
 MAX_OUTPUT_LIMIT = 32768
@@ -163,6 +249,8 @@ COLOR_ON = sys.stdout.isatty() and (IS_WINDOWS and _enable_virt_terminal() or Tr
 RESET, CYAN, GREEN, GRAY, YELLOW, RED, DARKGRAY = (
     "\033[0m", "\033[36m", "\033[32m", "\033[90m", "\033[33m", "\033[31m", "\033[90m",
 )
+
+GRADE_COLORS = {"green": GREEN, "yellow": YELLOW, "red": RED}
 
 TRANSCRIPT = None
 TRANSCRIPT_PATH = None
@@ -264,11 +352,38 @@ def get_int_setting(value, fallback):
         return fallback
 
 
-def select_fitting_variant(candidates, ram_gb):
-    for candidate in candidates:
-        if ram_gb >= candidate["min_ram_gb"]:
-            return candidate
-    return None
+def grade_variant(variant, ram_gb):
+    """('green' | 'yellow' | 'red', the reason) for this PC's RAM: green runs at full speed,
+    yellow runs with a cost, red will not run."""
+    if ram_gb < variant["min_ram_gb"]:
+        return "red", "not enough RAM on this PC"
+
+    if variant.get("experimental"):
+        return "yellow", "experimental"
+
+    if variant.get("budget") and ram_gb < SSD_BUDGET_RAM_GB:
+        return "yellow", "part of the experts are read from the SSD (slower)"
+
+    if ram_gb < variant["min_ram_gb"] + TIGHT_HEADROOM_GB:
+        return "yellow", "tight on this PC"
+
+    return "green", ""
+
+
+def pick_best_variant(candidates, ram_gb):
+    """The best variant this PC can run: the highest quality one that fits without a warning;
+    when every fitting variant carries a warning, the first fitting one in list order."""
+    fitting = [c for c in candidates if ram_gb >= c["min_ram_gb"]]
+
+    if not fitting:
+        return None
+
+    comfortable = [c for c in fitting if grade_variant(c, ram_gb)[0] == "green"]
+
+    if comfortable:
+        return max(comfortable, key=lambda c: c["quality"])
+
+    return fitting[0]
 
 
 def close_session_resources():
@@ -1002,8 +1117,9 @@ Options:
   -NoGui                     Force the console setup menu instead of the GUI
                              window that -Setup opens when the machine can
                              display one.
-  -Family qwen|coder         Model family.
-  -Model <name>              Model variant, e.g. IQ3_S or IQ1_M.
+  -Family qwen|swift|coder|unsloth
+                               Model family.
+  -Model <name>              Model variant, e.g. IQ3_S, IQ1_M or UD-IQ4_XS.
   -Context <tokens>          Context size; 0 = Strata recommendation.
   -Kv int8|k8v4|q4_0         KV cache quantization.
   -DataDir <path>            Model folder.
@@ -1279,7 +1395,7 @@ def _read_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
-def _interactive_choice(header, ordered, default_index, default_value):
+def _interactive_choice(header, ordered, default_index, default_value, legend=None):
     menu = load_setup()
     arrows = "\u2191\u2193" if _encodable("\u2191\u2193") else "up/down"
     width = box_width()
@@ -1305,7 +1421,10 @@ def _interactive_choice(header, ordered, default_index, default_value):
 
             indent = " " * len(prefix)
             wrapped = _wrap(option["label"], inner - len(prefix) - len(star))
-            color = (BOLD + GREEN) if (is_cursor and COLOR_ON) else None
+            color = option.get("color") if COLOR_ON else None
+
+            if is_cursor and COLOR_ON:
+                color = BOLD + (color or GREEN)
 
             rows.append((prefix + wrapped[0] + star, color))
 
@@ -1313,6 +1432,10 @@ def _interactive_choice(header, ordered, default_index, default_value):
                 rows.append((indent + line, color))
 
         rows.append(None)
+
+        for line in _legend_lines(legend):
+            rows.append((line, GRAY if COLOR_ON else None))
+
         rows.append((footer, GRAY if COLOR_ON else None))
 
         block = "\033[K\n".join(build_box(" " + header, rows, width)) + "\033[K\n"
@@ -1351,14 +1474,18 @@ def _interactive_choice(header, ordered, default_index, default_value):
     return result
 
 
-def prompt_choice(header, options, default_value):
+def _legend_lines(legend):
+    return [] if not legend else (list(legend) if isinstance(legend, (list, tuple)) else [legend])
+
+
+def prompt_choice(header, options, default_value, legend=None):
     menu = load_setup()
     ordered = select_ordered_default(options, default_value)
     default_index = next(
         (i for i, o in enumerate(ordered) if o["value"] == default_value), None)
 
     if _interactive_available():
-        return _interactive_choice(header, ordered, default_index, default_value)
+        return _interactive_choice(header, ordered, default_index, default_value, legend)
 
     width = box_width()
     inner = width - 2
@@ -1371,17 +1498,24 @@ def prompt_choice(header, options, default_value):
         prefix = " %d. " % number
         indent = " " * len(prefix)
         wrapped = _wrap(option["label"], inner - len(prefix) - len(star))
-        color = (BOLD + GREEN) if (is_default and COLOR_ON) else None
+        color = option.get("color") if COLOR_ON else None
+
+        if is_default and COLOR_ON:
+            color = BOLD + (color or GREEN)
 
         rows.append((prefix + wrapped[0] + star, color))
 
         for line in wrapped[1:]:
-            rows.append((indent + line, GREEN if (is_default and COLOR_ON) else None))
+            rows.append((indent + line, color))
 
         rows.append(("", None))
 
     rows.pop()
     rows.append(None)
+
+    for line in _legend_lines(legend):
+        rows.append((line, GRAY if COLOR_ON else None))
+
     rows.append((menu.TEXT_HINT, GRAY if COLOR_ON else None))
 
     print()
@@ -1538,7 +1672,7 @@ def prompt_setup_params(spec, state):
 
     if state["family"] or state["model"]:
         requested = get_candidates(state["family"], state["model"])
-        selected = select_fitting_variant(requested, spec["ram_gb"])
+        selected = pick_best_variant(requested, spec["ram_gb"])
 
         if not selected:
             selected = requested[0]
@@ -1549,7 +1683,7 @@ def prompt_setup_params(spec, state):
             None)
 
     if not selected:
-        selected = select_fitting_variant(VARIANTS, spec["ram_gb"])
+        selected = pick_best_variant(VARIANTS, spec["ram_gb"])
 
     if not selected:
         fail("this PC does not have enough RAM for any configured Strata model variant.")
@@ -1557,12 +1691,20 @@ def prompt_setup_params(spec, state):
     write_step(menu.STEP_TEXT)
 
     if not (state["family"] or state["model"]):
-        variant_options = [
-            {"value": v, "name": v["model"], "label": menu.variant_label(v)}
-            for v in VARIANTS
-        ]
+        best_variant = pick_best_variant(VARIANTS, spec["ram_gb"])
+        variant_options = []
 
-        selected = prompt_choice(menu.QUESTIONS["variant"], variant_options, selected)
+        for v in VARIANTS:
+            grade, note = grade_variant(v, spec["ram_gb"])
+            variant_options.append({
+                "value": v,
+                "name": v["model"],
+                "label": menu.variant_label(v, grade, note, v is best_variant),
+                "color": GRADE_COLORS[grade] if COLOR_ON else None,
+            })
+
+        selected = prompt_choice(menu.QUESTIONS["variant"], variant_options, selected,
+                                 menu.GRADE_LEGEND)
 
     selected_data_dir = default_data_dir
 
@@ -2790,7 +2932,7 @@ def run_opencode_sandbox(tag, port, open_code_json):
 def parse_args():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("-CheckOnly", dest="check_only", action="store_true")
-    parser.add_argument("-Family", dest="family", choices=["qwen", "coder"])
+    parser.add_argument("-Family", dest="family", choices=["qwen", "swift", "coder", "unsloth"])
     parser.add_argument("-Model", dest="model")
     parser.add_argument("-Context", dest="context", type=int)
     parser.add_argument("-Kv", dest="kv", choices=["int8", "k8v4", "q4_0"])
@@ -3050,13 +3192,13 @@ def main():
 
         candidates = get_candidates(family_filter, model_filter)
 
-        variant = select_fitting_variant(candidates, spec["ram_gb"])
+        variant = pick_best_variant(candidates, spec["ram_gb"])
 
         family_specified = args.family is not None
         model_specified = args.model is not None
 
         if not variant and not (family_specified or model_specified):
-            variant = select_fitting_variant(VARIANTS, spec["ram_gb"])
+            variant = pick_best_variant(VARIANTS, spec["ram_gb"])
 
             if variant:
                 write_warn("the saved variant no longer fits this PC's RAM; switching to %s"
@@ -3080,6 +3222,11 @@ def main():
         tag = tag.lower()
 
         write_ok("chosen: %s" % variant["title"])
+
+        grade, note = grade_variant(variant, spec["ram_gb"])
+
+        if grade == "yellow":
+            write_warn("%s on this PC: %s" % (variant["model"], note))
 
         # --------------------------------------------------------------------------------------------
         # Setup mutex
@@ -3779,7 +3926,7 @@ def main():
 
         write_ok("Strata accepted an OpenAI-compatible chat request for '%s'" % model_id)
 
-        display_name = re.sub(r" \(.*$", "", variant["title"]) + " (local)"
+        display_name = variant["title"].rsplit(" (", 1)[0] + " (local)"
 
         context_limit = DEFAULT_CONTEXT_LIMIT
 

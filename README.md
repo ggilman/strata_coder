@@ -88,15 +88,32 @@ run (or the built-in default on the first run). A parameter given on the command
 `strata-coder -Setup -Port 8081` never asks for the port. If the console cannot display Unicode box characters,
 plain `+ - |` frames are used instead.
 
-1. **Variant** — pick a model by number or by name (e.g. `IQ2_XS`). The default is the best variant that fits this
-   PC's RAM:
+1. **Variant** — pick a model by number or by name (e.g. `IQ2_XS`). The list is graded against this
+   PC's RAM and the best one it can run is pre-selected and marked `<- best this PC can run`:
 
-    | Variant | Needs RAM | Download |
-    |---|---|---|
-    | Qwen3.8-Flash-Next IQ3_S (3.5-bit, best quality) | 60 GB | ~84 GB |
-    | Qwen3.8-Flash-Next IQ3_XXS (3-bit) | 58 GB | ~76 GB |
-    | Qwen3.8-Flash-Next IQ2_XS (2-bit) | 46 GB | ~68 GB |
-    | Qwen3.8-Flash-Next **Coder** IQ1_M (code-focused) | 30 GB | ~58 GB |
+     | Variant | Needs RAM | Download | Answers | Quality |
+     |---|---|---|---|---|
+     | Qwen3.8-Flash-Next IQ3_S (3.5-bit) | 60 GB | ~84 GB | ~53 tok/s | best |
+     | Qwen3.8-Flash-Next IQ3_XXS (3-bit) | 58 GB | ~76 GB | ~62 tok/s (+17%) | great |
+     | Qwen3.8-Flash-Next IQ2_XS (2-bit) | 46 GB | ~68 GB | ~79 tok/s (+49%) | better |
+     | Qwen3.8-Flash-Next Q2_0 (2-bit, the fastest) | 48 GB | ~66 GB | ~94 tok/s (+77%) | good |
+     | Swift 1.5 IQ3_XXS (3-bit; short-thinking fine-tune) | 60 GB | ~76 GB | ~62 tok/s | great |
+     | Swift 1.5 IQ2_XS (2-bit; short-thinking fine-tune) | 48 GB | ~68 GB | ~79 tok/s | better |
+     | Qwen3.8-Flash-Next **Coder** IQ1_M (code-focused) | 30 GB | ~58 GB | ~55 tok/s | code only |
+     | Qwen3.8-Flash-Next (Unsloth) UD-IQ4_XS (~4-bit) | 48 GB | ~94 GB | see below | above IQ3_S |
+     | Qwen3.8-Flash-Next (Unsloth) UD-Q4_K_XL (4-bit, experimental) | 48 GB | ~111 GB | see below | best |
+
+    Speeds are Strata's published figures for an RTX 5070 (12 GB) with 64 GB of RAM; the percentage in
+    brackets is against IQ3_S. Under the variant list the setup window spells out the trade-off for this
+    PC: answers per second, how long a 32K-token prompt takes to read, the quality word, and what a step
+    down in size would buy ("IQ3_XXS is +17% (frees 7 GB RAM)").
+
+    Colors and markers: green `+` runs at full speed on this PC, yellow `!` runs but pays for it
+    (tight RAM, experts read from the SSD, or experimental), red `x` has too little RAM. The GUI shows
+    the same grading as a colored list with a one-line explanation under it. The Unsloth variants keep
+    a RAM budget of their experts and read the rest from the SSD on PCs with less than about 80 GB of
+    RAM, so they are only recommended on large-RAM PCs; pick them explicitly with `-Family unsloth`.
+
 
 2. **Model folder** — where the model files live. Default: the folder Strata used before, otherwise
    `%USERPROFILE%\ai-models\models`.
