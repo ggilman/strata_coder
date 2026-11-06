@@ -10,8 +10,9 @@ away:
     python setup.py
 
 Pressing OK starts strata-coder.py -Setup with the chosen parameters, which
-saves them and installs and configures everything. The scode shortcut is an
-action, not an option: its button takes effect the moment it is pressed.
+saves them and installs and configures everything. The scode shortcut and the
+Delete Strata engine buttons are actions, not options: their buttons take
+effect the moment they are pressed.
 """
 
 import ctypes
@@ -36,6 +37,7 @@ QUESTIONS = {
     "kv": "KV cache",
     "port": "Server port",
     "offline": "Stay fully local, block OpenCode web access?",
+    "sandbox": "Docker sandbox: run OpenCode in a container with no internet access?",
     "alias": "Add the scode shortcut to %s?",
 }
 
@@ -164,6 +166,14 @@ def run_setup_gui(sc, overrides=None):
     else:
         default_offline = saved.get("offline") is True
 
+    if "sandbox" in overrides:
+        default_sandbox = bool(overrides["sandbox"])
+    else:
+        default_sandbox = saved.get("sandbox") is True
+
+    if default_sandbox:
+        default_offline = True
+
     default_variant = None
 
     if "variant" in overrides:
@@ -287,14 +297,24 @@ def run_setup_gui(sc, overrides=None):
     ttk.Checkbutton(body, text=QUESTIONS["offline"], variable=offline_var).grid(
         row=6, column=0, columnspan=4, sticky="w", pady=3)
 
-    add_label("scode shortcut:", 7)
+    sandbox_var = tk.BooleanVar(value=default_sandbox)
+    ttk.Checkbutton(body, text=QUESTIONS["sandbox"], variable=sandbox_var).grid(
+        row=7, column=0, columnspan=4, sticky="w", pady=3)
+
+    def on_sandbox_toggle(*_args):
+        if sandbox_var.get():
+            offline_var.set(True)
+
+    sandbox_var.trace_add("write", on_sandbox_toggle)
+
+    add_label("scode shortcut:", 8)
     shell_var = tk.StringVar(value="auto")
     ttk.Combobox(body, textvariable=shell_var, values=alias_shells,
-                 state="readonly", width=12).grid(row=7, column=1, sticky="w")
+                 state="readonly", width=12).grid(row=8, column=1, sticky="w")
 
     alias_status = ttk.Label(body, text="adds the scode alias to the chosen shell; safe to press again",
                              foreground="#666666")
-    alias_status.grid(row=7, column=3, sticky="w", padx=(10, 0))
+    alias_status.grid(row=8, column=3, sticky="w", padx=(10, 0))
 
     def do_alias():
         shell = sc.get_calling_shell() if shell_var.get() == "auto" else shell_var.get()
@@ -312,7 +332,55 @@ def run_setup_gui(sc, overrides=None):
                  % shell_names.get(shell, shell))
 
     ttk.Button(body, text="Set scode shortcut", width=18, command=do_alias).grid(
-        row=7, column=2, sticky="w", padx=(6, 0))
+        row=8, column=2, sticky="w", padx=(6, 0))
+
+    add_label("Strata engine:", 9)
+
+    engine_status = ttk.Label(body,
+                              text="removes the downloaded engine; the next -Setup re-creates it (needs network)",
+                              foreground="#666666")
+    engine_status.grid(row=9, column=1, sticky="w")
+
+    def do_purge_engine():
+        state_json = sc.read_json(sc.STATE_PATH) or {}
+        strata_settings = sc.read_json(sc.STRATA_SETTINGS_PATH) or {}
+
+        roots = []
+
+        if state_json.get("StrataRoot"):
+            roots.append(state_json["StrataRoot"])
+
+        roots.extend(strata_settings.get("installs", []))
+        roots.extend(sc.glob.glob(os.path.join(sc.APP_DIR, "strata*")))
+
+        searched = set()
+        deleted = []
+        failed = []
+        data_dir = data_dir_var.get().strip()
+
+        for root in roots:
+            if not root or not os.path.isdir(root) or root in searched:
+                continue
+
+            searched.add(root)
+            removed, failures = sc.delete_strata_engine(root, data_dir)
+            deleted += removed
+            failed += failures
+
+        if deleted:
+            engine_status.configure(
+                foreground="green",
+                text="removed %d engine file(s); -Setup re-creates it on the next run (needs network)"
+                     % len(deleted))
+        elif failed:
+            engine_status.configure(foreground="red",
+                                    text="could not remove " + "; ".join(failed))
+        else:
+            engine_status.configure(foreground="#666666",
+                                    text="no downloaded Strata engine found - nothing to delete")
+
+    ttk.Button(body, text="Delete Strata engine", width=18, command=do_purge_engine).grid(
+        row=9, column=2, sticky="w", padx=(6, 0))
 
     outcome = {}
 
@@ -354,13 +422,14 @@ def run_setup_gui(sc, overrides=None):
             "context": context,
             "kv": kv,
             "port": int(port_text),
-            "offline": bool(offline_var.get()),
+            "offline": bool(offline_var.get()) or bool(sandbox_var.get()),
+            "sandbox": bool(sandbox_var.get()),
         }
 
         root.destroy()
 
     buttons = ttk.Frame(body)
-    buttons.grid(row=8, column=0, columnspan=4, sticky="e", pady=(14, 0))
+    buttons.grid(row=10, column=0, columnspan=4, sticky="e", pady=(14, 0))
     ttk.Button(buttons, text="Cancel", command=root.destroy).pack(side="right", padx=(8, 0))
     ttk.Button(buttons, text="OK", command=on_ok).pack(side="right")
 
@@ -400,6 +469,7 @@ def apply_setup(sc, result):
         "-Kv", result["kv"],
         "-Port", str(result["port"]),
         "-Offline", "true" if result["offline"] else "false",
+        "-Sandbox", "true" if result["sandbox"] else "false",
         "-NoAlias",
         "-NoGui",
     ]

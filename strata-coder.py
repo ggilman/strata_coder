@@ -6,7 +6,7 @@ Runs identically on Windows (cmd, PowerShell, Git Bash) and Linux. Installs per-
 Modes:
     strata-coder.py [-CheckOnly] [-Family qwen|coder] [-Model NAME] [-Context N]
         [-Kv int8|k8v4|q4_0] [-DataDir PATH] [-Port N] [-NoLaunch] [-Update]
-        [-Stop] [-Status] [-Setup] [-Offline [true|false]] [-Alias] [-NoAlias] [-NoGui]
+        [-Stop] [-Status] [-Setup] [-Offline [true|false]] [-Sandbox [true|false]] [-Alias] [-NoAlias] [-NoGui]
         [-AliasShell auto|cmd|powershell|bash|zsh] [-Help]
 """
 
@@ -67,6 +67,15 @@ LOG_DIR = os.path.join(APP_DIR, "logs")
 UNPACK_DIR = os.path.join(APP_DIR, "strata-unpack")
 RG_DIR = os.path.join(APP_DIR, "ripgrep")
 RG_EXE = os.path.join(RG_DIR, "rg.exe" if IS_WINDOWS else "rg")
+SANDBOX_DIR = os.path.join(APP_DIR, "sandbox")
+
+SANDBOX_NETWORK = "strata-coder-sandbox"
+SANDBOX_IMAGE = "strata-coder-opencode"
+SANDBOX_IMAGE_REVISION = "r2"
+SANDBOX_CONTAINER = "strata-coder-opencode"
+SANDBOX_HOME_VOLUME = "strata-coder-opencode-home"
+SANDBOX_RELAY = "strata-coder-relay"
+SANDBOX_RELAY_IMAGE = "alpine/socat:latest"
 
 SCRIPT_PATH = os.path.abspath(__file__)
 MENU_PATH = os.path.join(os.path.dirname(SCRIPT_PATH), "setup.py")
@@ -1000,7 +1009,10 @@ Options:
   -DataDir <path>            Model folder.
   -Port <port>               Server port, default 8080.
   -Offline [true|false]      Block OpenCode web access;
-                             -Offline false turns the block off.""")
+                             -Offline false turns the block off.
+  -Sandbox [true|false]      Run OpenCode inside a Docker container with
+                             no internet access (needs Docker; implies
+                             -Offline true); -Sandbox false turns it off.""")
 
 
 def install_ripgrep(release):
@@ -1184,6 +1196,9 @@ def run_setup_menu(state):
 
     if state["offline_specified"]:
         overrides["offline"] = state["offline"]
+
+    if state["sandbox_specified"]:
+        overrides["sandbox"] = state["sandbox"]
 
     menu.spawn_detached_gui(overrides)
 
@@ -1491,6 +1506,7 @@ def prompt_setup_params(spec, state):
     default_kv = "int8"
     default_port = 8080
     default_offline = False
+    default_sandbox = False
 
     if saved:
         default_context = get_int_setting(saved.get("context"), default_context)
@@ -1505,6 +1521,9 @@ def prompt_setup_params(spec, state):
 
         if saved.get("offline") is True:
             default_offline = True
+
+        if saved.get("sandbox") is True:
+            default_sandbox = True
 
     if state["context_specified"]:
         default_context = state["context"]
@@ -1578,6 +1597,18 @@ def prompt_setup_params(spec, state):
     else:
         selected_offline = prompt_yes_no(menu.QUESTIONS["offline"], selected_offline)
 
+    selected_sandbox = default_sandbox
+
+    if state["sandbox"]:
+        selected_sandbox = True
+    elif state["sandbox_specified"]:
+        selected_sandbox = False
+    else:
+        selected_sandbox = prompt_yes_no(menu.QUESTIONS["sandbox"], selected_sandbox)
+
+    if selected_sandbox and not state["offline"]:
+        selected_offline = True
+
     calling_shell = get_calling_shell()
 
     if state["no_alias"]:
@@ -1593,6 +1624,7 @@ def prompt_setup_params(spec, state):
         "dataDir": selected_data_dir,
         "port": selected_port,
         "offline": selected_offline,
+        "sandbox": selected_sandbox,
     }
 
     os.makedirs(APP_DIR, exist_ok=True)
@@ -1848,6 +1880,40 @@ def test_strata_config(root, tag):
         return False
 
     return os.path.isfile(config["exe"]) and os.path.isfile(venv_python(root))
+
+
+def test_strata_engine_missing(root, tag):
+    config = read_json(os.path.join(root, "strata-%s.json" % tag))
+
+    if not config or not config.get("exe"):
+        return False
+
+    return not os.path.isfile(config["exe"])
+
+
+def delete_strata_engine(root, data_dir):
+    deleted = []
+    failed = []
+
+    engine_names = ("strata.exe",) if IS_WINDOWS else ("strata",)
+    targets = []
+
+    for base in (root, data_dir):
+        if not base or not os.path.isdir(base):
+            continue
+        for name in engine_names:
+            for path in glob.glob(os.path.join(base, "**", name), recursive=True):
+                if os.path.isfile(path) and path not in targets:
+                    targets.append(path)
+
+    for path in targets:
+        try:
+            os.remove(path)
+            deleted.append(path)
+        except OSError as exc:
+            failed.append("%s (%s)" % (path, exc.strerror or exc))
+
+    return deleted, failed
 
 
 def read_gguf_string(reader):
@@ -2191,6 +2257,10 @@ def invoke_strata_setup(root, arguments):
         command = ["sh", os.path.join(root, "setup.sh")] + arguments
         popen_kwargs = dict(start_new_session=True)
 
+    # the offline dead proxy must not block the engine and model downloads;
+    # isolation resumes when OpenCode starts after this step
+    popen_kwargs["env"] = without_sinkhole_proxy(os.environ)
+
     process = subprocess.Popen(
         command,
         cwd=root,
@@ -2282,6 +2352,17 @@ def invoke_model_setup(root, variant, directory, server_port, context_tokens, kv
 OFFLINE_PROXY_URL = "http://127.0.0.1:9"
 OFFLINE_NO_PROXY = "127.0.0.1,localhost"
 
+SINKHOLE_PROXY_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+
+
+def without_sinkhole_proxy(env):
+    # Strata's own setup downloads the engine and the model, so isolation must
+    # never reach it, not even through an inherited environment (e.g. scode
+    # started from inside an isolated OpenCode session). Only the dead-proxy
+    # sinkhole values are dropped; a real corporate proxy stays in place.
+    return {key: value for key, value in env.items()
+            if not (key.upper() in SINKHOLE_PROXY_NAMES and value == OFFLINE_PROXY_URL)}
+
 OFFLINE_DENY_COMMANDS = (
     "curl", "curl.exe", "wget", "wget.exe", "ftp", "tftp", "telnet", "nc", "ncat", "socat",
     "ssh", "scp", "sftp", "rsync",
@@ -2334,29 +2415,354 @@ def clear_offline_proxy_sinkhole(saved):
             os.environ[key] = value
 
 
-def delete_strata_engine(root, data_dir):
-    deleted = []
-    failed = []
+# ----------------------------------------------------------------------------------------------------
+# Docker sandbox
+# ----------------------------------------------------------------------------------------------------
 
-    engine_names = ("strata.exe",) if IS_WINDOWS else ("strata",)
-    targets = []
+# tools baked into the sandbox image; ripgrep is absent because the linux musl
+# rg binary is copied in below, the .NET SDKs are absent because debian bookworm
+# carries no dotnet packages, and network utilities are deliberately absent so
+# nothing inside the container can probe or reach a network
+SANDBOX_APT_PACKAGES = [
+    # version control and search
+    "git",
+    "tree",
+    # python
+    "python3",
+    "python3-pip",
+    "python3-venv",
+    "python3-dev",
+    # build tools (needed for packages with native extensions)
+    "gcc",
+    "g++",
+    "make",
+    "cmake",
+    "ninja-build",
+    "pkgconf",
+    # C/C++ extended toolchain
+    "clang",
+    "clang-format",
+    "clang-tidy",
+    "cppcheck",
+    "gdb",
+    "libssl-dev",
+    "libffi-dev",
+    # data and files
+    "jq",
+    "sqlite3",
+    "unzip",
+    "zip",
+    "xxd",
+    # media and documents
+    "ffmpeg",
+    "imagemagick",
+    "poppler-utils",
+    # process and debug
+    "procps",
+    "lsof",
+    "strace",
+    "shellcheck",
+]
 
-    for base in (root, data_dir):
-        if not base or not os.path.isdir(base):
-            continue
-        for name in engine_names:
-            for path in glob.glob(os.path.join(base, "**", name), recursive=True):
-                if os.path.isfile(path) and path not in targets:
-                    targets.append(path)
+SANDBOX_DOCKERFILE = (
+    "FROM debian:bookworm-slim\n"
+    "RUN useradd -m sandbox && apt-get update \\\n"
+    "    && apt-get install -y --no-install-recommends ca-certificates wget \\\n"
+    + "".join("        %s \\\n" % pkg for pkg in SANDBOX_APT_PACKAGES) +
+    "    && rm -rf /var/lib/apt/lists/*\n"
+    "COPY opencode /usr/local/bin/opencode\n"
+    "COPY rg /usr/local/bin/rg\n"
+    "ENV HOME=/home/sandbox\n"
+    "USER sandbox\n"
+    "WORKDIR /workspace\n"
+    "ENTRYPOINT [\"opencode\"]\n"
+)
 
-    for path in targets:
-        try:
-            os.remove(path)
-            deleted.append(path)
-        except OSError as exc:
-            failed.append("%s (%s)" % (path, exc.strerror or exc))
 
-    return deleted, failed
+def docker_ready():
+    docker = shutil.which("docker")
+
+    if not docker:
+        return None, "the docker command was not found"
+
+    try:
+        proc = subprocess.run([docker, "info", "--format", "{{.ServerVersion}}"],
+                              capture_output=True, text=True, errors="replace")
+    except Exception as exc:
+        return None, str(exc)
+
+    if proc.returncode:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return None, detail[0] if detail else "the docker daemon is not running"
+
+    return docker, (proc.stdout or "").strip()
+
+
+def fail_no_docker(detail):
+    fail("the Docker sandbox is on but Docker is not usable: %s" % detail,
+         "Start Docker Desktop (it is installed by an administrator), run the script again, "
+         "or turn the sandbox off with: scode -Setup -Sandbox false")
+
+
+SANDBOX_RESERVED_MOUNTS = {
+    "bin", "boot", "dev", "etc", "home", "lib", "lib64", "media", "mnt", "opt",
+    "proc", "root", "run", "sbin", "srv", "sys", "tmp", "usr", "var",
+}
+
+
+def sandbox_mount_path(project_dir):
+    name = os.path.basename((project_dir or "").rstrip("\\/"))
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+
+    if not name:
+        return "/workspace"
+
+    return "/projects/%s" % name if name.lower() in SANDBOX_RESERVED_MOUNTS else "/%s" % name
+
+
+def sandbox_network_is_internal(docker):
+    proc = subprocess.run([docker, "network", "inspect", "--format", "{{.Internal}}", SANDBOX_NETWORK],
+                          capture_output=True, text=True, errors="replace")
+
+    return proc.returncode == 0 and (proc.stdout or "").strip().lower() == "true"
+
+
+def ensure_sandbox_network(docker):
+    if sandbox_network_is_internal(docker):
+        return
+
+    rc, _lines = run_native(docker, ["network", "inspect", SANDBOX_NETWORK])
+
+    if rc == 0:
+        rc, container_ids = run_native(docker, ["ps", "-aq", "--filter", "network=%s" % SANDBOX_NETWORK])
+
+        if container_ids:
+            run_native(docker, ["rm", "-f"] + container_ids)
+
+        run_native(docker, ["network", "rm", SANDBOX_NETWORK])
+
+    proc = subprocess.run([docker, "network", "create", "--internal", SANDBOX_NETWORK],
+                          capture_output=True, text=True, errors="replace")
+
+    if proc.returncode and not sandbox_network_is_internal(docker):
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        fail("could not create the internal sandbox network (%s)." % (detail[0] if detail else "unknown error"),
+             "Run 'docker network create --internal %s' manually and try again." % SANDBOX_NETWORK)
+
+
+def sandbox_image_tag(version):
+    return "%s:%s-%s" % (SANDBOX_IMAGE, version or "latest", SANDBOX_IMAGE_REVISION)
+
+
+def sandbox_opencode_version():
+    state_json = read_json(STATE_PATH)
+
+    if isinstance(state_json, dict) and state_json.get("OpenCodeVersion"):
+        return str(state_json["OpenCodeVersion"])
+
+    release = get_latest_release("anomalyco/opencode")
+
+    return release["tag_name"] if release else ""
+
+
+def stage_sandbox_binaries(version, avx2):
+    build = os.path.join(SANDBOX_DIR, "build")
+    os.makedirs(build, exist_ok=True)
+
+    if not os.path.isfile(os.path.join(build, "opencode")):
+        asset = "opencode-linux-x64-baseline.tar.gz" if avx2 is False \
+            else "opencode-linux-x64.tar.gz"
+        url = "https://github.com/anomalyco/opencode/releases/download/%s/%s" % (version, asset)
+        staged = get_downloaded_file(url, os.path.join(DOWNLOAD_DIR, asset),
+                                     os.path.join(SANDBOX_DIR, "unpack-opencode"), "opencode")
+        shutil.move(staged, os.path.join(build, "opencode"))
+        shutil.rmtree(os.path.join(SANDBOX_DIR, "unpack-opencode"), ignore_errors=True)
+
+    if not os.path.isfile(os.path.join(build, "rg")):
+        release = get_latest_release("BurntSushi/ripgrep")
+        asset = next((a for a in (release or {}).get("assets", [])
+                      if fnmatch.fnmatch(a.get("name", ""), "ripgrep-*-x86_64-unknown-linux-musl.tar.gz")),
+                     None)
+
+        if not asset:
+            fail("the ripgrep release does not contain a linux-musl build.",
+                 "Check network access and run the script again.")
+
+        staged = get_downloaded_file(asset["browser_download_url"],
+                                     os.path.join(DOWNLOAD_DIR, asset["name"]),
+                                     os.path.join(SANDBOX_DIR, "unpack-rg"), "rg")
+        shutil.move(staged, os.path.join(build, "rg"))
+        shutil.rmtree(os.path.join(SANDBOX_DIR, "unpack-rg"), ignore_errors=True)
+
+    write_text_file(os.path.join(build, "Dockerfile"), SANDBOX_DOCKERFILE)
+
+    return build
+
+
+def prune_old_sandbox_images(docker, keep_tag):
+    rc, tags = run_native(docker, ["image", "ls", "--filter", "reference=%s" % SANDBOX_IMAGE,
+                                   "--format", "{{.Repository}}:{{.Tag}}"])
+
+    for old_tag in tags:
+        if old_tag and old_tag != keep_tag:
+            run_native(docker, ["rmi", old_tag])
+
+
+def ensure_sandbox_image(docker, avx2):
+    version = sandbox_opencode_version()
+    tag = sandbox_image_tag(version)
+
+    rc, _lines = run_native(docker, ["image", "inspect", tag])
+
+    if rc == 0:
+        write_skip("sandbox image is already built (%s)" % tag)
+        prune_old_sandbox_images(docker, tag)
+        return tag
+
+    write_info("staging the linux OpenCode and ripgrep binaries for the sandbox image")
+
+    try:
+        build = stage_sandbox_binaries(version, avx2)
+    except Exception as exc:
+        fail("the sandbox image inputs could not be prepared (%s)." % exc,
+             "Check network access and run the script again.")
+
+    write_info("building the sandbox image %s "
+               "(the first build downloads the debian base and the toolchain, so it can take a few minutes)" % tag)
+    proc = subprocess.run([docker, "build", "-t", tag, build],
+                          capture_output=True, text=True, errors="replace")
+
+    if proc.returncode:
+        tail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-4:]
+        fail("the sandbox image build failed (%s)." % " | ".join(tail),
+             "Check that Docker Desktop is running and try again.")
+
+    prune_old_sandbox_images(docker, tag)
+
+    return tag
+
+
+def sandbox_models_reachable(docker, tag, url):
+    rc, _lines = run_native(docker, [
+        "run", "--rm", "--network", SANDBOX_NETWORK, "--entrypoint", "sh", tag,
+        "-c", "wget -q -O - %s" % url])
+
+    return rc == 0
+
+
+def start_sandbox_relay(docker, port):
+    run_native(docker, ["rm", "-f", SANDBOX_RELAY])
+
+    rc, lines = run_native(docker, [
+        "run", "-d", "--rm", "--name", SANDBOX_RELAY, SANDBOX_RELAY_IMAGE,
+        "tcp-listen:8080,fork,reuseaddr", "tcp-connect:host.docker.internal:%d" % port])
+
+    if rc != 0:
+        return False
+
+    rc, _lines = run_native(docker, ["network", "connect", SANDBOX_NETWORK, SANDBOX_RELAY])
+
+    if rc != 0:
+        run_native(docker, ["rm", "-f", SANDBOX_RELAY])
+        return False
+
+    return True
+
+
+def sandbox_config_content(open_code_json, base_url, port):
+    config = json.loads(open_code_json)
+
+    try:
+        config["provider"]["strata"]["options"]["baseURL"] = "%s:%d/v1" % (base_url, port)
+    except (KeyError, TypeError):
+        pass
+
+    return json.dumps(config, indent=2)
+
+
+def run_opencode_sandbox(tag, port, open_code_json):
+    docker, detail = docker_ready()
+
+    if not docker:
+        fail_no_docker(detail)
+
+    rc, running = run_native(docker, ["ps", "-q", "--filter", "name=^%s$" % SANDBOX_CONTAINER])
+
+    if running:
+        fail("another sandboxed OpenCode is already running in container '%s'." % SANDBOX_CONTAINER,
+             "Close that session's window first; sandboxed OpenCode instances share one container name.")
+
+    run_native(docker, ["rm", "-f", SANDBOX_CONTAINER])
+
+    if IS_WINDOWS and PROJECT_DIR.startswith("\\\\"):
+        fail("the Docker sandbox cannot mount the current folder: %s" % PROJECT_DIR,
+             "Docker cannot bind-mount network shares; cd to a local drive folder and run again.")
+
+    relay_started = False
+    base_url = "http://host.docker.internal"
+    probe_port = port
+
+    if not sandbox_models_reachable(docker, tag, "http://host.docker.internal:%d/v1/models" % port):
+        write_info("the internal network resolves no outside names (normal); "
+                   "routing the model connection through the socat relay")
+
+        if not start_sandbox_relay(docker, port):
+            fail("the sandbox relay container could not be started.",
+                 "Check that Docker can pull %s and run the script again, "
+                 "or turn the sandbox off with: scode -Setup -Sandbox false" % SANDBOX_RELAY_IMAGE)
+
+        relay_started = True
+        base_url = "http://%s" % SANDBOX_RELAY
+        probe_port = 8080
+
+        if not sandbox_models_reachable(docker, tag, "http://%s:8080/v1/models" % SANDBOX_RELAY):
+            run_native(docker, ["rm", "-f", SANDBOX_RELAY])
+            fail("the Strata server refused the sandboxed connection through the relay.",
+                 "A server started before the sandbox was turned on listens only on 127.0.0.1 and lacks the "
+                 "relay host allowance; run: scode -Stop, then run this script again.")
+
+    sandbox_json = sandbox_config_content(open_code_json, base_url, probe_port)
+
+    no_proxy = "127.0.0.1,localhost,host.docker.internal,%s" % SANDBOX_RELAY
+
+    mount = sandbox_mount_path(PROJECT_DIR)
+    arguments = [
+        docker, "run", "--rm", "-it", "--name", SANDBOX_CONTAINER,
+        "--network", SANDBOX_NETWORK,
+        "--hostname", "strata-sandbox",
+        "-v", "%s:%s" % (PROJECT_DIR, mount),
+        "-w", mount,
+        "-e", "OPENCODE_CONFIG_CONTENT=" + sandbox_json,
+        "-e", "HTTP_PROXY=" + OFFLINE_PROXY_URL,
+        "-e", "HTTPS_PROXY=" + OFFLINE_PROXY_URL,
+        "-e", "http_proxy=" + OFFLINE_PROXY_URL,
+        "-e", "https_proxy=" + OFFLINE_PROXY_URL,
+        "-e", "NO_PROXY=" + no_proxy,
+        "-e", "no_proxy=" + no_proxy,
+    ]
+
+    if IS_WINDOWS:
+        arguments += ["-v", "%s:/home/sandbox" % SANDBOX_HOME_VOLUME]
+    else:
+        # on Linux the container must run as the host user or the mounted project
+        # files are not writable; each uid gets its own home volume for sessions
+        uid_gid = "%d:%d" % (os.getuid(), os.getgid())
+        home_volume = "%s-%d" % (SANDBOX_HOME_VOLUME, os.getuid())
+        run_native(docker, ["run", "--rm", "--user", "0:0", "-v", "%s:/home/sandbox" % home_volume,
+                            "--entrypoint", "chown", tag, "-R", uid_gid, "/home/sandbox"])
+        arguments += ["--user", uid_gid, "-v", "%s:/home/sandbox" % home_volume]
+
+    arguments += [tag]
+
+    write_info("project folder mounted at %s (read-write)" % mount)
+
+    try:
+        subprocess.run(arguments)
+    finally:
+        reset_terminal_mouse()
+
+        if relay_started:
+            run_native(docker, ["rm", "-f", SANDBOX_RELAY])
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -2380,6 +2786,7 @@ def parse_args():
     parser.add_argument("-Status", dest="status", action="store_true")
     parser.add_argument("-Setup", dest="setup", action="store_true")
     parser.add_argument("-Offline", dest="offline", nargs="?", const=True, default=None)
+    parser.add_argument("-Sandbox", dest="sandbox", nargs="?", const=True, default=None)
     parser.add_argument("-Alias", dest="alias", action="store_true")
     parser.add_argument("-AliasShell", dest="alias_shell")
     parser.add_argument("-Help", "--help", "-h", dest="help", action="store_true")
@@ -2405,6 +2812,11 @@ def main():
     if isinstance(offline, str):
         offline = offline.strip().lower() in ("true", "1", "yes", "on")
 
+    sandbox_specified = args.sandbox is not None
+    sandbox = args.sandbox if sandbox_specified else False
+    if isinstance(sandbox, str):
+        sandbox = sandbox.strip().lower() in ("true", "1", "yes", "on")
+
     state = {
         "family": args.family or "",
         "model": args.model or "",
@@ -2414,6 +2826,8 @@ def main():
         "port": args.port if args.port is not None else 8080,
         "offline": offline,
         "offline_specified": offline_specified,
+        "sandbox": sandbox,
+        "sandbox_specified": sandbox_specified,
         "context_specified": args.context is not None,
         "kv_specified": args.kv is not None,
         "data_dir_specified": args.data_dir is not None,
@@ -2608,6 +3022,13 @@ def main():
 
             if not state["offline_specified"] and saved_setup.get("offline") is True:
                 state["offline"] = True
+
+            if not state["sandbox_specified"] and saved_setup.get("sandbox") is True:
+                state["sandbox"] = True
+                state["offline"] = True
+
+        if state["sandbox"]:
+            state["offline"] = True
 
         candidates = get_candidates(family_filter, model_filter)
 
@@ -3048,6 +3469,11 @@ def main():
                 write_info("this may download about %d GB and can take a long time" % download_estimate)
                 write_info("If interrupted, run the script again; supported downloads resume.")
 
+            if not model_ready and strata_root and test_strata_engine_missing(strata_root, tag):
+                write_warn("the model is configured but its engine file is missing "
+                           "(the setup window's Delete Strata engine button removed it)")
+                write_info("Strata re-creates the engine during setup, so this run needs network access")
+
             exit_code, configured = invoke_model_setup(
                 strata_root, variant, data_dir, port, state["context"], state["kv"], gguf_dir, tag)
 
@@ -3164,23 +3590,28 @@ def main():
             write_skip("ripgrep already installed")
 
         # --------------------------------------------------------------------------------------------
+        # Docker sandbox preparation
+        # --------------------------------------------------------------------------------------------
+
+        sandbox_tag = None
+
+        if state["sandbox"]:
+            write_step("Preparing the Docker sandbox")
+
+            sandbox_docker, sandbox_detail = docker_ready()
+
+            if not sandbox_docker:
+                fail_no_docker(sandbox_detail)
+
+            write_info("docker daemon version %s" % sandbox_detail)
+            ensure_sandbox_network(sandbox_docker)
+            sandbox_tag = ensure_sandbox_image(sandbox_docker, spec["avx2"])
+
+        # --------------------------------------------------------------------------------------------
         # -Setup stops here
         # --------------------------------------------------------------------------------------------
 
         if state["setup"]:
-            if state["offline"]:
-                write_step("Offline isolation: removing the downloaded Strata engine")
-
-                deleted_engines, failed_engines = delete_strata_engine(strata_root, data_dir)
-                for engine_path in deleted_engines:
-                    write_ok("removed " + engine_path)
-                for description in failed_engines:
-                    write_warn("could not remove " + description)
-
-                if failed_engines:
-                    write_info("run scode -Stop and repeat -Setup if any engine file was left")
-                write_info("the next run rebuilds the engine from source instead of using the downloaded exe")
-
             write_step("Setup complete")
             write_info("the server was not started and OpenCode was not opened")
             write_info("run scode (or strata-coder) in a project folder when you are ready to use it")
@@ -3219,6 +3650,11 @@ def main():
             env["PYTHONUNBUFFERED"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
 
+            if state["sandbox"]:
+                env["STRATA_ALLOWED_HOSTS"] = "%s,host.docker.internal" % SANDBOX_RELAY
+                write_info("the server will listen on 0.0.0.0 so the container can reach it; "
+                           "Windows Firewall blocks other devices by default")
+
             log_handle = open(server_log, "wb")
 
             popen_kwargs = {}
@@ -3238,7 +3674,8 @@ def main():
 
             server_process = subprocess.Popen(
                 [python, os.path.join(strata_root, "serve", "server.py"),
-                 "--engine", "strata", "--config", strata_config_path, "--port", str(port)],
+                 "--engine", "strata", "--config", strata_config_path, "--port", str(port)] +
+                (["--host", "0.0.0.0"] if state["sandbox"] else []),
                 cwd=strata_root,
                 stdin=subprocess.DEVNULL,
                 stdout=log_handle,
@@ -3405,7 +3842,8 @@ def main():
             write_info("stop the Strata server with: strata-coder -Stop (or scode -Stop)")
             sys.exit(0)
 
-        write_step("Opening OpenCode in " + PROJECT_DIR)
+        write_step("Opening OpenCode in a Docker sandbox from " + PROJECT_DIR
+                   if state["sandbox"] else "Opening OpenCode in " + PROJECT_DIR)
 
         os.environ["OPENCODE_CONFIG"] = OPENCODE_CFG
 
@@ -3421,7 +3859,11 @@ def main():
         write_info("OpenCode model: strata/%s" % model_id)
         write_info("Strata endpoint: http://127.0.0.1:%d/v1" % port)
 
-        if state["offline"]:
+        if state["sandbox"]:
+            write_info("OpenCode runs in container '%s' on internal network '%s'"
+                       % (SANDBOX_CONTAINER, SANDBOX_NETWORK))
+            write_info("container egress is blocked by Docker; only the local model endpoint is reachable")
+        elif state["offline"]:
             write_info("OpenCode web access: blocked (web tools denied, network shell commands denied)")
             write_info("dead proxy set for OpenCode and its child processes: " + OFFLINE_PROXY_URL)
 
@@ -3452,13 +3894,17 @@ def main():
         # proxy; NO_PROXY keeps the local Strata endpoint working. Any pre-existing
         # proxy settings are saved and restored as soon as OpenCode exits; atexit
         # is the fallback in case the run itself is interrupted before the finally.
+        # The sandbox container gets its own copies via docker -e instead.
         offline_proxy_saved = {}
-        if state["offline"]:
+        if state["offline"] and not state["sandbox"]:
             offline_proxy_saved = set_offline_proxy_sinkhole()
             atexit.register(clear_offline_proxy_sinkhole, offline_proxy_saved)
 
         try:
-            subprocess.run([OPENCODE_EXE, PROJECT_DIR], cwd=PROJECT_DIR)
+            if state["sandbox"]:
+                run_opencode_sandbox(sandbox_tag, port, open_code_json)
+            else:
+                subprocess.run([OPENCODE_EXE, PROJECT_DIR], cwd=PROJECT_DIR)
         finally:
             reset_terminal_mouse()
             os.environ.pop("OPENCODE_CONFIG_CONTENT", None)

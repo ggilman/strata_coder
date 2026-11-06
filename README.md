@@ -68,6 +68,7 @@ specific shell when detection picks the wrong one.
 | `strata-coder -Context 65536` / `-Port 8081` | Sets the context size and server port |
 | `strata-coder -Kv q4_0` | Sets the KV cache quant: `int8` (default), `k8v4`, or `q4_0` |
 | `strata-coder -Offline` | Blocks OpenCode's web tools; `-Offline false` turns the block off |
+| `strata-coder -Sandbox` | Runs OpenCode in a Docker container with no internet; `-Sandbox false` turns it off |
 | `strata-coder -Alias` | Adds the permanent `scode` alias to the calling shell |
 | `strata-coder -Setup -NoAlias` | Console `-Setup` that skips the `scode` shortcut question |
 | `strata-coder -Help` | Shows all options (`--help` also works) |
@@ -110,13 +111,33 @@ plain `+ - |` frames are used instead.
    `pip install`, PowerShell `Invoke-WebRequest`, and similar) in its config. OpenCode is also launched with a dead
    proxy (`http://127.0.0.1:9` with `NO_PROXY` for localhost) that every child process inherits, so anything the
    bash tool spawns that ignores the deny list still cannot reach the internet; the local Strata endpoint is
-   unaffected. Turning the setting off restores the normal config and clears the proxy. `-Setup` also deletes the
-   downloaded `strata.exe` while the setting is on, so the next run rebuilds the engine locally instead of trusting
-   a downloaded binary. Combined with the already-disabled
+   unaffected. Turning the setting off restores the normal config and clears the proxy. The isolation covers
+   OpenCode's use of the machine, not the setup itself, and it never removes `strata.exe` on its own — a fully
+   offline PC could not re-download or rebuild it afterwards. To stop trusting the downloaded binary and force a
+   fresh one, press **Delete Strata engine** in the setup window and run `-Setup` while the PC has network
+   access (see the GUI section). Isolation never blocks that rebuild: Strata's own setup runs with the dead proxy
+   stripped from its environment, and the block starts when OpenCode starts after it. Combined with the already-disabled
    autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Note this is still a policy
-   plus an inherited environment, not a sandbox; a hard block needs an outbound firewall rule for `opencode.exe`,
-   which requires admin.
-7. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
+   plus an inherited environment, not a sandbox — the next question adds a real one.
+7. **Docker sandbox** — yes/no. Runs OpenCode inside a Docker container on an internal network: Docker itself blocks
+   all outbound traffic from the container, so the only network path is the local model endpoint, reached through
+   a small `socat` relay container (the internal network resolves no external names at all). Your current folder is
+   mounted read-write
+   at a path named after the folder you run in (`D:\projects\my-app` becomes `/my-app`, so OpenCode shows
+   your project name rather than a generic `/workspace`; odd characters are cleaned up and a folder named
+   after a system directory like `home` mounts at `/projects/home`), and OpenCode's sessions persist in a
+   named volume. The container
+   image ships a full offline developer toolchain — git, the GNU and LLVM C/C++ toolchains with clang-format,
+   clang-tidy, cppcheck and gdb, Python 3 with pip, venv and dev headers, gcc/cmake/ninja/make with the SSL and FFI
+   dev libraries, jq, sqlite3, zip/unzip and xxd, ffmpeg, ImageMagick, poppler-utils, shellcheck, tree, and the
+   procps/lsof/strace diagnostics — but deliberately no network utilities and no .NET SDKs (Debian has none).
+   Implies the previous setting on. Needs Docker Desktop installed (an administrator installs it; check its
+   licensing for your company). The Strata server and GPU stay on the host, and `-Status` works unchanged. With the sandbox on, the
+   server starts listening on all interfaces of this PC so the relay can reach it; what keeps other devices out is
+   Windows Firewall, which blocks inbound to it by default (tell IT the server listens on your port while the
+   sandbox is on). Turning the sandbox on restarts a running server once so it picks these up — `-Setup` does that
+   automatically. Turning the setting off resumes the normal host launch.
+8. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
    Git Bash), the same as `strata-coder -Alias`. Open a new shell window afterwards to pick it up. The GUI handles the
    shortcut differently: it is an instant action there, not a question — see the GUI section.
 
@@ -140,12 +161,17 @@ The same menu also exists as one Tkinter window, opened directly with `python se
 installers). The window opens **detached**: the command you typed finishes right away and the window lives on its
 own, so your terminal is free; close the window to back out. The form has a variant dropdown (variants that don't
 fit this PC's RAM are marked), model folder with a **Browse…** button, context and KV-cache dropdowns, port, and
-an *Stay fully local* checkbox. Fields come up pre-filled from `setup.json`, and command-line parameters (e.g.
-`strata-coder -Setup -Port 8081`) pre-fill over the saved values.
+*Stay fully local* and *Docker sandbox* checkboxes. Fields come up pre-filled from `setup.json`, and command-line
+parameters (e.g. `strata-coder -Setup -Port 8081`) pre-fill over the saved values.
 
 In the window the `scode` shortcut is an **action**, not a question: pick the shell (`auto`, `cmd`, `powershell` —
 `auto`, `bash`, `zsh` on Linux) and press **Set scode shortcut** to add it right away; an inline note confirms
 "open a new shell window to use it". Press it as often as you like — it replaces the previous entry.
+
+**Delete Strata engine** is an instant action too: it removes the downloaded `strata.exe` (including any copy under
+the model folder) and an inline note confirms it, so the next `-Setup` re-creates the engine from a fresh download
+instead of trusting the binary on disk. Press it only when that next `-Setup` can reach the network — the re-download
+is Strata's only way back.
 
 **OK** then starts `strata-coder -Setup` with every chosen parameter plus `-NoAlias -NoGui` in its own console
 window (a new one on Windows, a terminal window on Linux), which saves the settings, runs the install and configure
@@ -186,10 +212,48 @@ quits). `-NoGui` forces the console panel, and the port defaults to the saved on
 When you quit OpenCode, the script stops the Strata server so RAM and VRAM are freed. With `-NoLaunch` the server keeps
 running after the script exits; stop it with `strata-coder -Stop`.
 
+## Isolation
+
+Three settings keep OpenCode from reaching the internet; they stack, and the full wording for each is in the
+`-Setup` menu questions above. The Strata server and GPU always stay on the host, and `-Status` works the same in every
+mode.
+
+- **Offline** (`-Offline`, setup Q6) — a *policy plus an inherited environment*, not a sandbox. OpenCode's `webfetch`
+  and `websearch` tools are set to `deny`, its `bash` tool gets a deny list for network commands (`curl`, `wget`,
+  `git push/clone`, `npm install`, `pip install`, `Invoke-WebRequest`, and similar), and OpenCode is launched with a
+  dead proxy (`http://127.0.0.1:9`, `NO_PROXY` for localhost) that every child process inherits, so anything that
+  ignores the deny list still cannot get out; the local Strata endpoint is unaffected. Combined with the
+  already-disabled autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Turning it
+  off (`-Offline false`) restores the normal config and clears the proxy. This covers OpenCode's use of the machine,
+  not the setup: Strata's own setup runs with the sinkhole proxy stripped so downloads and rebuilds are never blocked,
+  and the block only starts when OpenCode launches afterward. A hard block on the host still needs an outbound firewall
+  rule for `opencode.exe`, which requires admin.
+- **Docker sandbox** (`-Sandbox`, setup Q7) — a *real* sandbox, and it turns the offline setting on for you. OpenCode
+  runs in a container on an internal network where Docker blocks all outbound traffic and no external names resolve;
+  the only network path is the local model endpoint through a `socat` relay container. Your current folder is mounted
+  read-write at a path named after it, sessions persist in a named volume, and the image ships an offline developer
+  toolchain but deliberately no network utilities. Needs Docker Desktop (admin installs it; check licensing). While it
+  is on, the server listens on all interfaces of this PC so the relay can reach it, and Windows Firewall is what keeps
+  other devices out; `-Setup` restarts a running server once so it picks this up. The script reports a clear error
+  instead of running unprotected if Docker is missing.
+- **Delete Strata engine** (the setup-window button) — a one-shot action, not a setting.
+  It removes the downloaded `strata.exe` (and any copy under the model folder) so the next `-Setup` rebuilds the engine
+  from a fresh download instead of trusting the binary on disk — the way to stop trusting an unsigned download.
+  Isolation never deletes the engine on its own, because a fully offline PC could not get it back; press it only when
+  that next `-Setup` can reach the network.
+
+Pick Offline for a lightweight policy-level guard while OpenCode runs on the host, or the Docker sandbox for
+container-enforced isolation. Offline and the sandbox can be set without the menu via `-Offline [true|false]` and
+`-Sandbox [true|false]`.
+
 ## Notes
 
-- OpenCode runs as your user, not in a sandbox. It starts in your project folder and asks before risky actions.
-- On a managed PC, the only thing that needs IT is a current NVIDIA driver (580 or newer).
+- OpenCode runs as your user, not in a sandbox, unless you turn on the **Docker sandbox** setup option. It starts in
+  your project folder and asks before risky actions.
+- On a managed PC, the only thing that needs IT is a current NVIDIA driver (580 or newer) — plus Docker Desktop if
+  you want the Docker sandbox option, which an administrator must install (and whose licensing for your company IT
+  should confirm). With the sandbox on, the script reports a clear error instead of running unprotected when Docker
+  is missing.
 - If Strata has no ready-made engine for the GPU, it would want to install Visual Studio and the CUDA Toolkit, which needs admin. The script
   stops instead.
 - Strata's engine (`strata.exe`) is not code-signed, so Windows Smart App Control blocks it. The script stops at the PC check if
