@@ -2168,7 +2168,17 @@ def show_ram_stability(spec, variant, context_tokens, kv_quant, root, tag, data_
                        % (fit_tokens, COMFORTABLE_HEADROOM_GB))
 
 
-def test_setup_drift(root, tag, context_tokens, kv_quant):
+def path_is_under(path, parent):
+    path = os.path.normcase(os.path.abspath(path))
+    parent = os.path.normcase(os.path.abspath(parent))
+
+    if not parent.endswith(os.sep):
+        parent += os.sep
+
+    return path.startswith(parent)
+
+
+def test_setup_drift(root, tag, context_tokens, kv_quant, data_dir):
     config = read_json(os.path.join(root, "strata-%s.json" % tag))
 
     if not config or not config.get("args"):
@@ -2182,6 +2192,14 @@ def test_setup_drift(root, tag, context_tokens, kv_quant):
 
     if kv_quant and str(current_kv or "").lower() != str(kv_quant).lower():
         return True
+
+    # the model folder is baked into the engine's model paths; a different
+    # folder (or model files that went missing) needs a reconfigure
+    native = get_config_arg_value(config, "--native")
+
+    if native:
+        if not os.path.isfile(native) or not path_is_under(native, data_dir):
+            return True
 
     return False
 
@@ -3442,18 +3460,18 @@ def main():
 
         config_drift = False
 
-        if model_ready and not state["setup"]:
-            config_drift = test_setup_drift(strata_root, tag, state["context"], state["kv"])
+        if model_ready:
+            config_drift = test_setup_drift(
+                strata_root, tag, state["context"], state["kv"], data_dir)
 
             if config_drift:
-                write_info("saved setup settings differ from the configured model; reconfiguring")
+                write_info("the setup settings differ from the configured model; reconfiguring")
 
-        if not model_ready or state["setup"] or config_drift:
-            reconfigure = (state["setup"] or config_drift) and model_ready
+        if not model_ready or config_drift:
+            reconfigure = config_drift and model_ready
 
             if reconfigure:
-                reason = "-Setup" if state["setup"] else "saved setup settings"
-                write_step("Reconfiguring %s from %s" % (variant["title"], reason))
+                write_step("Reconfiguring %s with the new settings" % variant["title"])
 
                 if server_running:
                     write_info("stopping the running server so the new settings take effect")

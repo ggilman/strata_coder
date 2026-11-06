@@ -149,10 +149,10 @@ the server can run out of RAM and crash). For tight or risky ratings it also sug
 that keeps a safe margin.
 
 The answers are saved to `setup.json` and every later run reuses them. `-Setup` re-asks and re-saves, then stops
-without starting the server or opening OpenCode; run `scode` afterwards to use it. If the saved
-context or KV cache differs from what the model was configured with, the next run reconfigures the model in place
-(no re-download). The same parameters can also be set without the menu via `-Family`, `-Model`, `-Context`, `-Kv`,
-`-DataDir`, `-Port`, and `-Offline`.
+without starting the server or opening OpenCode; run `scode` afterwards to use it. The model is reconfigured in place
+(no re-download) only when an engine-relevant answer changes — model folder, context, or KV cache; port, offline,
+sandbox, and the `scode` shortcut never touch the engine. The same parameters can also be set without the menu via
+`-Family`, `-Model`, `-Context`, `-Kv`, `-DataDir`, `-Port`, and `-Offline`.
 
 ### The GUI menu
 
