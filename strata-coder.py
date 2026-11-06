@@ -6,7 +6,7 @@ Runs identically on Windows (cmd, PowerShell, Git Bash) and Linux. Installs per-
 Modes:
     strata-coder.py [-CheckOnly] [-Family qwen|swift|coder|unsloth] [-Model NAME] [-Context N]
         [-Kv int8|k8v4|q4_0] [-DataDir PATH] [-Port N] [-NoLaunch] [-Update]
-        [-Stop] [-Status] [-Setup] [-Offline [true|false]] [-Sandbox [true|false]] [-Alias] [-NoAlias] [-NoGui]
+        [-Stop] [-Status] [-Setup] [-Isolation none|local|docker|podman|wsl] [-Alias] [-NoAlias] [-NoGui]
         [-AliasShell auto|cmd|powershell|bash|zsh] [-Help]
 """
 
@@ -76,6 +76,19 @@ SANDBOX_CONTAINER = "strata-coder-opencode"
 SANDBOX_HOME_VOLUME = "strata-coder-opencode-home"
 SANDBOX_RELAY = "strata-coder-relay"
 SANDBOX_RELAY_IMAGE = "alpine/socat:latest"
+
+WSL_DIR = os.path.join(APP_DIR, "wsl")
+WSL_ROOTFS = "/var/lib/machines/strata-coder"
+WSL_HOME = "/var/lib/machines/strata-coder-home"
+WSL_RELAY_DIR = "/run/strata-coder-wsl"
+WSL_RELAY_UNIT = "strata-coder-wsl-relay"
+WSL_SANDBOX_USER = "sandbox"
+WSL_SCRIPT_DIR = "/usr/local/lib/strata-wsl"
+WSL_LAUNCHER_PATH = WSL_SCRIPT_DIR + "/launch.sh"
+WSL_PROBE_PATH = WSL_SCRIPT_DIR + "/probe.sh"
+WSL_DEBIAN_SUITE = "bookworm"
+WSL_DEBIAN_MIRROR = "http://deb.debian.org/debian"
+WSL_DISTRO_ENV = "STRATA_WSL_DISTRO"
 
 SCRIPT_PATH = os.path.abspath(__file__)
 MENU_PATH = os.path.join(os.path.dirname(SCRIPT_PATH), "setup.py")
@@ -220,6 +233,15 @@ TIGHT_HEADROOM_GB = 2
 # below this RAM the budget variants (Unsloth) keep only part of their experts in RAM and read
 # the rest from the SSD, which is much slower than the smaller quantizations held entirely in RAM
 SSD_BUDGET_RAM_GB = 80
+
+# Isolation: none = nothing extra; local = host-side policies around OpenCode; docker / podman =
+# OpenCode inside a container with no internet; wsl = the same container wall run by systemd-nspawn
+# inside a systemd-enabled WSL 2 distro on Windows, with no container engine installed at all.
+ISOLATION_CHOICES = ["none", "local", "docker", "podman", "wsl"]
+ISOLATION_LABELS = {"none": "None", "local": "Local Only", "docker": "Docker",
+                    "podman": "Podman", "wsl": "WSL Containers"}
+CONTAINER_ISOLATIONS = ("docker", "podman")
+
 LOG_KEEP = 20
 DEFAULT_CONTEXT_LIMIT = 131072
 MAX_OUTPUT_LIMIT = 32768
@@ -350,6 +372,25 @@ def get_int_setting(value, fallback):
         return int(str(value).strip())
     except (TypeError, ValueError):
         return fallback
+
+
+def saved_isolation(saved):
+    """The isolation value of a saved setup.json. Older files stored the offline/sandbox
+    booleans instead, so those are migrated: sandbox true was Docker, offline true was local."""
+    value = str((saved or {}).get("isolation") or "").strip().lower()
+
+    if value in ISOLATION_CHOICES:
+        if value == "wsl" and not IS_WINDOWS:
+            return "none"
+        return value
+
+    if (saved or {}).get("sandbox") is True:
+        return "docker"
+
+    if (saved or {}).get("offline") is True:
+        return "local"
+
+    return "none"
 
 
 def grade_variant(variant, ram_gb):
@@ -1124,11 +1165,12 @@ Options:
   -Kv int8|k8v4|q4_0         KV cache quantization.
   -DataDir <path>            Model folder.
   -Port <port>               Server port, default 8080.
-  -Offline [true|false]      Block OpenCode web access;
-                             -Offline false turns the block off.
-  -Sandbox [true|false]      Run OpenCode inside a Docker container with
-                             no internet access (needs Docker; implies
-                             -Offline true); -Sandbox false turns it off.""")
+    -Isolation <mode>          How OpenCode is isolated: none, local (host web
+                               block), docker / podman (container with no
+                               internet), wsl (same container inside WSL 2,
+                               no container engine). Applies to this
+                               run; add -Setup to save it.
+                               scode -Setup -Isolation none turns it off.""")
 
 
 def install_ripgrep(release):
@@ -1310,11 +1352,8 @@ def run_setup_menu(state):
     if state["port_specified"]:
         overrides["port"] = state["port"]
 
-    if state["offline_specified"]:
-        overrides["offline"] = state["offline"]
-
-    if state["sandbox_specified"]:
-        overrides["sandbox"] = state["sandbox"]
+    if state["isolation_specified"]:
+        overrides["isolation"] = state["isolation"]
 
     menu.spawn_detached_gui(overrides)
 
@@ -1639,8 +1678,7 @@ def prompt_setup_params(spec, state):
     default_context = 0
     default_kv = "int8"
     default_port = 8080
-    default_offline = False
-    default_sandbox = False
+    default_isolation = saved_isolation(saved)
 
     if saved:
         default_context = get_int_setting(saved.get("context"), default_context)
@@ -1652,12 +1690,6 @@ def prompt_setup_params(spec, state):
 
         if saved_port > 0:
             default_port = saved_port
-
-        if saved.get("offline") is True:
-            default_offline = True
-
-        if saved.get("sandbox") is True:
-            default_sandbox = True
 
     if state["context_specified"]:
         default_context = state["context"]
@@ -1735,26 +1767,17 @@ def prompt_setup_params(spec, state):
     if not state["port_specified"]:
         selected_port = prompt_port(menu.QUESTIONS["port"], default_port)
 
-    selected_offline = default_offline
+    selected_isolation = default_isolation
 
-    if state["offline"]:
-        selected_offline = True
-    elif state["offline_specified"]:
-        selected_offline = False
+    if state["isolation_specified"]:
+        selected_isolation = state["isolation"]
     else:
-        selected_offline = prompt_yes_no(menu.QUESTIONS["offline"], selected_offline)
+        selected_isolation = prompt_choice(menu.QUESTIONS["isolation"],
+                                           menu.isolation_options(), default_isolation)
 
-    selected_sandbox = default_sandbox
-
-    if state["sandbox"]:
-        selected_sandbox = True
-    elif state["sandbox_specified"]:
-        selected_sandbox = False
-    else:
-        selected_sandbox = prompt_yes_no(menu.QUESTIONS["sandbox"], selected_sandbox)
-
-    if selected_sandbox and not state["offline"]:
-        selected_offline = True
+    if selected_isolation == "wsl" and not IS_WINDOWS:
+        fail("the WSL isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
+             "For the same wall on this system use docker or podman: -Isolation docker or podman")
 
     calling_shell = get_calling_shell()
 
@@ -1770,8 +1793,7 @@ def prompt_setup_params(spec, state):
         "kv": selected_kv,
         "dataDir": selected_data_dir,
         "port": selected_port,
-        "offline": selected_offline,
-        "sandbox": selected_sandbox,
+        "isolation": selected_isolation,
     }
 
     os.makedirs(APP_DIR, exist_ok=True)
@@ -2511,7 +2533,7 @@ def invoke_model_setup(root, variant, directory, server_port, context_tokens, kv
 
 
 # ----------------------------------------------------------------------------------------------------
-# Offline isolation
+# Local (host-side) isolation policies
 # ----------------------------------------------------------------------------------------------------
 
 OFFLINE_PROXY_URL = "http://127.0.0.1:9"
@@ -2581,7 +2603,7 @@ def clear_offline_proxy_sinkhole(saved):
 
 
 # ----------------------------------------------------------------------------------------------------
-# Docker sandbox
+# Container sandbox (linux image used by both the docker and the podman engine)
 # ----------------------------------------------------------------------------------------------------
 
 # tools baked into the sandbox image; ripgrep is absent because the linux musl
@@ -2644,29 +2666,57 @@ SANDBOX_DOCKERFILE = (
 )
 
 
-def docker_ready():
-    docker = shutil.which("docker")
+# ----------------------------------------------------------------------------------------------------
+# Container sandbox: docker and podman speak the same CLI, so one code path drives both engines;
+# a backend entry carries the exe name, a display label, how to reach host.docker.internal, and
+# the startup hint shown when the engine is not up.
+# ----------------------------------------------------------------------------------------------------
 
-    if not docker:
-        return None, "the docker command was not found"
+CONTAINER_BACKENDS = {
+    "docker": {"exe": "docker", "label": "Docker", "host_gateway": not IS_WINDOWS,
+               "hint": "Start Docker Desktop (it is installed by an administrator) and run the script again"},
+    "podman": {"exe": "podman", "label": "Podman", "host_gateway": True,
+               "hint": "start Podman first: on Windows run 'podman machine start'; "
+                       "on Linux start the podman service"},
+}
+
+
+def container_ready(backend):
+    tool = shutil.which(backend["exe"])
+
+    if not tool:
+        return None, "the %s command was not found" % backend["exe"]
 
     try:
-        proc = subprocess.run([docker, "info", "--format", "{{.ServerVersion}}"],
+        proc = subprocess.run([tool, "info", "--format", "{{.ServerVersion}}"],
                               capture_output=True, text=True, errors="replace")
     except Exception as exc:
         return None, str(exc)
 
     if proc.returncode:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        return None, detail[0] if detail else "the docker daemon is not running"
+        return None, detail[0] if detail else "the %s service is not running" % backend["exe"]
 
-    return docker, (proc.stdout or "").strip()
+    try:
+        os_proc = subprocess.run([tool, "info", "--format", "{{.OSType}}"],
+                                 capture_output=True, text=True, errors="replace")
+    except Exception:
+        os_proc = None
+
+    os_type = ((os_proc.stdout if os_proc else "") or "").strip().lower()
+
+    if os_type and os_type != "linux":
+        return None, ("%s is running in Windows container mode, but the sandbox image is "
+                      "linux-based; switch %s to Linux containers"
+                      % (backend["exe"], backend["label"]))
+
+    return tool, (proc.stdout or "").strip()
 
 
-def fail_no_docker(detail):
-    fail("the Docker sandbox is on but Docker is not usable: %s" % detail,
-         "Start Docker Desktop (it is installed by an administrator), run the script again, "
-         "or turn the sandbox off with: scode -Setup -Sandbox false")
+def fail_no_container(backend, detail):
+    fail("the %s isolation is on but %s is not usable: %s"
+         % (backend["label"], backend["label"], detail),
+         "%s, or turn isolation off with: scode -Setup -Isolation none" % backend["hint"])
 
 
 SANDBOX_RESERVED_MOUNTS = {
@@ -2685,34 +2735,54 @@ def sandbox_mount_path(project_dir):
     return "/projects/%s" % name if name.lower() in SANDBOX_RESERVED_MOUNTS else "/%s" % name
 
 
-def sandbox_network_is_internal(docker):
-    proc = subprocess.run([docker, "network", "inspect", "--format", "{{.Internal}}", SANDBOX_NETWORK],
+def host_gateway_arguments(backend):
+    """engines without a built-in host.docker.internal inside containers get the host-gateway
+    mapping (podman everywhere; docker only on plain Linux engines, Docker Desktop is native)."""
+    if backend.get("host_gateway"):
+        return ["--add-host", "host.docker.internal:host-gateway"]
+    return []
+
+
+def sandbox_network_is_internal(tool):
+    proc = subprocess.run([tool, "network", "inspect", SANDBOX_NETWORK],
                           capture_output=True, text=True, errors="replace")
 
-    return proc.returncode == 0 and (proc.stdout or "").strip().lower() == "true"
+    if proc.returncode:
+        return False
+
+    try:
+        info = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return False
+
+    if isinstance(info, dict):
+        info = [info]
+
+    return bool(info) and bool(info[0].get("internal"))
 
 
-def ensure_sandbox_network(docker):
-    if sandbox_network_is_internal(docker):
+def ensure_sandbox_network(tool):
+    if sandbox_network_is_internal(tool):
         return
 
-    rc, _lines = run_native(docker, ["network", "inspect", SANDBOX_NETWORK])
+    rc, _lines = run_native(tool, ["network", "inspect", SANDBOX_NETWORK])
 
     if rc == 0:
-        rc, container_ids = run_native(docker, ["ps", "-aq", "--filter", "network=%s" % SANDBOX_NETWORK])
+        rc, container_ids = run_native(tool, ["ps", "-aq", "--filter", "network=%s" % SANDBOX_NETWORK])
 
         if container_ids:
-            run_native(docker, ["rm", "-f"] + container_ids)
+            run_native(tool, ["rm", "-f"] + container_ids)
 
-        run_native(docker, ["network", "rm", SANDBOX_NETWORK])
+        run_native(tool, ["network", "rm", SANDBOX_NETWORK])
 
-    proc = subprocess.run([docker, "network", "create", "--internal", SANDBOX_NETWORK],
+    proc = subprocess.run([tool, "network", "create", "--internal", SANDBOX_NETWORK],
                           capture_output=True, text=True, errors="replace")
 
-    if proc.returncode and not sandbox_network_is_internal(docker):
+    if proc.returncode and not sandbox_network_is_internal(tool):
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         fail("could not create the internal sandbox network (%s)." % (detail[0] if detail else "unknown error"),
-             "Run 'docker network create --internal %s' manually and try again." % SANDBOX_NETWORK)
+             "Run '%s network create --internal %s' manually and try again."
+             % (os.path.basename(tool), SANDBOX_NETWORK))
 
 
 def sandbox_image_tag(version):
@@ -2764,24 +2834,24 @@ def stage_sandbox_binaries(version, avx2):
     return build
 
 
-def prune_old_sandbox_images(docker, keep_tag):
-    rc, tags = run_native(docker, ["image", "ls", "--filter", "reference=%s" % SANDBOX_IMAGE,
-                                   "--format", "{{.Repository}}:{{.Tag}}"])
+def prune_old_sandbox_images(tool, keep_tag):
+    rc, tags = run_native(tool, ["image", "ls", "--filter", "reference=%s" % SANDBOX_IMAGE,
+                                 "--format", "{{.Repository}}:{{.Tag}}"])
 
     for old_tag in tags:
         if old_tag and old_tag != keep_tag:
-            run_native(docker, ["rmi", old_tag])
+            run_native(tool, ["rmi", old_tag])
 
 
-def ensure_sandbox_image(docker, avx2):
+def ensure_sandbox_image(backend, tool, avx2):
     version = sandbox_opencode_version()
     tag = sandbox_image_tag(version)
 
-    rc, _lines = run_native(docker, ["image", "inspect", tag])
+    rc, _lines = run_native(tool, ["image", "inspect", tag])
 
     if rc == 0:
         write_skip("sandbox image is already built (%s)" % tag)
-        prune_old_sandbox_images(docker, tag)
+        prune_old_sandbox_images(tool, tag)
         return tag
 
     write_info("staging the linux OpenCode and ripgrep binaries for the sandbox image")
@@ -2794,41 +2864,42 @@ def ensure_sandbox_image(docker, avx2):
 
     write_info("building the sandbox image %s "
                "(the first build downloads the debian base and the toolchain, so it can take a few minutes)" % tag)
-    proc = subprocess.run([docker, "build", "-t", tag, build],
+    proc = subprocess.run([tool, "build", "-t", tag, build],
                           capture_output=True, text=True, errors="replace")
 
     if proc.returncode:
         tail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-4:]
         fail("the sandbox image build failed (%s)." % " | ".join(tail),
-             "Check that Docker Desktop is running and try again.")
+             "Check that %s is running and try again." % backend["hint"].split(";")[0].lower())
 
-    prune_old_sandbox_images(docker, tag)
+    prune_old_sandbox_images(tool, tag)
 
     return tag
 
 
-def sandbox_models_reachable(docker, tag, url):
-    rc, _lines = run_native(docker, [
-        "run", "--rm", "--network", SANDBOX_NETWORK, "--entrypoint", "sh", tag,
-        "-c", "wget -q -O - %s" % url])
+def sandbox_models_reachable(backend, tool, tag, url):
+    rc, _lines = run_native(tool, [
+        "run", "--rm", "--network", SANDBOX_NETWORK] + host_gateway_arguments(backend) +
+        ["--entrypoint", "sh", tag, "-c", "wget -q -O - %s" % url])
 
     return rc == 0
 
 
-def start_sandbox_relay(docker, port):
-    run_native(docker, ["rm", "-f", SANDBOX_RELAY])
+def start_sandbox_relay(backend, tool, port):
+    run_native(tool, ["rm", "-f", SANDBOX_RELAY])
 
-    rc, lines = run_native(docker, [
-        "run", "-d", "--rm", "--name", SANDBOX_RELAY, SANDBOX_RELAY_IMAGE,
-        "tcp-listen:8080,fork,reuseaddr", "tcp-connect:host.docker.internal:%d" % port])
+    rc, lines = run_native(tool, [
+        "run", "-d", "--rm", "--name", SANDBOX_RELAY] + host_gateway_arguments(backend) +
+        [SANDBOX_RELAY_IMAGE,
+         "tcp-listen:8080,fork,reuseaddr", "tcp-connect:host.docker.internal:%d" % port])
 
     if rc != 0:
         return False
 
-    rc, _lines = run_native(docker, ["network", "connect", SANDBOX_NETWORK, SANDBOX_RELAY])
+    rc, _lines = run_native(tool, ["network", "connect", SANDBOX_NETWORK, SANDBOX_RELAY])
 
     if rc != 0:
-        run_native(docker, ["rm", "-f", SANDBOX_RELAY])
+        run_native(tool, ["rm", "-f", SANDBOX_RELAY])
         return False
 
     return True
@@ -2845,43 +2916,46 @@ def sandbox_config_content(open_code_json, base_url, port):
     return json.dumps(config, indent=2)
 
 
-def run_opencode_sandbox(tag, port, open_code_json):
-    docker, detail = docker_ready()
+def run_opencode_sandbox(isolation, tag, port, open_code_json):
+    backend = CONTAINER_BACKENDS[isolation]
+    tool, detail = container_ready(backend)
 
-    if not docker:
-        fail_no_docker(detail)
+    if not tool:
+        fail_no_container(backend, detail)
 
-    rc, running = run_native(docker, ["ps", "-q", "--filter", "name=^%s$" % SANDBOX_CONTAINER])
+    rc, running = run_native(tool, ["ps", "-q", "--filter", "name=^%s$" % SANDBOX_CONTAINER])
 
     if running:
         fail("another sandboxed OpenCode is already running in container '%s'." % SANDBOX_CONTAINER,
              "Close that session's window first; sandboxed OpenCode instances share one container name.")
 
-    run_native(docker, ["rm", "-f", SANDBOX_CONTAINER])
+    run_native(tool, ["rm", "-f", SANDBOX_CONTAINER])
 
     if IS_WINDOWS and PROJECT_DIR.startswith("\\\\"):
-        fail("the Docker sandbox cannot mount the current folder: %s" % PROJECT_DIR,
-             "Docker cannot bind-mount network shares; cd to a local drive folder and run again.")
+        fail("the %s sandbox cannot mount the current folder: %s" % (backend["label"], PROJECT_DIR),
+             "%s cannot bind-mount network shares; cd to a local drive folder and run again."
+             % backend["label"])
 
     relay_started = False
     base_url = "http://host.docker.internal"
     probe_port = port
 
-    if not sandbox_models_reachable(docker, tag, "http://host.docker.internal:%d/v1/models" % port):
+    if not sandbox_models_reachable(backend, tool, tag, "http://host.docker.internal:%d/v1/models" % port):
         write_info("the internal network resolves no outside names (normal); "
                    "routing the model connection through the socat relay")
 
-        if not start_sandbox_relay(docker, port):
+        if not start_sandbox_relay(backend, tool, port):
             fail("the sandbox relay container could not be started.",
-                 "Check that Docker can pull %s and run the script again, "
-                 "or turn the sandbox off with: scode -Setup -Sandbox false" % SANDBOX_RELAY_IMAGE)
+                 "Check that %s can pull %s and run the script again, "
+                 "or turn isolation off with: scode -Setup -Isolation none"
+                 % (backend["exe"], SANDBOX_RELAY_IMAGE))
 
         relay_started = True
         base_url = "http://%s" % SANDBOX_RELAY
         probe_port = 8080
 
-        if not sandbox_models_reachable(docker, tag, "http://%s:8080/v1/models" % SANDBOX_RELAY):
-            run_native(docker, ["rm", "-f", SANDBOX_RELAY])
+        if not sandbox_models_reachable(backend, tool, tag, "http://%s:8080/v1/models" % SANDBOX_RELAY):
+            run_native(tool, ["rm", "-f", SANDBOX_RELAY])
             fail("the Strata server refused the sandboxed connection through the relay.",
                  "A server started before the sandbox was turned on listens only on 127.0.0.1 and lacks the "
                  "relay host allowance; run: scode -Stop, then run this script again.")
@@ -2892,7 +2966,7 @@ def run_opencode_sandbox(tag, port, open_code_json):
 
     mount = sandbox_mount_path(PROJECT_DIR)
     arguments = [
-        docker, "run", "--rm", "-it", "--name", SANDBOX_CONTAINER,
+        tool, "run", "--rm", "-it", "--name", SANDBOX_CONTAINER,
         "--network", SANDBOX_NETWORK,
         "--hostname", "strata-sandbox",
         "-v", "%s:%s" % (PROJECT_DIR, mount),
@@ -2906,6 +2980,8 @@ def run_opencode_sandbox(tag, port, open_code_json):
         "-e", "no_proxy=" + no_proxy,
     ]
 
+    arguments += host_gateway_arguments(backend)
+
     if IS_WINDOWS:
         arguments += ["-v", "%s:/home/sandbox" % SANDBOX_HOME_VOLUME]
     else:
@@ -2913,8 +2989,8 @@ def run_opencode_sandbox(tag, port, open_code_json):
         # files are not writable; each uid gets its own home volume for sessions
         uid_gid = "%d:%d" % (os.getuid(), os.getgid())
         home_volume = "%s-%d" % (SANDBOX_HOME_VOLUME, os.getuid())
-        run_native(docker, ["run", "--rm", "--user", "0:0", "-v", "%s:/home/sandbox" % home_volume,
-                            "--entrypoint", "chown", tag, "-R", uid_gid, "/home/sandbox"])
+        run_native(tool, ["run", "--rm", "--user", "0:0", "-v", "%s:/home/sandbox" % home_volume,
+                          "--entrypoint", "chown", tag, "-R", uid_gid, "/home/sandbox"])
         arguments += ["--user", uid_gid, "-v", "%s:/home/sandbox" % home_volume]
 
     arguments += [tag]
@@ -2927,7 +3003,415 @@ def run_opencode_sandbox(tag, port, open_code_json):
         reset_terminal_mouse()
 
         if relay_started:
-            run_native(docker, ["rm", "-f", SANDBOX_RELAY])
+            run_native(tool, ["rm", "-f", SANDBOX_RELAY])
+
+
+# ----------------------------------------------------------------------------------------------------
+# WSL sandbox: the same wall without any container engine. systemd-nspawn (a systemd component)
+# runs the same Debian rootfs inside a systemd-enabled WSL 2 distro. The container is started with
+# --private-network, so it has only the loopback interface: no routes, no DNS, nothing to configure
+# or firewall. Its single path to the model is a unix socket directory bind-mounted into it; inside
+# the container socat bridges the model port to that socket, and a python relay on the WSL host
+# forwards it to the Windows Strata endpoint (WSL mirrored networking shares the Windows loopback).
+# Two quirks of systemd 255 on the WSL kernel are handled here: its unified-cgroup mount probe fails
+# on this kernel, so nspawn is started through a wrapper that exports
+# SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1, and its short -b option swallows the container command, so
+# only the long --bind= form is ever passed.
+# ----------------------------------------------------------------------------------------------------
+
+WSL_HOST_PACKAGES = ("systemd-container", "debootstrap", "python3")
+
+WSL_RELAY_PY = '''
+import os
+import socket
+import socketserver
+import sys
+import threading
+
+SOCK_DIR = sys.argv[1] if len(sys.argv) > 1 else "/run/strata-coder-wsl"
+MODEL_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
+SOCK_PATH = os.path.join(SOCK_DIR, "relay.sock")
+
+
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        # mirrored networking shares the Windows loopback, so the Strata endpoint is 127.0.0.1
+        try:
+            up = socket.create_connection(("127.0.0.1", MODEL_PORT), timeout=10)
+        except Exception:
+            return
+
+        def pump(src, dst):
+            try:
+                while True:
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except Exception:
+                pass
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+
+        thread = threading.Thread(target=pump, args=(up, self.request))
+        thread.daemon = True
+        thread.start()
+        pump(self.request, up)
+        thread.join(timeout=3)
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+
+try:
+    os.unlink(SOCK_PATH)
+except FileNotFoundError:
+    pass
+
+server = Server(SOCK_PATH, Handler)
+server.serve_forever()
+'''
+
+WSL_NSPAWN_WRAPPER = (
+    "#!/bin/bash\n"
+    "export SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1\n"
+    "exec systemd-nspawn \"$@\"\n"
+)
+
+# wsl.exe re-parses the command line it hands to a distro and expands $ variables on the way in,
+# so everything a container command needs lives in these pushed files, never in an inline
+# "sh -c" argument. The port arrives as argument 1.
+
+WSL_LAUNCHER_SH = '''#!/bin/sh
+socat TCP-LISTEN:"$1",fork,reuseaddr UNIX-CONNECT:/run/strata-coder-wsl/relay.sock &
+SPID=$!
+sleep 1
+runuser -u sandbox -- env HOME=/home/sandbox opencode
+RC=$?
+kill $SPID 2>/dev/null
+exit $RC
+'''
+
+WSL_PROBE_SH = '''#!/bin/sh
+socat TCP-LISTEN:"$1",fork,reuseaddr UNIX-CONNECT:/run/strata-coder-wsl/relay.sock &
+SPID=$!
+sleep 1
+python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:$1/v1/models', timeout=10).read(64)"
+RC=$?
+kill $SPID 2>/dev/null
+exit $RC
+'''
+
+
+def wsl_exe():
+    return shutil.which("wsl") or shutil.which("wsl.exe")
+
+
+def wsl_wslpath(win_path):
+    drive, rest = os.path.splitdrive(os.path.abspath(win_path))
+    return "/mnt/%s%s" % (drive[0].lower(), rest.replace("\\", "/"))
+
+
+def wsl_admin_lines(wsl, args_list):
+    """wsl.exe management output (-l, --status) is UTF-16; command output inside a distro is UTF-8."""
+    proc = subprocess.run([wsl] + list(args_list), capture_output=True)
+    raw = proc.stdout or b""
+
+    try:
+        text = raw.decode("utf-16-le", errors="replace")
+    except Exception:
+        text = raw.decode("utf-8", errors="replace")
+
+    lines = [line.replace("\ufeff", "").strip() for line in text.splitlines()]
+    return proc.returncode, [line for line in lines if line]
+
+
+def wsl_run_script(wsl, distro, script, tag, as_root=True):
+    path = os.path.join(WSL_DIR, "%s.sh" % tag)
+    write_text_file(path, script)
+    command = [wsl, "-d", distro] + (["-u", "root"] if as_root else []) + \
+              ["--", "bash", "-c", "tr -d '\\r' < '%s' | bash -s" % wsl_wslpath(path)]
+    return subprocess.run(command, capture_output=True, text=True, errors="replace")
+
+
+def wsl_tail(proc):
+    return " | ".join((((proc.stderr or "") + (proc.stdout or "")).strip().splitlines() or [""])[-3:])
+
+
+def wsl_ready():
+    """Locate a usable WSL 2 distro: the default one (or STRATA_WSL_DISTRO), running WSL 2 with
+    systemd as init. Returns a (handle, detail) pair like container_ready."""
+    wsl = wsl_exe()
+
+    if not wsl:
+        return None, "the wsl command was not found (install WSL on Windows with: wsl --install)"
+
+    rc, lines = wsl_admin_lines(wsl, ["-l", "-v"])
+
+    if rc or len(lines) < 2:
+        return None, "no WSL distribution is installed (install one with: wsl --install -d Ubuntu)"
+
+    distros = {}
+    default_name = ""
+
+    for line in lines[1:]:
+        parts = line.split()
+
+        if len(parts) < 3:
+            continue
+
+        name_parts = parts[:-2]
+
+        if name_parts and name_parts[0] == "*":
+            name_parts = name_parts[1:]
+            default_name = " ".join(name_parts)
+
+        if name_parts:
+            distros[" ".join(name_parts)] = parts[-1]
+
+    names = sorted(distros)
+
+    if not names:
+        return None, "no usable WSL distribution was found in: wsl -l -v"
+
+    pick = (os.environ.get(WSL_DISTRO_ENV) or "").strip()
+
+    if pick and pick not in distros:
+        return None, ("the distro named by %s (%s) is not installed; installed: %s"
+                      % (WSL_DISTRO_ENV, pick, ", ".join(names)))
+
+    distro = pick or default_name
+
+    if not distro:
+        return None, "could not tell which WSL distribution is the default (set %s to pick one)" % WSL_DISTRO_ENV
+
+    if distros.get(distro) != "2":
+        return None, ("%s runs WSL 1; the sandbox needs WSL 2 (convert with: wsl --set-version \"%s\" 2)"
+                      % (distro, distro))
+
+    proc = subprocess.run([wsl, "-d", distro, "--", "ps", "-p", "1", "-o", "comm="],
+                          capture_output=True, text=True, errors="replace")
+
+    if (proc.stdout or "").strip() != "systemd":
+        return None, ("%s does not run systemd as init; the sandbox needs it (add systemd=true to "
+                      "/etc/wsl.conf inside %s, then run: wsl --shutdown)" % (distro, distro))
+
+    return {"wsl": wsl, "distro": distro}, "%s (WSL %s)" % (distro, distros.get(distro))
+
+
+def fail_no_wsl(detail):
+    fail("the WSL isolation is on but WSL is not usable: %s" % detail,
+         "Fix that first (see above), or turn isolation off with: scode -Setup -Isolation none")
+
+
+def wsl_is_mirrored(wsl, distro):
+    proc = wsl_run_script(wsl, distro, "ip addr show lo | grep -q 10.255.255.254", "mirror", as_root=False)
+    return proc.returncode == 0
+
+
+def ensure_wsl_packages(wsl, distro):
+    script = ("missing=''; for p in %s; do dpkg -s \"$p\" >/dev/null 2>&1 || missing=\"$missing $p\"; done; "
+              "if [ -n \"$missing\" ]; then export DEBIAN_FRONTEND=noninteractive; "
+              "apt-get update -qq || true; apt-get install -y -qq $missing || true; fi; "
+              "for p in $missing; do dpkg -s \"$p\" >/dev/null 2>&1 || { echo \"still missing: $p\"; exit 1; }; done"
+              % " ".join(WSL_HOST_PACKAGES))
+    proc = wsl_run_script(wsl, distro, script, "packages")
+
+    if proc.returncode:
+        fail("the WSL sandbox tools (systemd-container, debootstrap, python3) are not installed "
+             "in %s and could not be installed (%s)." % (distro, wsl_tail(proc) or "unknown error"),
+             "Install them by hand inside %s with: sudo apt install systemd-container debootstrap python3 "
+             "and run the script again." % distro)
+
+
+def wsl_rootfs_stamp(wsl, distro):
+    proc = wsl_run_script(wsl, distro, "cat '%s/.strata-stamp' 2>/dev/null || true" % WSL_ROOTFS, "stamp")
+    return (proc.stdout or "").strip()
+
+
+def ensure_wsl_rootfs(wsl, distro, avx2):
+    version = sandbox_opencode_version()
+    stamp = "%s-%s" % (version, SANDBOX_IMAGE_REVISION)
+
+    if wsl_rootfs_stamp(wsl, distro) == stamp:
+        write_skip("WSL sandbox rootfs is already built (opencode %s)" % version)
+        return
+
+    write_info("staging the linux OpenCode and ripgrep binaries for the WSL sandbox")
+
+    try:
+        build = stage_sandbox_binaries(version, avx2)
+    except Exception as exc:
+        fail("the WSL sandbox inputs could not be prepared (%s)." % exc,
+             "Check network access and run the script again.")
+
+    stage = wsl_wslpath(build)
+    packages = " ".join(["ca-certificates", "wget", "socat"] + SANDBOX_APT_PACKAGES)
+
+    script = (
+        "set -e\n"
+        "if [ \"$(cat '%(rootfs)s/.strata-stamp' 2>/dev/null || true)\" != \"%(stamp)s\" ]; then\n"
+        "  rm -rf '%(rootfs)s'\n"
+        "fi\n"
+        "if [ ! -x '%(rootfs)s/bin/sh' ]; then\n"
+        "  debootstrap --variant=minbase --include=socat,ca-certificates %(suite)s '%(rootfs)s' %(mirror)s\n"
+        "fi\n"
+        "export DEBIAN_FRONTEND=noninteractive\n"
+        "chroot '%(rootfs)s' apt-get update -qq\n"
+        "chroot '%(rootfs)s' apt-get install -y -qq --no-install-recommends %(packages)s\n"
+        "id=$(chroot '%(rootfs)s' id -u %(user)s 2>/dev/null || echo '')\n"
+        "if [ -z \"$id\" ]; then chroot '%(rootfs)s' useradd -m %(user)s; fi\n"
+        "cp '%(stage)s/opencode' '%(rootfs)s/usr/local/bin/opencode'\n"
+        "cp '%(stage)s/rg' '%(rootfs)s/usr/local/bin/rg'\n"
+        "chmod +x '%(rootfs)s/usr/local/bin/opencode' '%(rootfs)s/usr/local/bin/rg'\n"
+        "mkdir -p '%(home)s'\n"
+        "uid=$(chroot '%(rootfs)s' id -u %(user)s)\n"
+        "chown -R \"$uid:$uid\" '%(home)s'\n"
+        "echo '%(stamp)s' > '%(rootfs)s/.strata-stamp'\n"
+    ) % {"rootfs": WSL_ROOTFS, "stamp": stamp, "suite": WSL_DEBIAN_SUITE, "mirror": WSL_DEBIAN_MIRROR,
+         "packages": packages, "user": WSL_SANDBOX_USER, "stage": stage, "home": WSL_HOME}
+
+    write_info("building the WSL sandbox rootfs in %s "
+               "(the first build downloads the debian base and the toolchain, so it can take a few minutes)"
+               % WSL_ROOTFS)
+    proc = wsl_run_script(wsl, distro, script, "rootfs")
+
+    if proc.returncode:
+        fail("the WSL sandbox rootfs build failed (%s)." % (wsl_tail(proc) or "unknown error"),
+             "Check network access inside %s (try: wsl -d %s) and run the script again." % (distro, distro))
+
+    write_ok("WSL sandbox rootfs built (opencode %s)" % version)
+
+
+def wsl_push_runtime_files(wsl, distro):
+    relay_path = os.path.join(WSL_DIR, "relay.py")
+    write_text_file(relay_path, WSL_RELAY_PY)
+    wrapper_path = os.path.join(WSL_DIR, "nspawn-wrapper.sh")
+    write_text_file(wrapper_path, WSL_NSPAWN_WRAPPER)
+    launcher_path = os.path.join(WSL_DIR, "launcher.sh")
+    write_text_file(launcher_path, WSL_LAUNCHER_SH)
+    probe_path = os.path.join(WSL_DIR, "probe.sh")
+    write_text_file(probe_path, WSL_PROBE_SH)
+
+    script = (
+        "set -e\n"
+        "tr -d '\\r' < '%(relay)s' > /tmp/strata-wsl-relay.py\n"
+        "tr -d '\\r' < '%(wrapper)s' > /tmp/strata-wsl-nspawn.sh\n"
+        "chmod +x /tmp/strata-wsl-nspawn.sh\n"
+        "mkdir -p '%(relay_dir)s'\n"
+        "mkdir -p '%(rootfs)s%(script_dir)s'\n"
+        "tr -d '\\r' < '%(launcher)s' > '%(rootfs)s%(launcher_in)s'\n"
+        "tr -d '\\r' < '%(probe)s' > '%(rootfs)s%(probe_in)s'\n"
+        "chmod +x '%(rootfs)s%(launcher_in)s' '%(rootfs)s%(probe_in)s'\n"
+        "uid=$(chroot '%(rootfs)s' id -u %(user)s)\n"
+        "mkdir -p '%(home)s'\n"
+        "chown \"$uid:$uid\" '%(home)s'\n"
+    ) % {"relay": wsl_wslpath(relay_path), "wrapper": wsl_wslpath(wrapper_path),
+         "relay_dir": WSL_RELAY_DIR, "script_dir": WSL_SCRIPT_DIR,
+         "launcher": wsl_wslpath(launcher_path), "probe": wsl_wslpath(probe_path),
+         "launcher_in": WSL_LAUNCHER_PATH, "probe_in": WSL_PROBE_PATH,
+         "rootfs": WSL_ROOTFS, "user": WSL_SANDBOX_USER, "home": WSL_HOME}
+
+    proc = wsl_run_script(wsl, distro, script, "runtime")
+
+    if proc.returncode:
+        fail("the WSL sandbox runtime files could not be prepared (%s)." % (wsl_tail(proc) or "unknown error"))
+
+
+def wsl_stop_relay(wsl, distro):
+    subprocess.run([wsl, "-d", distro, "-u", "root", "--", "systemctl", "stop", WSL_RELAY_UNIT],
+                   capture_output=True, text=True, errors="replace")
+
+
+def wsl_relay_active(wsl, distro):
+    proc = subprocess.run([wsl, "-d", distro, "-u", "root", "--",
+                           "systemctl", "is-active", WSL_RELAY_UNIT],
+                          capture_output=True, text=True, errors="replace")
+    return (proc.stdout or "").strip() == "active"
+
+
+def wsl_start_relay(wsl, distro, port):
+    wsl_stop_relay(wsl, distro)
+    proc = subprocess.run([wsl, "-d", distro, "-u", "root", "--",
+                           "systemd-run", "--collect", "--unit", WSL_RELAY_UNIT,
+                           "python3", "/tmp/strata-wsl-relay.py", WSL_RELAY_DIR, str(port)],
+                          capture_output=True, text=True, errors="replace")
+
+    if proc.returncode:
+        fail("the WSL model relay could not be started (%s)." % (wsl_tail(proc) or "unknown error"),
+             "Check that python3 is installed inside %s and run the script again." % distro)
+
+    wait = wsl_run_script(wsl, distro,
+                          "for i in $(seq 1 20); do [ -S '%s/relay.sock' ] && exit 0; sleep 0.5; done; exit 1"
+                          % WSL_RELAY_DIR, "relaywait")
+
+    if wait.returncode:
+        wsl_stop_relay(wsl, distro)
+        fail("the WSL model relay started but never created its socket in %s." % WSL_RELAY_DIR,
+             "Run 'journalctl -u %s' inside %s to see why it stopped, then try again."
+             % (WSL_RELAY_UNIT, distro))
+
+
+def wsl_nspawn_base(wsl, distro):
+    return [wsl, "-d", distro, "-u", "root", "--", "bash", "/tmp/strata-wsl-nspawn.sh",
+            "--directory=%s" % WSL_ROOTFS, "--machine=strata-coder", "--register=no", "--private-network",
+            "--bind=%s:%s" % (WSL_RELAY_DIR, WSL_RELAY_DIR)]
+
+
+def wsl_models_reachable(wsl, distro, port):
+    probe = wsl_nspawn_base(wsl, distro) + ["--", WSL_PROBE_PATH, str(port)]
+    proc = subprocess.run(probe, capture_output=True, text=True, errors="replace")
+    return proc.returncode == 0
+
+
+def run_opencode_wsl(handle, port, open_code_json):
+    wsl, distro = handle["wsl"], handle["distro"]
+
+    if IS_WINDOWS and PROJECT_DIR.startswith("\\\\"):
+        fail("the WSL sandbox cannot mount the current folder: %s" % PROJECT_DIR,
+             "WSL cannot bind-mount network shares; cd to a local drive folder and run again.")
+
+    wsl_push_runtime_files(wsl, distro)
+
+    if wsl_relay_active(wsl, distro):
+        fail("another sandboxed OpenCode is already running through the WSL relay.",
+             "Close that session's window first; WSL-sandboxed OpenCode instances share one relay.")
+
+    wsl_start_relay(wsl, distro, port)
+
+    try:
+        if not wsl_models_reachable(wsl, distro, port):
+            fail("the WSL sandbox could not reach the Strata endpoint through the relay.",
+                 "the WSL sandbox needs mirrored networking so WSL shares the Windows loopback: put "
+                 "[wsl2] and networkingMode=mirrored into %USERPROFILE%\\.wslconfig, run wsl --shutdown, "
+                 "and try again (with NAT-mode WSL the Hyper-V firewall blocks WSL-to-Windows connections)")
+
+        mount = sandbox_mount_path(PROJECT_DIR)
+        sandbox_json = sandbox_config_content(open_code_json, "http://127.0.0.1", port)
+
+        env_args = []
+        no_proxy = "127.0.0.1,localhost"
+
+        for name, value in (("OPENCODE_CONFIG_CONTENT", sandbox_json),
+                            ("HTTP_PROXY", OFFLINE_PROXY_URL), ("HTTPS_PROXY", OFFLINE_PROXY_URL),
+                            ("http_proxy", OFFLINE_PROXY_URL), ("https_proxy", OFFLINE_PROXY_URL),
+                            ("NO_PROXY", no_proxy), ("no_proxy", no_proxy)):
+            env_args.append("--setenv=%s=%s" % (name, value))
+
+        arguments = wsl_nspawn_base(wsl, distro) + \
+                    ["--working-directory=%s" % mount,
+                     "--bind=%s:%s" % (wsl_wslpath(PROJECT_DIR), mount),
+                     "--bind=%s:/home/sandbox" % WSL_HOME] + \
+                    env_args + ["--", WSL_LAUNCHER_PATH, str(port)]
+
+        write_info("project folder mounted at %s (read-write)" % mount)
+        subprocess.run(arguments)
+    finally:
+        reset_terminal_mouse()
+        wsl_stop_relay(wsl, distro)
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -2950,8 +3434,7 @@ def parse_args():
     parser.add_argument("-Stop", dest="stop", action="store_true")
     parser.add_argument("-Status", dest="status", action="store_true")
     parser.add_argument("-Setup", dest="setup", action="store_true")
-    parser.add_argument("-Offline", dest="offline", nargs="?", const=True, default=None)
-    parser.add_argument("-Sandbox", dest="sandbox", nargs="?", const=True, default=None)
+    parser.add_argument("-Isolation", dest="isolation", choices=ISOLATION_CHOICES)
     parser.add_argument("-Alias", dest="alias", action="store_true")
     parser.add_argument("-AliasShell", dest="alias_shell")
     parser.add_argument("-Help", "--help", "-h", dest="help", action="store_true")
@@ -2972,16 +3455,6 @@ def main():
 
     args = parse_args()
 
-    offline_specified = args.offline is not None
-    offline = args.offline if offline_specified else False
-    if isinstance(offline, str):
-        offline = offline.strip().lower() in ("true", "1", "yes", "on")
-
-    sandbox_specified = args.sandbox is not None
-    sandbox = args.sandbox if sandbox_specified else False
-    if isinstance(sandbox, str):
-        sandbox = sandbox.strip().lower() in ("true", "1", "yes", "on")
-
     state = {
         "family": args.family or "",
         "model": args.model or "",
@@ -2989,10 +3462,8 @@ def main():
         "kv": args.kv or "",
         "data_dir": args.data_dir or "",
         "port": args.port if args.port is not None else 8080,
-        "offline": offline,
-        "offline_specified": offline_specified,
-        "sandbox": sandbox,
-        "sandbox_specified": sandbox_specified,
+        "isolation": args.isolation or "",
+        "isolation_specified": args.isolation is not None,
         "context_specified": args.context is not None,
         "kv_specified": args.kv is not None,
         "data_dir_specified": args.data_dir is not None,
@@ -3004,6 +3475,10 @@ def main():
         "check_only": args.check_only,
         "setup": args.setup,
     }
+
+    if state["isolation"] == "wsl" and not IS_WINDOWS:
+        fail("the WSL isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
+             "For the same wall on this system use docker or podman: scode -Setup -Isolation docker")
 
     try:
         if args.help:
@@ -3043,6 +3518,15 @@ def main():
 
             if stop_strata_servers() == 0:
                 write_skip("no Strata server process was found")
+
+            # best effort: a WSL relay left behind by an interrupted sandbox session
+            stop_wsl = wsl_exe()
+            stop_distro = (os.environ.get(WSL_DISTRO_ENV) or "").strip()
+
+            if stop_wsl:
+                subprocess.run([stop_wsl] + (["-d", stop_distro] if stop_distro else []) +
+                               ["-u", "root", "--", "systemctl", "stop", WSL_RELAY_UNIT],
+                               capture_output=True, text=True, errors="replace")
 
             sys.exit(0)
 
@@ -3185,15 +3669,18 @@ def main():
                 if saved_port > 0:
                     state["port"] = saved_port
 
-            if not state["offline_specified"] and saved_setup.get("offline") is True:
-                state["offline"] = True
+            if not state["isolation_specified"]:
+                state["isolation"] = saved_isolation(saved_setup)
 
-            if not state["sandbox_specified"] and saved_setup.get("sandbox") is True:
-                state["sandbox"] = True
-                state["offline"] = True
+        isolation = state["isolation"] or "none"
 
-        if state["sandbox"]:
-            state["offline"] = True
+        if isolation == "wsl" and not IS_WINDOWS:
+            fail("the WSL isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
+                 "For the same wall on this system use docker or podman: scode -Setup -Isolation docker")
+
+        local_guard = isolation == "local"
+        container_backend = isolation if isolation in CONTAINER_ISOLATIONS else None
+        wsl_active = isolation == "wsl"
 
         candidates = get_candidates(family_filter, model_filter)
 
@@ -3760,22 +4247,46 @@ def main():
             write_skip("ripgrep already installed")
 
         # --------------------------------------------------------------------------------------------
-        # Docker sandbox preparation
+        # Container sandbox preparation (docker and podman engines)
         # --------------------------------------------------------------------------------------------
 
         sandbox_tag = None
+        sandbox_backend = CONTAINER_BACKENDS.get(container_backend) if container_backend else None
 
-        if state["sandbox"]:
-            write_step("Preparing the Docker sandbox")
+        if sandbox_backend:
+            write_step("Preparing the %s sandbox" % sandbox_backend["label"])
 
-            sandbox_docker, sandbox_detail = docker_ready()
+            sandbox_tool, sandbox_detail = container_ready(sandbox_backend)
 
-            if not sandbox_docker:
-                fail_no_docker(sandbox_detail)
+            if not sandbox_tool:
+                fail_no_container(sandbox_backend, sandbox_detail)
 
-            write_info("docker daemon version %s" % sandbox_detail)
-            ensure_sandbox_network(sandbox_docker)
-            sandbox_tag = ensure_sandbox_image(sandbox_docker, spec["avx2"])
+            write_info("%s version %s" % (sandbox_backend["label"], sandbox_detail))
+            ensure_sandbox_network(sandbox_tool)
+            sandbox_tag = ensure_sandbox_image(sandbox_backend, sandbox_tool, spec["avx2"])
+
+        # --------------------------------------------------------------------------------------------
+        # WSL sandbox preparation (systemd-nspawn inside a WSL 2 distro; no container engine)
+        # --------------------------------------------------------------------------------------------
+
+        wsl_handle = None
+
+        if wsl_active:
+            write_step("Preparing the WSL sandbox")
+
+            wsl_handle, wsl_detail = wsl_ready()
+
+            if not wsl_handle:
+                fail_no_wsl(wsl_detail)
+
+            write_info("distro: %s" % wsl_detail)
+            ensure_wsl_packages(wsl_handle["wsl"], wsl_handle["distro"])
+            ensure_wsl_rootfs(wsl_handle["wsl"], wsl_handle["distro"], spec["avx2"])
+
+            if not wsl_is_mirrored(wsl_handle["wsl"], wsl_handle["distro"]):
+                write_warn("mirrored networking was not detected inside WSL (no 10.255.255.254 on lo)")
+                write_warn("if the model connection fails, add [wsl2] and networkingMode=mirrored to "
+                           "%UserProfile%\\.wslconfig, then run: wsl --shutdown")
 
         # --------------------------------------------------------------------------------------------
         # -Setup stops here
@@ -3820,7 +4331,7 @@ def main():
             env["PYTHONUNBUFFERED"] = "1"
             env["PYTHONIOENCODING"] = "utf-8"
 
-            if state["sandbox"]:
+            if sandbox_backend:
                 env["STRATA_ALLOWED_HOSTS"] = "%s,host.docker.internal" % SANDBOX_RELAY
                 write_info("the server will listen on 0.0.0.0 so the container can reach it; "
                            "Windows Firewall blocks other devices by default")
@@ -3845,7 +4356,7 @@ def main():
             server_process = subprocess.Popen(
                 [python, os.path.join(strata_root, "serve", "server.py"),
                  "--engine", "strata", "--config", strata_config_path, "--port", str(port)] +
-                (["--host", "0.0.0.0"] if state["sandbox"] else []),
+                (["--host", "0.0.0.0"] if sandbox_backend else []),
                 cwd=strata_root,
                 stdin=subprocess.DEVNULL,
                 stdout=log_handle,
@@ -3974,7 +4485,7 @@ def main():
             "autoupdate": False,
         }
 
-        if state["offline"]:
+        if isolation != "none":
             open_code_config["permission"] = offline_permission_block()
 
         open_code_json = json.dumps(open_code_config, indent=2)
@@ -4005,15 +4516,21 @@ def main():
             write_info("OpenCode config: " + OPENCODE_CFG)
             write_info("OpenCode model: strata/%s" % model_id)
 
-            if state["offline"]:
+            if local_guard:
                 write_info("OpenCode web access: blocked (web tools denied, network shell commands denied)")
                 write_info("a dead proxy will be set for OpenCode and its child processes: " + OFFLINE_PROXY_URL)
+
+            if wsl_active:
+                write_info("OpenCode will run in a systemd-nspawn WSL container with no network "
+                           "interfaces; the model is reached through a WSL-side relay")
 
             write_info("stop the Strata server with: strata-coder -Stop (or scode -Stop)")
             sys.exit(0)
 
-        write_step("Opening OpenCode in a Docker sandbox from " + PROJECT_DIR
-                   if state["sandbox"] else "Opening OpenCode in " + PROJECT_DIR)
+        write_step("Opening OpenCode in a %s sandbox from %s"
+                   % ((sandbox_backend["label"] if sandbox_backend else "WSL"), PROJECT_DIR)
+                   if (sandbox_backend or wsl_handle)
+                   else "Opening OpenCode in " + PROJECT_DIR)
 
         os.environ["OPENCODE_CONFIG"] = OPENCODE_CFG
 
@@ -4029,11 +4546,17 @@ def main():
         write_info("OpenCode model: strata/%s" % model_id)
         write_info("Strata endpoint: http://127.0.0.1:%d/v1" % port)
 
-        if state["sandbox"]:
+        if sandbox_backend:
             write_info("OpenCode runs in container '%s' on internal network '%s'"
                        % (SANDBOX_CONTAINER, SANDBOX_NETWORK))
-            write_info("container egress is blocked by Docker; only the local model endpoint is reachable")
-        elif state["offline"]:
+            write_info("container egress is blocked by %s; only the local model endpoint is reachable"
+                       % sandbox_backend["label"])
+        elif wsl_handle:
+            write_info("OpenCode runs in a systemd-nspawn container in WSL distro '%s'"
+                       % wsl_handle["distro"])
+            write_info("the container has no network interfaces at all; only the local model endpoint "
+                       "is reachable through the WSL-side relay")
+        elif local_guard:
             write_info("OpenCode web access: blocked (web tools denied, network shell commands denied)")
             write_info("dead proxy set for OpenCode and its child processes: " + OFFLINE_PROXY_URL)
 
@@ -4064,15 +4587,17 @@ def main():
         # proxy; NO_PROXY keeps the local Strata endpoint working. Any pre-existing
         # proxy settings are saved and restored as soon as OpenCode exits; atexit
         # is the fallback in case the run itself is interrupted before the finally.
-        # The sandbox container gets its own copies via docker -e instead.
+        # The sandbox container gets its own copies via the engine's -e instead.
         offline_proxy_saved = {}
-        if state["offline"] and not state["sandbox"]:
+        if local_guard:
             offline_proxy_saved = set_offline_proxy_sinkhole()
             atexit.register(clear_offline_proxy_sinkhole, offline_proxy_saved)
 
         try:
-            if state["sandbox"]:
-                run_opencode_sandbox(sandbox_tag, port, open_code_json)
+            if sandbox_backend:
+                run_opencode_sandbox(container_backend, sandbox_tag, port, open_code_json)
+            elif wsl_handle:
+                run_opencode_wsl(wsl_handle, port, open_code_json)
             else:
                 subprocess.run([OPENCODE_EXE, PROJECT_DIR], cwd=PROJECT_DIR)
         finally:

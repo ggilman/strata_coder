@@ -36,8 +36,7 @@ QUESTIONS = {
     "context": "Context",
     "kv": "KV cache",
     "port": "Server port",
-    "offline": "Stay fully local, block OpenCode web access?",
-    "sandbox": "Docker sandbox: run OpenCode in a container with no internet access?",
+    "isolation": "Isolation - keep OpenCode away from the internet?",
     "alias": "Add the scode shortcut to %s?",
 }
 
@@ -205,45 +204,109 @@ def kv_info_text():
     ])
 
 
-def offline_info_text():
-    return "\n".join([
-        "Fully local",
-        "",
-        "Nothing leaves this PC. While OpenCode runs:",
-        "  - OpenCode and every process it starts get a dead proxy (http://127.0.0.1:9), so "
-        "any web request dies instantly;",
-        "  - OpenCode's webfetch and websearch tools are switched off;",
-        "  - its bash gets a deny list for network tools: curl, wget, ssh, git push/pull/"
-        "clone, npm, pip, uv, conda, winget installs and friends. All other commands keep "
-        "working.",
-        "",
-        "Local traffic stays exempt (NO_PROXY covers 127.0.0.1 and localhost), so OpenCode "
-        "still reaches the model server on this PC. Everything is undone the moment OpenCode "
-        "exits; no permanent machine changes are made.",
-        "",
-        "Use it for sensitive code you never want this machine to be able to send out.",
-    ])
+def isolation_info(which):
+    """the popup text for one isolation choice, shown by the GUI's per-option info buttons."""
+    texts = {
+        "none": "\n".join([
+            "Isolation: None",
+            "",
+            "OpenCode runs directly on this PC with the normal internet access of your user "
+            "account. Nothing is blocked.",
+            "",
+            "Fine for everyday work; pick Local Only or a container when the code or data on "
+            "this machine must not leave it.",
+        ]),
+        "local": "\n".join([
+            "Isolation: Local Only",
+            "",
+            "OpenCode keeps running on this PC, but nothing leaves it. While OpenCode runs:",
+            "  - OpenCode and every process it starts get a dead proxy (http://127.0.0.1:9), "
+            "so any web request dies instantly;",
+            "  - OpenCode's webfetch and websearch tools are switched off;",
+            "  - its bash gets a deny list for network tools: curl, wget, ssh, git push/pull/"
+            "clone, npm, pip, uv, conda, winget installs and friends. All other commands keep "
+            "working.",
+            "",
+            "Local traffic stays exempt (NO_PROXY covers 127.0.0.1 and localhost), so OpenCode "
+            "still reaches the model server on this PC. Everything is undone the moment "
+            "OpenCode exits; no permanent machine changes are made.",
+            "",
+            "This is a policy wall, not a jail: a very determined exploit could still step "
+            "around it. The Docker and Podman choices are the real jail.",
+        ]),
+        "docker": "\n".join([
+            "Isolation: Docker",
+            "",
+            "The stronger wall: OpenCode itself runs inside a Docker container instead of on "
+            "this PC.",
+            "  - the container sits on an internal Docker network with no route to the "
+            "internet;",
+            "  - it reaches the model only through a small relay on that network, and the "
+            "model still runs on this PC;",
+            "  - only the project folder you open is mounted inside the container - the rest "
+            "of this PC is invisible to it;",
+            "  - inside the container the same dead proxy and network-tool deny list as "
+            "Local Only apply.",
+            "",
+            "Even a misbehaving or compromised OpenCode cannot reach your other files or your "
+            "network. Needs Docker Desktop or Docker Engine; the sandbox image is built on "
+            "first use, and OpenCode's history is kept in a named volume that survives "
+            "restarts.",
+        ]),
+        "podman": "\n".join([
+            "Isolation: Podman",
+            "",
+            "The same container wall as Docker, driven by the Podman engine instead: same "
+            "internal network, same image, same relay, same deny lists. Pick it when Podman "
+            "is already installed or Docker Desktop's licensing is a problem.",
+            "",
+            "Needs Podman: on Windows that means a podman machine (run 'podman machine "
+            "start' before using it); on Linux the normal podman install works out of the "
+            "box. The sandbox image builds on first use.",
+        ]),
+        "wsl": "\n".join([
+            "Isolation: WSL Containers",
+            "",
+            "The same container wall as Docker and Podman, but run by systemd-nspawn (part of "
+            "systemd) inside a WSL 2 Linux distro - no Docker, no Podman, no container engine "
+            "at all.",
+            "",
+            "  - the container gets no network interfaces whatsoever (only its own loopback): "
+            "no routes, no DNS, nothing to firewall;",
+            "  - the model keeps running on Windows; the container reaches it through a small "
+            "relay inside WSL, using WSL's mirrored networking (shared Windows loopback);",
+            "  - the same Debian dev toolchain and network deny lists as the Docker sandbox; "
+            "your project folder is mounted inside, and OpenCode's history persists in a WSL "
+            "directory.",
+            "",
+            "Needs Windows plus WSL 2 with systemd in the distro (the stock Ubuntu distro "
+            "qualifies). The script installs a few standard distro packages inside it "
+            "(systemd-container, debootstrap) and builds the sandbox rootfs on first use. If "
+            "your WSL is not in mirrored networking mode yet, add [wsl2] and "
+            "networkingMode=mirrored to %UserProfile%\\.wslconfig and run wsl --shutdown.",
+        ]),
+    }
+
+    return texts.get(which, "")
 
 
-def sandbox_info_text():
-    return "\n".join([
-        "Docker sandbox",
-        "",
-        "The stronger wall: OpenCode itself runs inside a Docker container instead of on this "
-        "PC.",
-        "  - the container sits on an internal Docker network with no route to the internet;",
-        "  - it reaches the model only through a small relay on that network, and the model "
-        "still runs on this PC;",
-        "  - only the project folder you open is mounted inside the container - the rest of "
-        "this PC is invisible to it;",
-        "  - inside the container the same dead proxy and network-tool deny list as Fully "
-        "local apply.",
-        "",
-        "Even a misbehaving or compromised OpenCode cannot reach your other files or your "
-        "network. Needs Docker (Desktop or Engine); the image is built on first use, Fully "
-        "local is switched on together with it, and OpenCode's history is kept in a named "
-        "volume that survives restarts.",
-    ])
+def isolation_options():
+    """the console setup's isolation options; WSL Containers is only offered on Windows,
+    where WSL exists."""
+    options = [{"value": "none", "name": "None", "label": "None - nothing extra"},
+               {"value": "local", "name": "Local", "label": "Local Only - block web access for "
+                                                            "OpenCode on this PC"},
+               {"value": "docker", "name": "Docker", "label": "Docker - OpenCode in a container "
+                                                              "with no internet"},
+               {"value": "podman", "name": "Podman", "label": "Podman - the same container wall, "
+                                                              "Podman engine"}]
+
+    if os.name == "nt":
+        options.append({"value": "wsl", "name": "WSL",
+                        "label": "WSL Containers - the same container inside WSL 2, "
+                                 "no container engine"})
+
+    return options
 
 
 def speed_nudge(variant, peers, ram_gb):
@@ -369,7 +432,7 @@ def run_setup_gui(sc, overrides=None):
     """Show the setup window and return the chosen settings dict, or None on Cancel.
 
     overrides carries parameters already given on the command line (dataDir,
-    context, kv, port, offline, and variant as a (family, model) pair) which
+    context, kv, port, isolation, and variant as a (family, model) pair) which
     pre-fill the form over the saved setup.json values. The scode shortcut is
     not part of the result: its button acts the moment it is pressed."""
 
@@ -402,18 +465,13 @@ def run_setup_gui(sc, overrides=None):
     default_kv = overrides.get("kv") or str(saved.get("kv") or "int8")
     default_port = overrides.get("port") or sc.get_int_setting(saved.get("port"), 8080) or 8080
 
-    if "offline" in overrides:
-        default_offline = bool(overrides["offline"])
-    else:
-        default_offline = saved.get("offline") is True
+    default_isolation = sc.saved_isolation(saved)
 
-    if "sandbox" in overrides:
-        default_sandbox = bool(overrides["sandbox"])
-    else:
-        default_sandbox = saved.get("sandbox") is True
+    if "isolation" in overrides:
+        default_isolation = overrides["isolation"]
 
-    if default_sandbox:
-        default_offline = True
+    if default_isolation == "wsl" and os.name != "nt":
+        default_isolation = "none"
 
     default_variant = None
 
@@ -587,33 +645,32 @@ def run_setup_gui(sc, overrides=None):
     port_var = tk.StringVar(value=str(default_port))
     ttk.Entry(body, textvariable=port_var, width=10).grid(row=6, column=1, sticky="w")
 
-    offline_var = tk.BooleanVar(value=default_offline)
-    ttk.Checkbutton(body, text="Fully local", variable=offline_var).grid(
-        row=7, column=0, sticky="w", pady=3)
-    ttk.Button(body, text="\u24d8", width=4,
-               command=lambda: info_popup("Fully local", offline_info_text())).grid(
-        row=7, column=1, sticky="w", pady=3)
+    add_label("Isolation:", 7)
+    isolation_var = tk.StringVar(value=default_isolation)
 
-    sandbox_var = tk.BooleanVar(value=default_sandbox)
-    ttk.Checkbutton(body, text="Docker sandbox", variable=sandbox_var).grid(
-        row=8, column=0, sticky="w", pady=3)
-    ttk.Button(body, text="\u24d8", width=4,
-               command=lambda: info_popup("Docker sandbox", sandbox_info_text())).grid(
-        row=8, column=1, sticky="w", pady=3)
+    isolation_rows = [("none", "None"),
+                      ("local", "Local Only"),
+                      ("docker", "Docker"),
+                      ("podman", "Podman")]
 
-    def on_sandbox_toggle(*_args):
-        if sandbox_var.get():
-            offline_var.set(True)
+    if os.name == "nt":
+        isolation_rows.append(("wsl", "WSL Containers"))
 
-    sandbox_var.trace_add("write", on_sandbox_toggle)
+    for offset, (value, label) in enumerate(isolation_rows):
+        line = 7 + offset
+        radio = ttk.Radiobutton(body, text=label, variable=isolation_var, value=value)
+        radio.grid(row=line, column=1, sticky="w", pady=1)
+        ttk.Button(body, text="\u24d8", width=4,
+                   command=lambda which=value: info_popup(label, isolation_info(which))).grid(
+            row=line, column=2, sticky="w", padx=(6, 0))
 
-    add_label("scode shortcut:", 9)
+    add_label("scode shortcut:", 12)
     shell_var = tk.StringVar(value="auto")
     ttk.Combobox(body, textvariable=shell_var, values=alias_shells,
-                 state="readonly", width=12).grid(row=9, column=1, sticky="w")
+                 state="readonly", width=12).grid(row=12, column=1, sticky="w")
 
     alias_status = ttk.Label(body, text="", foreground="#666666", wraplength=240, justify="left")
-    alias_status.grid(row=10, column=1, sticky="w", padx=(12, 0))
+    alias_status.grid(row=13, column=1, sticky="w", padx=(12, 0))
 
     def do_alias():
         shell = sc.get_calling_shell() if shell_var.get() == "auto" else shell_var.get()
@@ -631,14 +688,14 @@ def run_setup_gui(sc, overrides=None):
                  % shell_names.get(shell, shell))
 
     scode_row = ttk.Frame(body)
-    scode_row.grid(row=10, column=0, sticky="w")
+    scode_row.grid(row=13, column=0, sticky="w")
     ttk.Button(scode_row, text="Set Alias", width=10, command=do_alias).pack(side="left")
     ttk.Button(scode_row, text="\u24d8", width=4,
                command=lambda: info_popup("scode shortcut", scode_info_text())).pack(
         side="left", padx=(6, 0))
 
     engine_status = ttk.Label(body, text="", foreground="#666666", wraplength=240, justify="left")
-    engine_status.grid(row=11, column=1, sticky="w", padx=(12, 0))
+    engine_status.grid(row=14, column=1, sticky="w", padx=(12, 0))
 
     def do_purge_engine():
         state_json = sc.read_json(sc.STATE_PATH) or {}
@@ -679,7 +736,7 @@ def run_setup_gui(sc, overrides=None):
                                     text="no downloaded Strata engine found - nothing to delete")
 
     engine_row = ttk.Frame(body)
-    engine_row.grid(row=11, column=0, sticky="w")
+    engine_row.grid(row=14, column=0, sticky="w")
     ttk.Button(engine_row, text="Delete Strata", width=14,
                command=do_purge_engine).pack(side="left")
     ttk.Button(engine_row, text="\u24d8", width=4,
@@ -728,8 +785,7 @@ def run_setup_gui(sc, overrides=None):
             "context": context,
             "kv": kv,
             "port": int(port_text),
-            "offline": bool(offline_var.get()) or bool(sandbox_var.get()),
-            "sandbox": bool(sandbox_var.get()),
+            "isolation": isolation_var.get(),
         }
 
         root.destroy()
@@ -737,7 +793,7 @@ def run_setup_gui(sc, overrides=None):
     variant_list.bind("<Double-Button-1>", lambda _event: on_ok())
 
     buttons = ttk.Frame(body)
-    buttons.grid(row=12, column=0, columnspan=4, sticky="e", pady=(14, 0))
+    buttons.grid(row=15, column=0, columnspan=4, sticky="e", pady=(14, 0))
     ttk.Button(buttons, text="Cancel", command=root.destroy).pack(side="right", padx=(8, 0))
     ttk.Button(buttons, text="OK", command=on_ok).pack(side="right")
 
@@ -776,8 +832,7 @@ def apply_setup(sc, result):
         "-Context", str(result["context"]),
         "-Kv", result["kv"],
         "-Port", str(result["port"]),
-        "-Offline", "true" if result["offline"] else "false",
-        "-Sandbox", "true" if result["sandbox"] else "false",
+        "-Isolation", result["isolation"],
         "-NoAlias",
         "-NoGui",
     ]

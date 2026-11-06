@@ -67,8 +67,7 @@ specific shell when detection picks the wrong one.
 | `strata-coder -Family coder -Model IQ1_M` | Overrides the automatic model choice |
 | `strata-coder -Context 65536` / `-Port 8081` | Sets the context size and server port |
 | `strata-coder -Kv q4_0` | Sets the KV cache quant: `int8` (default), `k8v4`, or `q4_0` |
-| `strata-coder -Offline` | Blocks OpenCode's web tools; `-Offline false` turns the block off |
-| `strata-coder -Sandbox` | Runs OpenCode in a Docker container with no internet; `-Sandbox false` turns it off |
+| `strata-coder -Isolation docker` | Keeps OpenCode away from the internet (`none` / `local` / `docker` / `podman` / `wsl`) — the same choice as setup's Isolation, applied to the run; add `-Setup` to save it |
 | `strata-coder -Alias` | Adds the permanent `scode` alias to the calling shell |
 | `strata-coder -Setup -NoAlias` | Console `-Setup` that skips the `scode` shortcut question |
 | `strata-coder -Help` | Shows all options (`--help` also works) |
@@ -127,38 +126,59 @@ plain `+ - |` frames are used instead.
 4. **KV cache** — `int8` (8-bit, default), `k8v4` (8-bit K, 4-bit V), or `q4_0` (4-bit, smallest). Lower quantizations
    save RAM and let you pick a larger context.
 5. **Server port** — default 8080.
-6. **Stay fully local, block OpenCode web access?** — yes/no. On, OpenCode's `webfetch` and `websearch` tools are set to
-   `deny` and its `bash` tool gets a deny list for network commands (`curl`, `wget`, `git push/clone`, `npm install`,
-   `pip install`, PowerShell `Invoke-WebRequest`, and similar) in its config. OpenCode is also launched with a dead
-   proxy (`http://127.0.0.1:9` with `NO_PROXY` for localhost) that every child process inherits, so anything the
-   bash tool spawns that ignores the deny list still cannot reach the internet; the local Strata endpoint is
-   unaffected. Turning the setting off restores the normal config and clears the proxy. The isolation covers
-   OpenCode's use of the machine, not the setup itself, and it never removes `strata.exe` on its own — a fully
-   offline PC could not re-download or rebuild it afterwards. To stop trusting the downloaded binary and force a
-   fresh one, press **Delete Strata** in the setup window and run `-Setup` while the PC has network
-   access (see the GUI section). Isolation never blocks that rebuild: Strata's own setup runs with the dead proxy
-   stripped from its environment, and the block starts when OpenCode starts after it. Combined with the already-disabled
-   autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Note this is still a policy
-   plus an inherited environment, not a sandbox — the next question adds a real one.
-7. **Docker sandbox** — yes/no. Runs OpenCode inside a Docker container on an internal network: Docker itself blocks
-   all outbound traffic from the container, so the only network path is the local model endpoint, reached through
-   a small `socat` relay container (the internal network resolves no external names at all). Your current folder is
-   mounted read-write
-   at a path named after the folder you run in (`D:\projects\my-app` becomes `/my-app`, so OpenCode shows
-   your project name rather than a generic `/workspace`; odd characters are cleaned up and a folder named
-   after a system directory like `home` mounts at `/projects/home`), and OpenCode's sessions persist in a
-   named volume. The container
-   image ships a full offline developer toolchain — git, the GNU and LLVM C/C++ toolchains with clang-format,
-   clang-tidy, cppcheck and gdb, Python 3 with pip, venv and dev headers, gcc/cmake/ninja/make with the SSL and FFI
-   dev libraries, jq, sqlite3, zip/unzip and xxd, ffmpeg, ImageMagick, poppler-utils, shellcheck, tree, and the
-   procps/lsof/strace diagnostics — but deliberately no network utilities and no .NET SDKs (Debian has none).
-   Implies the previous setting on. Needs Docker Desktop installed (an administrator installs it; check its
-   licensing for your company). The Strata server and GPU stay on the host, and `-Status` works unchanged. With the sandbox on, the
-   server starts listening on all interfaces of this PC so the relay can reach it; what keeps other devices out is
-   Windows Firewall, which blocks inbound to it by default (tell IT the server listens on your port while the
-   sandbox is on). Turning the sandbox on restarts a running server once so it picks these up — `-Setup` does that
-   automatically. Turning the setting off resumes the normal host launch.
-8. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
+ 6. **Isolation** — pick one option (radio buttons in the GUI, a numbered list in the console):
+
+    - **None** (default) — OpenCode runs on this PC with normal internet access.
+    - **Local Only** — OpenCode keeps running on this PC, but nothing it does can leave it: its `webfetch` and
+      `websearch` tools are set to `deny`, its `bash` tool gets a deny list for network commands (`curl`, `wget`,
+      `git push/clone`, `npm install`, `pip install`, PowerShell `Invoke-WebRequest`, and similar), and it is launched
+      with a dead proxy (`http://127.0.0.1:9` with `NO_PROXY` for localhost) that every child process inherits, so
+      anything the bash tool spawns that ignores the deny list still cannot reach the internet; the local Strata
+      endpoint is unaffected. All of it is undone when OpenCode exits. This covers OpenCode's use of the machine, not
+      the setup itself, and it never removes `strata.exe` on its own — a fully offline PC could not re-download or
+      rebuild it afterwards. To stop trusting the downloaded binary and force a fresh one, press **Delete Strata** in
+      the setup window and run `-Setup` while the PC has network access (see the GUI section). Isolation never blocks
+      that rebuild: Strata's own setup runs with the dead proxy stripped from its environment, and the block starts
+      when OpenCode starts after it. Combined with the already-disabled autoupdate, sharing, and cloud providers,
+      nothing OpenCode does reaches the internet. Note this is still a policy plus an inherited environment, not a
+      sandbox — the container choices are the real jail.
+    - **Docker** — runs OpenCode inside a Docker container on an internal network: Docker itself blocks all outbound
+      traffic from the container, so the only network path is the local model endpoint, reached through a small
+      `socat` relay container (the internal network resolves no external names at all). Your current folder is
+      mounted read-write at a path named after the folder you run in (`D:\projects\my-app` becomes `/my-app`, so
+      OpenCode shows your project name rather than a generic `/workspace`; odd characters are cleaned up and a
+      folder named after a system directory like `home` mounts at `/projects/home`), and OpenCode's sessions persist
+      in a named volume. The container image ships a full offline developer toolchain — git, the GNU and LLVM C/C++
+      toolchains with clang-format, clang-tidy, cppcheck and gdb, Python 3 with pip, venv and dev headers,
+      gcc/cmake/ninja/make with the SSL and FFI dev libraries, jq, sqlite3, zip/unzip and xxd, ffmpeg, ImageMagick,
+      poppler-utils, shellcheck, tree, and the procps/lsof/strace diagnostics — but deliberately no network
+      utilities and no .NET SDKs (Debian has none). Needs Docker Desktop installed (an administrator installs it;
+      check its licensing for your company). The Strata server and GPU stay on the host, and `-Status` works
+      unchanged. With the sandbox on, the server starts listening on all interfaces of this PC so the relay can
+      reach it; what keeps other devices out is Windows Firewall, which blocks inbound to it by default (tell IT the
+      server listens on your port while the sandbox is on). Turning the sandbox on restarts a running server once so
+      it picks these up — `-Setup` does that automatically.
+    - **Podman** — the same container wall driven by the Podman engine instead of Docker: same internal network,
+      same sandbox image, same relay, same deny lists. Choose it where Podman is already installed or Docker
+      Desktop's licensing is a problem. On Windows it needs a podman machine — start it with `podman machine start`
+      before running `scode`.
+    - **WSL Containers** — the same container wall run by `systemd-nspawn` (a standard systemd
+      component) inside a WSL 2 Linux distro, with no Docker, no Podman, and no container engine
+      at all. The container is started with no network interfaces whatsoever — only its own
+      loopback exists, so there are no routes, no DNS, and nothing to firewall; the single path to
+      the model is a small relay running inside WSL, which reaches the Windows server through
+      WSL's mirrored networking (the shared Windows loopback), so the server keeps its
+      `127.0.0.1`-only bind. It uses the same Debian dev toolchain image recipe, the same deny
+      lists, and the same project-folder mount (`D:\projects\my-app` is mounted from WSL's
+      `/mnt/d/projects/my-app` to `/my-app`), and OpenCode's sessions persist in a directory
+      inside the distro. Needs Windows plus WSL 2 with systemd in the distro (the stock Ubuntu
+      distro qualifies; non-default distros may need `systemd=true` in their `/etc/wsl.conf`) and
+      mirrored networking (`[wsl2]` + `networkingMode=mirrored` in `%UserProfile%\.wslconfig`,
+      then `wsl --shutdown` — the script detects and tells you). On first use it installs a few
+      standard packages inside the distro (`systemd-container`, `debootstrap`) and builds the
+      sandbox rootfs there; the Strata server and GPU stay on Windows and `-Status` works
+      unchanged.
+ 7. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
    Git Bash), the same as `strata-coder -Alias`. Open a new shell window afterwards to pick it up. The GUI handles the
    shortcut differently: it is an instant action there, not a question — see the GUI section.
 
@@ -171,9 +191,9 @@ that keeps a safe margin.
 
 The answers are saved to `setup.json` and every later run reuses them. `-Setup` re-asks and re-saves, then stops
 without starting the server or opening OpenCode; run `scode` afterwards to use it. The model is reconfigured in place
-(no re-download) only when an engine-relevant answer changes — model folder, context, or KV cache; port, offline,
-sandbox, and the `scode` shortcut never touch the engine. The same parameters can also be set without the menu via
-`-Family`, `-Model`, `-Context`, `-Kv`, `-DataDir`, `-Port`, and `-Offline`.
+(no re-download) only when an engine-relevant answer changes — model folder, context, or KV cache; port, isolation,
+and the `scode` shortcut never touch the engine. The same parameters can also be set without the menu via
+`-Family`, `-Model`, `-Context`, `-Kv`, `-DataDir`, `-Port`, and `-Isolation`.
 
 ### The GUI menu
 
@@ -181,8 +201,9 @@ The same menu also exists as one Tkinter window, opened directly with `python se
 `strata-coder -Setup` when the machine can display one (it needs tkinter, which ships with the standard Python
 installers). The window opens **detached**: the command you typed finishes right away and the window lives on its
 own, so your terminal is free; close the window to back out. The form has a variant dropdown (variants that don't
-fit this PC's RAM are marked), model folder with a **Browse…** button, port, and **Context**, **KV cache**,
-*Fully local* and *Docker sandbox* controls — every one of them has an **ⓘ** popup that spells out its trade-offs.
+fit this PC's RAM are marked), model folder with a **Browse…** button, port, an **Isolation** radio group
+(**None / Local Only / Docker / Podman / WSL Containers**), and
+**Context** and **KV cache** dropdowns — every one of them has an **ⓘ** popup that spells out its trade-offs.
 Fields come up pre-filled from `setup.json`, and command-line parameters (e.g. `strata-coder -Setup -Port 8081`)
 pre-fill over the saved values.
 
@@ -224,7 +245,7 @@ quits). `-NoGui` forces the console panel, and the port defaults to the saved on
    `%APPDATA%\Strata\settings.json`), an already-prepared model, matching GGUFs in the Hugging Face cache, OpenCode, and a
    server already running. It skips whatever is there.
 3. **Checks disk space** before downloading. Model files go to the folder Strata used before, otherwise to
-   `%USERPROFILE%\ai-models\models`. The setup parameters (model, folder, context, KV cache, port, offline) are saved in
+    `%USERPROFILE%\ai-models\models`. The setup parameters (model, folder, context, KV cache, port, isolation) are saved in
    `%LOCALAPPDATA%\strata-coder\setup.json`; `strata-coder -Setup` asks for them again and re-saves the file, and
    every other run reads them to fill in whatever the command line did not decide.
 4. **Installs** Strata, the model, OpenCode, and [ripgrep](https://github.com/BurntSushi/ripgrep) into `%LOCALAPPDATA%\strata-coder\`. If interrupted, run it again and the download resumes. ripgrep is the `rg` command OpenCode uses for content search; its folder is added to `PATH` when OpenCode starts, and a failed ripgrep download is only a warning (search still works, just slower).
@@ -237,46 +258,62 @@ running after the script exits; stop it with `strata-coder -Stop`.
 
 ## Isolation
 
-Three settings keep OpenCode from reaching the internet; they stack, and the full wording for each is in the
-`-Setup` menu questions above. The Strata server and GPU always stay on the host, and `-Status` works the same in every
-mode.
+One **Isolation** setting decides how OpenCode is kept from the internet (setup Q6, or `-Isolation` on the command
+line); the full wording for each choice is in the `-Setup` menu questions above. The Strata server and GPU always stay
+on the host, and `-Status` works the same in every mode.
 
-- **Offline** (`-Offline`, setup Q6) — a *policy plus an inherited environment*, not a sandbox. OpenCode's `webfetch`
+- **None** (`-Isolation none`, the default) — OpenCode runs on this PC with normal internet access; only the normal
+  OpenCode safety prompts apply.
+- **Local Only** (`-Isolation local`) — a *policy plus an inherited environment*, not a sandbox. OpenCode's `webfetch`
   and `websearch` tools are set to `deny`, its `bash` tool gets a deny list for network commands (`curl`, `wget`,
   `git push/clone`, `npm install`, `pip install`, `Invoke-WebRequest`, and similar), and OpenCode is launched with a
   dead proxy (`http://127.0.0.1:9`, `NO_PROXY` for localhost) that every child process inherits, so anything that
   ignores the deny list still cannot get out; the local Strata endpoint is unaffected. Combined with the
-  already-disabled autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Turning it
-  off (`-Offline false`) restores the normal config and clears the proxy. This covers OpenCode's use of the machine,
-  not the setup: Strata's own setup runs with the sinkhole proxy stripped so downloads and rebuilds are never blocked,
-  and the block only starts when OpenCode launches afterward. A hard block on the host still needs an outbound firewall
+  already-disabled autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Switching
+  back to `none` restores the normal config and clears the proxy. This covers OpenCode's use of the machine, not the
+  setup: Strata's own setup runs with the sinkhole proxy stripped so downloads and rebuilds are never blocked, and
+  the block only starts when OpenCode launches afterward. A hard block on the host still needs an outbound firewall
   rule for `opencode.exe`, which requires admin.
-- **Docker sandbox** (`-Sandbox`, setup Q7) — a *real* sandbox, and it turns the offline setting on for you. OpenCode
-  runs in a container on an internal network where Docker blocks all outbound traffic and no external names resolve;
-  the only network path is the local model endpoint through a `socat` relay container. Your current folder is mounted
-  read-write at a path named after it, sessions persist in a named volume, and the image ships an offline developer
-  toolchain but deliberately no network utilities. Needs Docker Desktop (admin installs it; check licensing). While it
-  is on, the server listens on all interfaces of this PC so the relay can reach it, and Windows Firewall is what keeps
-  other devices out; `-Setup` restarts a running server once so it picks this up. The script reports a clear error
-  instead of running unprotected if Docker is missing.
+- **Docker** (`-Isolation docker`) and **Podman** (`-Isolation podman`) — a *real* sandbox driven by either engine
+  through the same code path: OpenCode runs in a container on an internal network where outbound traffic is blocked
+  and no external names resolve; the only network path is the local model endpoint through a `socat` relay container.
+  Your current folder is mounted read-write at a path named after it, sessions persist in a named volume, and the
+  image ships an offline developer toolchain but deliberately no network utilities. Inside the container the Local
+  Only policies apply as well. Docker needs Docker Desktop/Engine (admin installs it; check licensing); Podman needs
+  a podman machine started on Windows. While one of these is on, the server listens on all interfaces of this PC
+  so the relay can reach it, and Windows Firewall is what keeps other devices out; `-Setup` restarts a running
+  server once so it picks this up. The script reports a clear error instead of running unprotected if the
+  chosen engine is missing.
+- **WSL Containers** (`-Isolation wsl`, Windows only) — the same wall with no container engine at all: the same
+  Debian rootfs is run by `systemd-nspawn` inside a systemd-enabled WSL 2 distro, and the container is given
+  *no network interfaces* (`--private-network`), so there is nothing to block — the only path to the model is a
+  unix socket relayed inside WSL to the server's localhost port, which works because WSL mirrored networking
+  shares the Windows loopback (the server therefore keeps its `127.0.0.1`-only bind — nothing is opened on
+  other interfaces). Needs WSL 2 with systemd in the distro and mirrored networking (both checked, with exact
+  instructions on failure); the script installs `systemd-container` and `debootstrap` inside the distro and
+  builds the rootfs and session directory there on first use. The same project-folder mount, toolchain, and deny
+  lists as Docker; network shares (`\\server\...` folders) cannot be mounted, same as the other sandboxes.
 - **Delete Strata** (the setup-window button) — a one-shot action, not a setting.
   It removes the downloaded `strata.exe` (and any copy under the model folder) so the next `-Setup` rebuilds the engine
   from a fresh download instead of trusting the binary on disk — the way to stop trusting an unsigned download.
   Isolation never deletes the engine on its own, because a fully offline PC could not get it back; press it only when
   that next `-Setup` can reach the network.
 
-Pick Offline for a lightweight policy-level guard while OpenCode runs on the host, or the Docker sandbox for
-container-enforced isolation. Offline and the sandbox can be set without the menu via `-Offline [true|false]` and
-`-Sandbox [true|false]`.
+Pick **Local Only** for a lightweight policy-level guard while OpenCode runs on the host, or Docker/Podman/WSL
+Containers for container-enforced isolation (WSL Containers is the one that installs no container engine at all).
+Any choice can be set without the menu via `-Isolation none|local|docker|podman|wsl`; it applies to the run it is
+given on, and to later runs when combined with `-Setup`.
 
 ## Notes
 
-- OpenCode runs as your user, not in a sandbox, unless you turn on the **Docker sandbox** setup option. It starts in
-  your project folder and asks before risky actions.
-- On a managed PC, the only thing that needs IT is a current NVIDIA driver (580 or newer) — plus Docker Desktop if
-  you want the Docker sandbox option, which an administrator must install (and whose licensing for your company IT
-  should confirm). With the sandbox on, the script reports a clear error instead of running unprotected when Docker
-  is missing.
+- OpenCode runs as your user, not in a sandbox, unless you pick **Docker**, **Podman**, or **WSL Containers**
+  for Isolation. It starts in your project folder and asks before risky actions.
+- On a managed PC, the only thing that needs IT is a current NVIDIA driver (580 or newer) — plus Docker Desktop
+  (or Podman) if you want those container options, which an administrator must install (and whose licensing for
+  your company IT should confirm). The **WSL Containers** option needs no third-party install at all, only WSL 2
+  (enable once with `wsl --install`, which an administrator does) and its mirrored networking mode, both checked
+  and explained by the script. With a container isolation on, the script reports a clear error instead of running
+  unprotected when its engine is missing.
 - If Strata has no ready-made engine for the GPU, it would want to install Visual Studio and the CUDA Toolkit, which needs admin. The script
   stops instead.
 - Strata's engine (`strata.exe`) is not code-signed, so Windows Smart App Control blocks it. The script stops at the PC check if
