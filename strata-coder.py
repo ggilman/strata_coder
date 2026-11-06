@@ -11,6 +11,7 @@ Modes:
 """
 
 import argparse
+import atexit
 import ctypes
 import fnmatch
 import glob
@@ -2275,6 +2276,65 @@ def invoke_model_setup(root, variant, directory, server_port, context_tokens, kv
 
 
 # ----------------------------------------------------------------------------------------------------
+# Offline isolation
+# ----------------------------------------------------------------------------------------------------
+
+OFFLINE_PROXY_URL = "http://127.0.0.1:9"
+OFFLINE_NO_PROXY = "127.0.0.1,localhost"
+
+OFFLINE_DENY_COMMANDS = (
+    "curl", "curl.exe", "wget", "wget.exe", "ftp", "tftp", "telnet", "nc", "ncat", "socat",
+    "ssh", "scp", "sftp", "rsync",
+    "Invoke-WebRequest", "invoke-webrequest", "Invoke-RestMethod", "invoke-restmethod",
+    "iwr", "irm",
+    "git push", "git pull", "git fetch", "git clone", "git ls-remote", "git submodule update",
+    "npm install", "npm i", "npm add", "npm ci", "npm update", "npx",
+    "yarn install", "yarn add", "yarn upgrade", "pnpm install", "pnpm add", "pnpm update",
+    "pip install", "pip3 install", "pip download", "uv add", "uv sync", "uv pip install",
+    "poetry install", "poetry add", "poetry update", "conda install", "conda create",
+    "choco install", "winget install", "apt install", "apt-get install", "dotnet tool install",
+)
+
+
+def offline_permission_block():
+    bash_rules = {"*": "allow"}
+
+    for command in OFFLINE_DENY_COMMANDS:
+        bash_rules[command] = "deny"
+        bash_rules[command + " *"] = "deny"
+
+    return {"webfetch": "deny", "websearch": "deny", "bash": bash_rules}
+
+
+def set_offline_proxy_sinkhole():
+    saved = {}
+
+    for group in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"):
+        value = OFFLINE_NO_PROXY if group == "NO_PROXY" else OFFLINE_PROXY_URL
+
+        existing = {}
+        for key in list(os.environ):
+            if key.upper() == group:
+                existing[key] = os.environ[key]
+                del os.environ[key]
+
+        saved[group] = existing
+        os.environ[group] = value
+        os.environ[group.lower()] = value
+
+    return saved
+
+
+def clear_offline_proxy_sinkhole(saved):
+    for group, existing in saved.items():
+        for key in list(os.environ):
+            if key.upper() == group.upper():
+                del os.environ[key]
+        for key, value in existing.items():
+            os.environ[key] = value
+
+
+# ----------------------------------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------------------------------
 
@@ -3270,7 +3330,7 @@ def main():
         }
 
         if state["offline"]:
-            open_code_config["permission"] = {"webfetch": "deny", "websearch": "deny"}
+            open_code_config["permission"] = offline_permission_block()
 
         open_code_json = json.dumps(open_code_config, indent=2)
 
@@ -3301,7 +3361,8 @@ def main():
             write_info("OpenCode model: strata/%s" % model_id)
 
             if state["offline"]:
-                write_info("OpenCode web access: blocked (webfetch and websearch denied)")
+                write_info("OpenCode web access: blocked (web tools denied, network shell commands denied)")
+                write_info("a dead proxy will be set for OpenCode and its child processes: " + OFFLINE_PROXY_URL)
 
             write_info("stop the Strata server with: strata-coder -Stop (or scode -Stop)")
             sys.exit(0)
@@ -3323,7 +3384,8 @@ def main():
         write_info("Strata endpoint: http://127.0.0.1:%d/v1" % port)
 
         if state["offline"]:
-            write_info("OpenCode web access: blocked (webfetch and websearch denied)")
+            write_info("OpenCode web access: blocked (web tools denied, network shell commands denied)")
+            write_info("dead proxy set for OpenCode and its child processes: " + OFFLINE_PROXY_URL)
 
         if not os.path.isfile(OPENCODE_CFG):
             fail("the generated OpenCode configuration file does not exist: " + OPENCODE_CFG)
@@ -3348,12 +3410,22 @@ def main():
         except Exception as exc:
             write_warn("could not run 'opencode debug config' (%s)" % exc)
 
+        # sinkhole: OpenCode and everything its bash tool spawns inherit a dead
+        # proxy; NO_PROXY keeps the local Strata endpoint working. Any pre-existing
+        # proxy settings are saved and restored as soon as OpenCode exits; atexit
+        # is the fallback in case the run itself is interrupted before the finally.
+        offline_proxy_saved = {}
+        if state["offline"]:
+            offline_proxy_saved = set_offline_proxy_sinkhole()
+            atexit.register(clear_offline_proxy_sinkhole, offline_proxy_saved)
+
         try:
             subprocess.run([OPENCODE_EXE, PROJECT_DIR], cwd=PROJECT_DIR)
         finally:
             reset_terminal_mouse()
             os.environ.pop("OPENCODE_CONFIG_CONTENT", None)
             os.environ.pop("OPENCODE_CONFIG", None)
+            clear_offline_proxy_sinkhole(offline_proxy_saved)
 
         write_step("Stopping the Strata server")
 

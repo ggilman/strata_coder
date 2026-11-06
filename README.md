@@ -106,10 +106,14 @@ plain `+ - |` frames are used instead.
    save RAM and let you pick a larger context.
 5. **Server port** — default 8080.
 6. **Stay fully local, block OpenCode web access?** — yes/no. On, OpenCode's `webfetch` and `websearch` tools are set to
-   `deny` in its config, so the assistant itself cannot browse the web or search. Combined with the already-disabled
-   autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Note this is a policy inside
-   OpenCode, not a sandbox: its `bash` tool can still run network commands like `curl`. A hard block needs an outbound
-   firewall rule for `opencode.exe`, which requires admin.
+   `deny` and its `bash` tool gets a deny list for network commands (`curl`, `wget`, `git push/clone`, `npm install`,
+   `pip install`, PowerShell `Invoke-WebRequest`, and similar) in its config. OpenCode is also launched with a dead
+   proxy (`http://127.0.0.1:9` with `NO_PROXY` for localhost) that every child process inherits, so anything the
+   bash tool spawns that ignores the deny list still cannot reach the internet; the local Strata endpoint is
+   unaffected. Turning the setting off restores the normal config and clears the proxy. Combined with the already-disabled
+   autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Note this is still a policy
+   plus an inherited environment, not a sandbox; a hard block needs an outbound firewall rule for `opencode.exe`,
+   which requires admin.
 7. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
    Git Bash), the same as `strata-coder -Alias`. Open a new shell window afterwards to pick it up. The GUI handles the
    shortcut differently: it is an instant action there, not a question — see the GUI section.
