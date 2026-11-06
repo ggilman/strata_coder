@@ -110,7 +110,9 @@ plain `+ - |` frames are used instead.
    `pip install`, PowerShell `Invoke-WebRequest`, and similar) in its config. OpenCode is also launched with a dead
    proxy (`http://127.0.0.1:9` with `NO_PROXY` for localhost) that every child process inherits, so anything the
    bash tool spawns that ignores the deny list still cannot reach the internet; the local Strata endpoint is
-   unaffected. Turning the setting off restores the normal config and clears the proxy. Combined with the already-disabled
+   unaffected. Turning the setting off restores the normal config and clears the proxy. `-Setup` also deletes the
+   downloaded `strata.exe` while the setting is on, so the next run rebuilds the engine locally instead of trusting
+   a downloaded binary. Combined with the already-disabled
    autoupdate, sharing, and cloud providers, nothing OpenCode does reaches the internet. Note this is still a policy
    plus an inherited environment, not a sandbox; a hard block needs an outbound firewall rule for `opencode.exe`,
    which requires admin.

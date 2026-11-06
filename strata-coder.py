@@ -2334,6 +2334,31 @@ def clear_offline_proxy_sinkhole(saved):
             os.environ[key] = value
 
 
+def delete_strata_engine(root, data_dir):
+    deleted = []
+    failed = []
+
+    engine_names = ("strata.exe",) if IS_WINDOWS else ("strata",)
+    targets = []
+
+    for base in (root, data_dir):
+        if not base or not os.path.isdir(base):
+            continue
+        for name in engine_names:
+            for path in glob.glob(os.path.join(base, "**", name), recursive=True):
+                if os.path.isfile(path) and path not in targets:
+                    targets.append(path)
+
+    for path in targets:
+        try:
+            os.remove(path)
+            deleted.append(path)
+        except OSError as exc:
+            failed.append("%s (%s)" % (path, exc.strerror or exc))
+
+    return deleted, failed
+
+
 # ----------------------------------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------------------------------
@@ -3143,6 +3168,19 @@ def main():
         # --------------------------------------------------------------------------------------------
 
         if state["setup"]:
+            if state["offline"]:
+                write_step("Offline isolation: removing the downloaded Strata engine")
+
+                deleted_engines, failed_engines = delete_strata_engine(strata_root, data_dir)
+                for engine_path in deleted_engines:
+                    write_ok("removed " + engine_path)
+                for description in failed_engines:
+                    write_warn("could not remove " + description)
+
+                if failed_engines:
+                    write_info("run scode -Stop and repeat -Setup if any engine file was left")
+                write_info("the next run rebuilds the engine from source instead of using the downloaded exe")
+
             write_step("Setup complete")
             write_info("the server was not started and OpenCode was not opened")
             write_info("run scode (or strata-coder) in a project folder when you are ready to use it")
