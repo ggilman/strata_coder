@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 import time
 import urllib.request
 
@@ -33,9 +34,46 @@ PANEL_HINT = " Ctrl+C quits - updates every 2 s at %s"
 LIVE_ANSI = {"Green": "\033[32m", "Yellow": "\033[33m", "DarkGray": "\033[90m"}
 LIVE_GUI = {"Green": "#1a9e3f", "Yellow": "#b58900", "DarkGray": "#8a8a8a"}
 BORDER_GUI = {46: "#1a9e3f", 220: "#b58900", 241: "#767676"}
+BAR_GUI = {"green": "#1a9e3f", "yellow": "#b58900", "red": "#c0392b"}
+BAR_TRACK_GUI = "#e6e6e6"
+BAR_BORDER_GUI = "#cfcfcf"
+BAR_WIDTH = 16
+BAR_UNI = ("\u2588", "\u2591")
+BAR_ASC = ("#", "-")
 GUI_HINT = "updates every 2 s at %s - close this window to quit"
 NO_SERVER_TEXT = "no Strata server is answering on port %d - retrying every 2 s"
 LOST_TEXT = "lost the connection to the server (%s) - retrying every 2 s"
+
+
+def bar_glyphs():
+    try:
+        "".join(BAR_UNI).encode(sys.stdout.encoding or "ascii")
+        return BAR_UNI
+    except (UnicodeEncodeError, LookupError):
+        return BAR_ASC
+
+
+def format_bar(pct, text="", width=BAR_WIDTH, glyphs=None):
+    full, empty = glyphs or bar_glyphs()
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = int(round((pct / 100.0) * width))
+    filled = max(0, min(width, filled))
+    bar_str = "[%s%s]" % (full * filled, empty * (width - filled))
+    return "%s %s" % (bar_str, text) if text else bar_str
+
+
+def format_usage_bar(used, total, width=BAR_WIDTH, glyphs=None):
+    pct = max(0.0, min(100.0, (100.0 * used / total) if total > 0 else 0.0))
+    text = "%.1f / %.1f GiB (%.0f%%)" % (used, total, pct)
+    return format_bar(pct, text, width=width, glyphs=glyphs)
+
+
+def bar_grade(pct):
+    if pct >= 90.0:
+        return "red"
+    if pct >= 75.0:
+        return "yellow"
+    return "green"
 
 
 def load_cli():
@@ -108,7 +146,7 @@ def poll_once(base):
     return (status_info, v1_status, totals), None
 
 
-def get_status_display(status_info, v1_status, totals):
+def get_status_display(status_info, v1_status, totals, glyphs=None):
     timing = v1_status.get("last_timings")
     machine = v1_status.get("machine") or {}
     activity = v1_status.get("activity") or {}
@@ -144,35 +182,59 @@ def get_status_display(status_info, v1_status, totals):
     if totals and float(totals.get("output_tokens") or 0) > 0 and float(totals.get("decode_ms") or 0) > 0:
         body_lines.append(
             "average:  %.1f tok/s over %s answers since start"
-            % (100 * float(totals["output_tokens"]) / float(totals["decode_ms"]),
+            % (1000 * float(totals["output_tokens"]) / float(totals["decode_ms"]),
                totals.get("requests")))
     else:
         body_lines.append("average:  none yet")
 
+    context_bar = None
     if v1_status.get("cache_max_tokens") and status_info.get("prompt_tokens") is not None:
+        ctx_used = int(status_info["prompt_tokens"])
+        ctx_total = int(v1_status["cache_max_tokens"])
+        ctx_pct = max(0.0, min(100.0, (100.0 * ctx_used / ctx_total) if ctx_total > 0 else 0.0))
+        ctx_text = "%s / %s (%.0f%%)" % (ctx_used, ctx_total, ctx_pct)
+        context_bar = {"used": ctx_used, "total": ctx_total, "pct": ctx_pct, "text": ctx_text}
         body_lines.append(
-            "context:  %s / %s (%.0f%%)"
-            % (status_info["prompt_tokens"], v1_status["cache_max_tokens"],
-               100 * float(status_info["prompt_tokens"]) / float(v1_status["cache_max_tokens"])))
+            "context:  %s" % format_bar(ctx_pct, ctx_text, glyphs=glyphs))
     else:
         body_lines.append("context:  unknown")
 
     gpu = machine.get("gpu")
+    gpu_bar = None
+    vram_bar = None
 
     if gpu:
+        gpu_pct = max(0.0, min(100.0, float(gpu.get("util_pct") or 0)))
+        gpu_text = "%.0f%% util, %.0f C, %.0f W" % (
+            round(gpu_pct), round(float(gpu.get("temp_c") or 0)), float(gpu.get("power_w") or 0))
+        gpu_bar = {"pct": gpu_pct, "text": gpu_text}
+
+        vram_used = float(gpu.get("used_mib") or 0) / 1024.0
+        vram_total = float(gpu.get("total_mib") or 0) / 1024.0
+        vram_pct = max(0.0, min(100.0, (100.0 * vram_used / vram_total) if vram_total > 0 else 0.0))
+        vram_text = "%.1f / %.1f GiB (%.0f%%)" % (vram_used, vram_total, vram_pct)
+        vram_bar = {"used": vram_used, "total": vram_total, "pct": vram_pct, "text": vram_text}
+
         body_lines.append(
-            "gpu:      %.0f%% util, %.0f C, %.0f W, VRAM %.1f / %.1f GiB"
-            % (round(float(gpu.get("util_pct") or 0)), round(float(gpu.get("temp_c") or 0)),
-               float(gpu.get("power_w") or 0),
-               float(gpu.get("used_mib") or 0) / 1024, float(gpu.get("total_mib") or 0) / 1024))
+            "gpu:      %s" % format_bar(gpu_pct, gpu_text, glyphs=glyphs))
+        body_lines.append(
+            "vram:     %s" % format_usage_bar(vram_used, vram_total, glyphs=glyphs))
     else:
         body_lines.append("gpu:      n/a")
+        body_lines.append("vram:     n/a")
 
     ram = machine.get("ram")
+    ram_bar = None
 
     if ram:
-        body_lines.append("ram:      %.1f / %.1f GiB"
-                          % (float(ram.get("used_gib") or 0), float(ram.get("total_gib") or 0)))
+        ram_used = float(ram.get("used_gib") or 0)
+        ram_total = float(ram.get("total_gib") or 0)
+        ram_pct = max(0.0, min(100.0, (100.0 * ram_used / ram_total) if ram_total > 0 else 0.0))
+        ram_text = "%.1f / %.1f GiB (%.0f%%)" % (ram_used, ram_total, ram_pct)
+        ram_bar = {"used": ram_used, "total": ram_total, "pct": ram_pct, "text": ram_text}
+
+        body_lines.append(
+            "ram:      %s" % format_usage_bar(ram_used, ram_total, glyphs=glyphs))
     else:
         body_lines.append("ram:      n/a")
 
@@ -198,6 +260,10 @@ def get_status_display(status_info, v1_status, totals):
         "live_color": live_color,
         "border256": border256,
         "model_text": v1_status.get("model") or "model",
+        "context_bar": context_bar,
+        "gpu_bar": gpu_bar,
+        "vram_bar": vram_bar,
+        "ram_bar": ram_bar,
     }
 
 
@@ -317,20 +383,101 @@ def show_status_window(sc, server_port):
     footer.pack(anchor="w", padx=12, pady=(8, 10))
 
     ever_connected = bool(health)
+    bar_w, bar_h = 140, 12
+    row_slots = []
+    chrome_state = {"border": None, "title": None, "footer": None}
 
-    def tick():
+    def get_row_slot(index):
+        while len(row_slots) <= index:
+            frame = tk.Frame(lines_frame, bg="white")
+            prefix_label = tk.Label(frame, text="", font=body_font, bg="white",
+                                    fg="black", anchor="w")
+            prefix_label.pack(side="left")
+            canvas = tk.Canvas(
+                frame, width=bar_w, height=bar_h, bg=BAR_TRACK_GUI,
+                highlightthickness=1, highlightbackground=BAR_BORDER_GUI, bd=0)
+            rect_id = canvas.create_rectangle(0, 0, 0, bar_h, fill=BAR_GUI["green"],
+                                              outline="", state="hidden")
+            text_label = tk.Label(frame, text="", font=body_font, bg="white",
+                                  fg="black", anchor="w")
+            row_slots.append({
+                "frame": frame,
+                "prefix_label": prefix_label,
+                "canvas": canvas,
+                "rect_id": rect_id,
+                "text_label": text_label,
+                "visible": False,
+                "mode": "text",
+                "prefix_text": None,
+                "prefix_fg": None,
+                "fill_w": None,
+                "fill_color": None,
+                "bar_text": None,
+            })
+        return row_slots[index]
+
+    def set_row_text(index, text, fg="black"):
+        slot = get_row_slot(index)
+        if not slot["visible"]:
+            slot["frame"].pack(fill="x")
+            slot["visible"] = True
+        if slot["mode"] != "text":
+            slot["canvas"].pack_forget()
+            slot["text_label"].pack_forget()
+            slot["mode"] = "text"
+        if slot["prefix_text"] != text:
+            slot["prefix_label"].configure(text=text)
+            slot["prefix_text"] = text
+        if slot["prefix_fg"] != fg:
+            slot["prefix_label"].configure(fg=fg)
+            slot["prefix_fg"] = fg
+
+    def set_row_bar(index, prefix, bar):
+        slot = get_row_slot(index)
+        if not slot["visible"]:
+            slot["frame"].pack(fill="x")
+            slot["visible"] = True
+        if slot["mode"] != "bar":
+            slot["canvas"].pack(side="left", padx=(2, 8))
+            slot["text_label"].pack(side="left")
+            slot["mode"] = "bar"
+        if slot["prefix_text"] != prefix:
+            slot["prefix_label"].configure(text=prefix)
+            slot["prefix_text"] = prefix
+        if slot["prefix_fg"] != "black":
+            slot["prefix_label"].configure(fg="black")
+            slot["prefix_fg"] = "black"
+
+        fill_w = max(0, min(bar_w, int(round((bar["pct"] / 100.0) * bar_w))))
+        fill_color = BAR_GUI[bar_grade(bar["pct"])]
+        if slot["fill_w"] != fill_w or slot["fill_color"] != fill_color:
+            if fill_w > 0:
+                slot["canvas"].coords(slot["rect_id"], 0, 0, fill_w, bar_h)
+                slot["canvas"].itemconfigure(slot["rect_id"], fill=fill_color, state="normal")
+            else:
+                slot["canvas"].itemconfigure(slot["rect_id"], state="hidden")
+            slot["fill_w"] = fill_w
+            slot["fill_color"] = fill_color
+
+        bar_text = bar.get("text") or (
+            "%.1f / %.1f GiB (%.0f%%)" % (bar["used"], bar["total"], bar["pct"]))
+        if slot["bar_text"] != bar_text:
+            slot["text_label"].configure(text=bar_text)
+            slot["bar_text"] = bar_text
+
+    def hide_extra_rows(used_count):
+        for slot in row_slots[used_count:]:
+            if slot["visible"]:
+                slot["frame"].pack_forget()
+                slot["visible"] = False
+
+    def render_poll_result(data, exc):
         nonlocal ever_connected
-
-        data, exc = poll_once(base)
-
-        for child in lines_frame.winfo_children():
-            child.destroy()
 
         if data is None:
             message = NO_SERVER_TEXT % server_port if not ever_connected else LOST_TEXT % exc
-            tk.Label(lines_frame, text=message, font=body_font, bg="white",
-                     fg="#c0392b", anchor="w").pack(fill="x")
-            footer.configure(text=GUI_HINT % time.strftime("%H:%M:%S"))
+            set_row_text(0, message, fg="#c0392b")
+            hide_extra_rows(1)
         else:
             status_info, v1_status, totals = data
             ever_connected = True
@@ -338,22 +485,83 @@ def show_status_window(sc, server_port):
             display = get_status_display(status_info, v1_status, totals)
 
             border = BORDER_GUI.get(display["border256"], "#767676")
-            outer.configure(highlightbackground=border)
-            root.configure(bg=border)
-            title_label.configure(
-                text=" Strata speed  %s  %s " % (display["model_text"], base), fg=border)
+            if chrome_state["border"] != border:
+                outer.configure(highlightbackground=border)
+                root.configure(bg=border)
+                chrome_state["border"] = border
+
+            title_text = " Strata speed  %s  %s " % (display["model_text"], base)
+            if chrome_state["title"] != (title_text, border):
+                title_label.configure(text=title_text, fg=border)
+                chrome_state["title"] = (title_text, border)
 
             live = LIVE_GUI.get(display["live_color"], "black")
 
-            for index, line in enumerate(display["body_lines"]):
-                tk.Label(lines_frame, text=line, font=body_font, bg="white", anchor="w",
-                         fg=live if index == 0 else "black").pack(fill="x")
+            bars_by_prefix = {
+                "context:": display.get("context_bar"),
+                "gpu:": display.get("gpu_bar"),
+                "vram:": display.get("vram_bar"),
+                "ram:": display.get("ram_bar"),
+            }
 
-            footer.configure(text=GUI_HINT % time.strftime("%H:%M:%S"))
+            body_lines = display["body_lines"]
+            for index, line in enumerate(body_lines):
+                bar = None
+                for prefix_key, candidate in bars_by_prefix.items():
+                    if line.startswith(prefix_key) and candidate is not None:
+                        bar = candidate
+                        break
 
-        root.after(2000, tick)
+                if bar is not None:
+                    set_row_bar(index, line[:10], bar)
+                else:
+                    set_row_text(index, line, fg=live if index == 0 else "black")
 
-    tick()
+            hide_extra_rows(len(body_lines))
+
+        footer_text = GUI_HINT % time.strftime("%H:%M:%S")
+        if chrome_state["footer"] != footer_text:
+            footer.configure(text=footer_text)
+            chrome_state["footer"] = footer_text
+
+        root.update_idletasks()
+
+    latest_poll = {"ready": False, "data": None, "exc": None, "in_flight": False}
+    poll_lock = threading.Lock()
+
+    def poll_worker():
+        data, exc = poll_once(base)
+        with poll_lock:
+            latest_poll["data"] = data
+            latest_poll["exc"] = exc
+            latest_poll["ready"] = True
+            latest_poll["in_flight"] = False
+
+    def start_poll():
+        with poll_lock:
+            if latest_poll["in_flight"]:
+                return
+            latest_poll["in_flight"] = True
+        thread = threading.Thread(target=poll_worker, daemon=True)
+        thread.start()
+
+    def check_poll():
+        ready = False
+        with poll_lock:
+            if latest_poll["ready"]:
+                data = latest_poll["data"]
+                exc = latest_poll["exc"]
+                latest_poll["ready"] = False
+                ready = True
+        if ready:
+            render_poll_result(data, exc)
+            root.after(2000, start_poll)
+        root.after(100, check_poll)
+
+    initial_data, initial_exc = poll_once(base)
+    render_poll_result(initial_data, initial_exc)
+    root.after(2000, start_poll)
+    root.after(100, check_poll)
 
     try:
         root.mainloop()
