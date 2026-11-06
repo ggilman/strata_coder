@@ -5,23 +5,29 @@ This tool runs a local AI coding assistant: [OpenCode](https://opencode.ai), bac
 
 ## Install (once)
 
-1. Clone this repo to a permanent location, e.g.:
+1. Install Python 3.9+ if you don't have it (the standard installer from python.org includes
+   tkinter, which the GUI menus use; this project was tested with 3.12). Then clone this repo to a
+   permanent location, e.g.:
 
    ```
    git clone https://github.com/ggilman/strata_coder.git D:\tools\strata_coder
    ```
 
-2. Run the setup once, from PowerShell (or from Git Bash / Command Prompt with
-   `powershell -NoProfile -ExecutionPolicy Bypass -File ...`):
+2. Run the setup once, from PowerShell, Git Bash, or Command Prompt:
 
    ```
-   D:\tools\strata_coder\strata-coder.ps1 -Setup
+   python D:\tools\strata_coder\strata-coder.py -Setup
    ```
 
-   It checks the PC, installs Strata and OpenCode, downloads the model, and asks whether to add a
-   `scode` shortcut to the shell you ran it from, then stops without starting the server or opening
-   OpenCode. Open a new shell window afterwards so the shortcut is picked up, and run `scode` to
-   start using it.
+   It opens the setup menu — a GUI window when the machine can display one, otherwise a
+   box-drawing console menu (see "The `-Setup` menu" below) — then checks the PC, installs Strata
+   and OpenCode, downloads the model, and saves your answers. It stops without starting the server
+   or opening OpenCode. Open a new shell window afterwards if you added the `scode` shortcut, and
+   run `scode` to start using it.
+
+The repo is three scripts that must stay in the same folder: `strata-coder.py` (the command
+itself), `setup.py` (the setup menu, its GUI, and all the menu text), and `status.py` (the status
+dashboard and its GUI).
 
 ## Daily use
 
@@ -37,7 +43,7 @@ scode
 OpenCode the server stops and RAM/VRAM are freed. Every command in the table below works the same
 way through `scode`.
 
-If you skipped the shortcut, run the full path instead (`D:\...\strata_coder\strata-coder.ps1`),
+If you skipped the shortcut, run the full path instead (`python D:\...\strata_coder\strata-coder.py`),
 put the `strata_coder` folder on your user PATH and type `strata-coder`, or add the shortcut later
 with `strata-coder -Alias`. `-Alias cmd`, `-Alias powershell`, and `-Alias bash` force a
 specific shell when detection picks the wrong one.
@@ -48,25 +54,35 @@ specific shell when detection picks the wrong one.
 | `strata-coder -CheckOnly` | Shows the specs, the chosen model, disk space, and what is installed. Changes nothing |
 | `strata-coder -NoLaunch` | Sets up and starts the server only |
 | `strata-coder -Stop` | Stops the Strata server |
-| `strata-coder -Status` | Live dashboard of the running server: tokens/sec for the current answer plus the average over all answers, context use, GPU/RAM, uptime (`--status` also works; Ctrl+C to quit) |
+| `strata-coder -Status` | Live dashboard of the running server: tokens/sec for the current answer plus the average over all answers, context use, GPU/RAM, uptime — in a GUI window when the machine can display one, otherwise refreshing in place in the console (Ctrl+C or closing the window quits) |
+| `python status.py [port]` | Opens the status dashboard directly; port defaults to the saved one |
 | `strata-coder -Update` | Moves Strata, OpenCode, and ripgrep to their newest releases |
-| `strata-coder -Setup` | Interactive menu for the setup parameters (see below), then installs and configures everything and stops |
+| `strata-coder -Setup` | Setup-parameter menu (see below), then installs and configures everything and stops. Opens the GUI menu automatically when the machine can display one |
+| `python setup.py` | Opens the GUI setup window directly — same parameters as `-Setup` |
+| `strata-coder -NoGui` | Force the console versions of the setup menu and status dashboard |
 | `strata-coder -DataDir E:\models` | Puts the model files somewhere specific |
 | `strata-coder -Family coder -Model IQ1_M` | Overrides the automatic model choice |
 | `strata-coder -Context 65536` / `-Port 8081` | Sets the context size and server port |
 | `strata-coder -Kv q4_0` | Sets the KV cache quant: `int8` (default), `k8v4`, or `q4_0` |
-| `strata-coder -Offline` | Blocks OpenCode's web tools; `-Offline:$false` turns the block off |
+| `strata-coder -Offline` | Blocks OpenCode's web tools; `-Offline false` turns the block off |
 | `strata-coder -Alias` | Adds the permanent `scode` alias to the calling shell |
+| `strata-coder -Setup -NoAlias` | Console `-Setup` that skips the `scode` shortcut question |
 | `strata-coder -Help` | Shows all options (`--help` also works) |
 
 ## The `-Setup` menu
 
-`strata-coder -Setup` walks you through the setup parameters one by one. The menu uses
-[gum](https://github.com/charmbracelet/gum): it is downloaded once into `%LOCALAPPDATA%\strata-coder\gum\` if not already
-there, and if that download fails the plain text prompts are used instead. Pressing Enter keeps the displayed default,
-which is the value saved in `%LOCALAPPDATA%\strata-coder\setup.json` from a previous run (or the built-in default on
-the first run). A parameter given on the command line skips its question: `strata-coder -Setup -Port 8081` never asks
-for the port.
+`strata-coder -Setup` asks the setup parameters one by one through a menu: a **GUI window** when the machine can
+display one, otherwise a console menu with box-drawing frames, built from the shared menu text in
+`setup.py` — nothing extra to download.
+Force the console menu any time with `-NoGui`; `python setup.py` opens the GUI directly. In the console menu, move
+the `>` cursor with the **arrow keys** (or PgUp/PgDn), type a **digit** to
+jump to an option, and press **Enter** to pick it; the default of each question is marked `* default` and comes up
+pre-selected, and Esc keeps it. On redirected input or consoles that can't read raw keys, the menus fall back to
+plain prompts: press Enter to keep the default, type its number, or for the Variant and Context menus type a name
+(e.g. `IQ2_XS`, `64k`). The default is the value saved in `%LOCALAPPDATA%\strata-coder\setup.json` from a previous
+run (or the built-in default on the first run). A parameter given on the command line skips its question:
+`strata-coder -Setup -Port 8081` never asks for the port. If the console cannot display Unicode box characters,
+plain `+ - |` frames are used instead.
 
 1. **Variant** — pick a model by number or by name (e.g. `IQ2_XS`). The default is the best variant that fits this
    PC's RAM:
@@ -92,7 +108,8 @@ for the port.
    OpenCode, not a sandbox: its `bash` tool can still run network commands like `curl`. A hard block needs an outbound
    firewall rule for `opencode.exe`, which requires admin.
 7. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
-   Git Bash), the same as `strata-coder -Alias`. Open a new shell window afterwards to pick it up.
+   Git Bash), the same as `strata-coder -Alias`. Open a new shell window afterwards to pick it up. The GUI handles the
+   shortcut differently: it is an instant action there, not a question — see the GUI section.
 
 When the install finishes, `-Setup` prints a **memory stability** summary: the estimated peak RAM the
 server will use with your chosen variant, context, and KV cache (the KV cache size is measured from the
@@ -106,6 +123,36 @@ without starting the server or opening OpenCode; run `scode` afterwards to use i
 context or KV cache differs from what the model was configured with, the next run reconfigures the model in place
 (no re-download). The same parameters can also be set without the menu via `-Family`, `-Model`, `-Context`, `-Kv`,
 `-DataDir`, `-Port`, and `-Offline`.
+
+### The GUI menu
+
+The same menu also exists as one Tkinter window, opened directly with `python setup.py` or automatically by
+`strata-coder -Setup` when the machine can display one (it needs tkinter, which ships with the standard Python
+installers): variant dropdown (variants that don't fit this PC's RAM are marked), model folder with a **Browse…**
+button, context and KV-cache dropdowns, port, and an *Stay fully local* checkbox. Fields come up pre-filled from
+`setup.json`, and command-line parameters (e.g. `strata-coder -Setup -Port 8081`) pre-fill over the saved values.
+
+In the window the `scode` shortcut is an **action**, not a question: pick the shell (`auto`, `cmd`, `powershell` —
+`auto`, `bash`, `zsh` on Linux) and press **Set scode shortcut** to add it right away; an inline note confirms
+"open a new shell window to use it". Press it as often as you like — it replaces the previous entry.
+
+**OK** then starts `strata-coder -Setup` with every chosen parameter plus `-NoAlias -NoGui`, which saves the
+settings and runs the same install and configure steps and shows the memory-stability summary before stopping; when
+`-Setup` opens the window inside the script, this all continues in the same console afterwards. **Cancel** exits and
+changes nothing (a shortcut already set stays — it was an instant action).
+
+The questions, option labels, and hints for both menus live in `setup.py`, so the console menu and the window always
+ask exactly the same things.
+
+### The status dashboard
+
+`strata-coder -Status` (or `python status.py [port]`) shows the live server dashboard: tokens/sec for the current
+answer, the all-time average, context use, GPU/RAM, requests in flight, and uptime. When the machine can display
+one it opens as a GUI window — the border and the status line change color with server state (green while
+generating, yellow while busy, gray while idle) — and it keeps retrying on screen if the server goes away. Without a
+display it refreshes a box-drawing panel in place in the console, like before (Ctrl+C quits). `-NoGui` forces the
+console panel, and the port defaults to the saved one — or pass it: `python status.py 8081`. The code for both
+presentations lives in `status.py`.
 
 ## What it does
 
