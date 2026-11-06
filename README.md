@@ -19,11 +19,14 @@ This tool runs a local AI coding assistant: [OpenCode](https://opencode.ai), bac
    python D:\tools\strata_coder\strata-coder.py -Setup
    ```
 
-   It opens the setup menu — a GUI window when the machine can display one, otherwise a
-   box-drawing console menu (see "The `-Setup` menu" below) — then checks the PC, installs Strata
-   and OpenCode, downloads the model, and saves your answers. It stops without starting the server
-   or opening OpenCode. Open a new shell window afterwards if you added the `scode` shortcut, and
-   run `scode` to start using it.
+   It checks the PC, then opens the setup menu — a GUI window when the machine can display one,
+   otherwise a box-drawing console menu (see "The `-Setup` menu" below). With the GUI the command
+   finishes right away and the window opens in the background: press **OK** and the install runs in
+   its own console window — Strata and OpenCode get installed, the model gets downloaded, and your
+   answers get saved; it stops without starting the server or opening OpenCode. Closing the window
+   or pressing Cancel changes nothing. In the console menu the questions are asked in the terminal
+   and the install follows directly. Either way, open a new shell window afterwards if you added
+   the `scode` shortcut, and run `scode` to start using it.
 
 The repo is three scripts that must stay in the same folder: `strata-coder.py` (the command
 itself), `setup.py` (the setup menu, its GUI, and all the menu text), and `status.py` (the status
@@ -128,17 +131,19 @@ context or KV cache differs from what the model was configured with, the next ru
 
 The same menu also exists as one Tkinter window, opened directly with `python setup.py` or automatically by
 `strata-coder -Setup` when the machine can display one (it needs tkinter, which ships with the standard Python
-installers): variant dropdown (variants that don't fit this PC's RAM are marked), model folder with a **Browse…**
-button, context and KV-cache dropdowns, port, and an *Stay fully local* checkbox. Fields come up pre-filled from
-`setup.json`, and command-line parameters (e.g. `strata-coder -Setup -Port 8081`) pre-fill over the saved values.
+installers). The window opens **detached**: the command you typed finishes right away and the window lives on its
+own, so your terminal is free; close the window to back out. The form has a variant dropdown (variants that don't
+fit this PC's RAM are marked), model folder with a **Browse…** button, context and KV-cache dropdowns, port, and
+an *Stay fully local* checkbox. Fields come up pre-filled from `setup.json`, and command-line parameters (e.g.
+`strata-coder -Setup -Port 8081`) pre-fill over the saved values.
 
 In the window the `scode` shortcut is an **action**, not a question: pick the shell (`auto`, `cmd`, `powershell` —
 `auto`, `bash`, `zsh` on Linux) and press **Set scode shortcut** to add it right away; an inline note confirms
 "open a new shell window to use it". Press it as often as you like — it replaces the previous entry.
 
-**OK** then starts `strata-coder -Setup` with every chosen parameter plus `-NoAlias -NoGui`, which saves the
-settings and runs the same install and configure steps and shows the memory-stability summary before stopping; when
-`-Setup` opens the window inside the script, this all continues in the same console afterwards. **Cancel** exits and
+**OK** then starts `strata-coder -Setup` with every chosen parameter plus `-NoAlias -NoGui` in its own console
+window (a new one on Windows, a terminal window on Linux), which saves the settings, runs the install and configure
+steps, and shows the memory-stability summary before stopping. Closing the window or pressing **Cancel** exits and
 changes nothing (a shortcut already set stays — it was an instant action).
 
 The questions, option labels, and hints for both menus live in `setup.py`, so the console menu and the window always

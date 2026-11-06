@@ -16,7 +16,9 @@ action, not an option: its button takes effect the moment it is pressed.
 
 import ctypes
 import importlib.util
+import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -368,19 +370,27 @@ def run_setup_gui(sc, overrides=None):
     return outcome.get("result")
 
 
-def main():
-    if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w")
+CHILD_ENV = "STRATA_SETUP_GUI_CHILD"
 
-    if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w")
 
-    sc = load_cli()
-    result = run_setup_gui(sc)
+def spawn_detached_gui(overrides=None):
+    env = dict(os.environ)
+    env[CHILD_ENV] = json.dumps(overrides or {})
 
-    if result is None:
-        return
+    options = {"env": env,
+               "stdin": subprocess.DEVNULL,
+               "stdout": subprocess.DEVNULL,
+               "stderr": subprocess.DEVNULL}
 
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    else:
+        options["start_new_session"] = True
+
+    subprocess.Popen([sys.executable, os.path.abspath(__file__)], **options)
+
+
+def apply_setup(sc, result):
     command = [
         sys.executable, CLI_PATH, "-Setup",
         "-Family", result["family"],
@@ -396,10 +406,44 @@ def main():
 
     options = {}
 
-    if sc.IS_WINDOWS and ctypes.windll.kernel32.GetConsoleWindow() == 0:
-        options["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+    if sc.IS_WINDOWS:
+        if ctypes.windll.kernel32.GetConsoleWindow() == 0:
+            options["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+    else:
+        for terminal in ("x-terminal-emulator", "xterm"):
+            path = shutil.which(terminal)
+
+            if path:
+                command = [path, "-e"] + command
+                break
+
+        options["start_new_session"] = True
 
     subprocess.Popen(command, **options)
+
+
+def main():
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+
+    if os.environ.get(CHILD_ENV) is None:
+        if not is_available():
+            raise SystemExit("no display available for the setup window - run: "
+                             "python strata-coder.py -Setup -NoGui")
+
+        spawn_detached_gui()
+        return
+
+    sc = load_cli()
+    result = run_setup_gui(sc, json.loads(os.environ[CHILD_ENV]))
+
+    if result is None:
+        return
+
+    apply_setup(sc, result)
 
 
 if __name__ == "__main__":

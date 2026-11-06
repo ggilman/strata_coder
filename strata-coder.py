@@ -1162,7 +1162,7 @@ def run_setup_menu(state):
     menu = load_setup()
 
     if state["no_gui"] or not menu.is_available():
-        return
+        return False
 
     overrides = {}
 
@@ -1184,29 +1184,11 @@ def run_setup_menu(state):
     if state["offline_specified"]:
         overrides["offline"] = state["offline"]
 
-    write_step("Opening the setup window")
+    menu.spawn_detached_gui(overrides)
 
-    result = menu.run_setup_gui(sys.modules[__name__], overrides)
-
-    if result is None:
-        write_warn("setup canceled from the setup window; nothing was changed")
-        sys.exit(0)
-
-    state["family"] = result["family"]
-    state["model"] = result["model"]
-    state["data_dir"] = result["dataDir"]
-    state["data_dir_specified"] = True
-    state["context"] = result["context"]
-    state["context_specified"] = True
-    state["kv"] = result["kv"]
-    state["kv_specified"] = True
-    state["port"] = result["port"]
-    state["port_specified"] = True
-    state["offline"] = result["offline"]
-    state["offline_specified"] = True
-    state["no_alias"] = True
-
-    write_step("Setup window closed; continuing with the chosen values in this console")
+    write_step("Setup window opened in the background - this command finished; press OK in the window "
+               "and the install runs in its own console window")
+    return True
 
 
 def _interactive_available():
@@ -2507,7 +2489,9 @@ def main():
         saved_setup = read_json(SETUP_PATH)
 
         if state["setup"] and not state["check_only"]:
-            run_setup_menu(state)
+            if run_setup_menu(state):
+                sys.exit(0)
+
             saved_setup = prompt_setup_params(spec, state)
         elif state["setup"]:
             write_warn("the -Setup menu was skipped because -CheckOnly changes nothing")
