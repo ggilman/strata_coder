@@ -149,10 +149,11 @@ ask exactly the same things.
 `strata-coder -Status` (or `python status.py [port]`) shows the live server dashboard: tokens/sec for the current
 answer, the all-time average, context use, GPU/RAM, requests in flight, and uptime. When the machine can display
 one it opens as a GUI window — the border and the status line change color with server state (green while
-generating, yellow while busy, gray while idle) — and it keeps retrying on screen if the server goes away. Without a
-display it refreshes a box-drawing panel in place in the console, like before (Ctrl+C quits). `-NoGui` forces the
-console panel, and the port defaults to the saved one — or pass it: `python status.py 8081`. The code for both
-presentations lives in `status.py`.
+generating, yellow while busy, gray while idle) — and it keeps retrying on screen if the server goes away. The GUI
+opens detached: the window appears and the command finishes right away, so your terminal is free while the window
+runs on its own. Without a display it refreshes a box-drawing panel in place in the console, like before (Ctrl+C
+quits). `-NoGui` forces the console panel, and the port defaults to the saved one — or pass it:
+`python status.py 8081`. The code for both presentations lives in `status.py`.
 
 ## What it does
 

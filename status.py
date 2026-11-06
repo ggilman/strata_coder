@@ -370,11 +370,39 @@ def show_status_window(sc, server_port):
 # Entry points
 # ----------------------------------------------------------------------------------------------------
 
-def run_status(sc, server_port, no_gui=False):
-    if not no_gui and is_available():
-        show_status_window(sc, server_port)
+CHILD_ENV = "STRATA_STATUS_GUI_CHILD"
+
+
+def spawn_detached_gui(server_port):
+    import subprocess
+
+    env = dict(os.environ)
+    env[CHILD_ENV] = "1"
+
+    options = {"env": env,
+               "stdin": subprocess.DEVNULL,
+               "stdout": subprocess.DEVNULL,
+               "stderr": subprocess.DEVNULL}
+
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     else:
+        options["start_new_session"] = True
+
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), str(server_port)], **options)
+
+
+def run_status(sc, server_port, no_gui=False):
+    if no_gui or not is_available():
         show_status_panel(sc, server_port)
+        return
+
+    if os.environ.get(CHILD_ENV) == "1":
+        show_status_window(sc, server_port)
+        return
+
+    spawn_detached_gui(server_port)
+    sc.write_step("status window opened in the background - the command finished; close the window to quit")
 
 
 def main():
