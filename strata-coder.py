@@ -12,6 +12,7 @@ Modes:
 
 import argparse
 import atexit
+import base64
 import ctypes
 import fnmatch
 import glob
@@ -86,6 +87,8 @@ WSL_SANDBOX_USER = "sandbox"
 WSL_SCRIPT_DIR = "/usr/local/lib/strata-wsl"
 WSL_LAUNCHER_PATH = WSL_SCRIPT_DIR + "/launch.sh"
 WSL_PROBE_PATH = WSL_SCRIPT_DIR + "/probe.sh"
+WSL_NSPAWN_SCRIPT = "/tmp/strata-wsl-nspawn.sh"
+WSL_EXTRAS_PATH = "/tmp/strata-wsl-extras"
 WSL_DEBIAN_SUITE = "bookworm"
 WSL_DEBIAN_MIRROR = "http://deb.debian.org/debian"
 WSL_DISTRO_ENV = "STRATA_WSL_DISTRO"
@@ -3075,10 +3078,21 @@ server = Server(SOCK_PATH, Handler)
 server.serve_forever()
 '''
 
+# wsl.exe re-parses the command line it forwards to a distro (and can expand $ and split on
+# spaces), so the project path and the JSON env block never appear as arguments: the wrapper is a
+# pushed script that base64-decodes the extra nspawn options, one per line, from WSL_EXTRAS_PATH and
+# assembles them. Only the container command (launcher path, numeric port, sanitized mount) stays
+# on the wsl.exe command line.
 WSL_NSPAWN_WRAPPER = (
     "#!/bin/bash\n"
     "export SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1\n"
-    "exec systemd-nspawn \"$@\"\n"
+    "base=(--directory=%(rootfs)s --machine=strata-coder --register=no --private-network "
+    "--bind=%(relay)s:%(relay)s)\n"
+    "extras=()\n"
+    "if [ -s '%(extras)s' ]; then\n"
+    "  while IFS= read -r line; do extras+=(\"$(printf '%%s' \"$line\" | base64 -d)\"); done < '%(extras)s'\n"
+    "fi\n"
+    "exec systemd-nspawn \"${base[@]}\" \"${extras[@]}\" -- \"$@\"\n"
 )
 
 # wsl.exe re-parses the command line it hands to a distro and expands $ variables on the way in,
@@ -3292,18 +3306,21 @@ def ensure_wsl_rootfs(wsl, distro, avx2):
 def wsl_push_runtime_files(wsl, distro):
     relay_path = os.path.join(WSL_DIR, "relay.py")
     write_text_file(relay_path, WSL_RELAY_PY)
-    wrapper_path = os.path.join(WSL_DIR, "nspawn-wrapper.sh")
-    write_text_file(wrapper_path, WSL_NSPAWN_WRAPPER)
     launcher_path = os.path.join(WSL_DIR, "launcher.sh")
     write_text_file(launcher_path, WSL_LAUNCHER_SH)
     probe_path = os.path.join(WSL_DIR, "probe.sh")
     write_text_file(probe_path, WSL_PROBE_SH)
+    wrapper = WSL_NSPAWN_WRAPPER % {"rootfs": WSL_ROOTFS, "relay": WSL_RELAY_DIR,
+                                    "extras": WSL_EXTRAS_PATH}
+    wrapper_path = os.path.join(WSL_DIR, "nspawn-wrapper.sh")
+    write_text_file(wrapper_path, wrapper)
 
     script = (
         "set -e\n"
         "tr -d '\\r' < '%(relay)s' > /tmp/strata-wsl-relay.py\n"
-        "tr -d '\\r' < '%(wrapper)s' > /tmp/strata-wsl-nspawn.sh\n"
-        "chmod +x /tmp/strata-wsl-nspawn.sh\n"
+        "tr -d '\\r' < '%(wrapper)s' > '%(nspawn)s'\n"
+        "chmod +x '%(nspawn)s'\n"
+        "rm -f '%(extras)s'\n"
         "mkdir -p '%(relay_dir)s'\n"
         "mkdir -p '%(rootfs)s%(script_dir)s'\n"
         "tr -d '\\r' < '%(launcher)s' > '%(rootfs)s%(launcher_in)s'\n"
@@ -3313,7 +3330,8 @@ def wsl_push_runtime_files(wsl, distro):
         "mkdir -p '%(home)s'\n"
         "chown \"$uid:$uid\" '%(home)s'\n"
     ) % {"relay": wsl_wslpath(relay_path), "wrapper": wsl_wslpath(wrapper_path),
-         "relay_dir": WSL_RELAY_DIR, "script_dir": WSL_SCRIPT_DIR,
+         "nspawn": WSL_NSPAWN_SCRIPT, "relay_dir": WSL_RELAY_DIR, "script_dir": WSL_SCRIPT_DIR,
+         "extras": WSL_EXTRAS_PATH,
          "launcher": wsl_wslpath(launcher_path), "probe": wsl_wslpath(probe_path),
          "launcher_in": WSL_LAUNCHER_PATH, "probe_in": WSL_PROBE_PATH,
          "rootfs": WSL_ROOTFS, "user": WSL_SANDBOX_USER, "home": WSL_HOME}
@@ -3359,15 +3377,24 @@ def wsl_start_relay(wsl, distro, port):
 
 
 def wsl_nspawn_base(wsl, distro):
-    return [wsl, "-d", distro, "-u", "root", "--", "bash", "/tmp/strata-wsl-nspawn.sh",
-            "--directory=%s" % WSL_ROOTFS, "--machine=strata-coder", "--register=no", "--private-network",
-            "--bind=%s:%s" % (WSL_RELAY_DIR, WSL_RELAY_DIR)]
+    return [wsl, "-d", distro, "-u", "root", "--", "bash", WSL_NSPAWN_SCRIPT]
 
 
 def wsl_models_reachable(wsl, distro, port):
-    probe = wsl_nspawn_base(wsl, distro) + ["--", WSL_PROBE_PATH, str(port)]
+    probe = wsl_nspawn_base(wsl, distro) + [WSL_PROBE_PATH, str(port)]
     proc = subprocess.run(probe, capture_output=True, text=True, errors="replace")
     return proc.returncode == 0
+
+
+def wsl_write_extras(wsl, distro, extras):
+    path = os.path.join(WSL_DIR, "extras.txt")
+    body = "".join("%s\n" % base64.b64encode(item.encode("utf-8")).decode("ascii") for item in extras)
+    write_text_file(path, body)
+    script = "tr -d '\\r' < '%s' > '%s'\n" % (wsl_wslpath(path), WSL_EXTRAS_PATH)
+    proc = wsl_run_script(wsl, distro, script, "extras")
+
+    if proc.returncode:
+        fail("the WSL sandbox mount options could not be prepared (%s)." % (wsl_tail(proc) or "unknown error"))
 
 
 def run_opencode_wsl(handle, port, open_code_json):
@@ -3395,19 +3422,19 @@ def run_opencode_wsl(handle, port, open_code_json):
         mount = sandbox_mount_path(PROJECT_DIR)
         sandbox_json = sandbox_config_content(open_code_json, "http://127.0.0.1", port)
 
-        env_args = []
         no_proxy = "127.0.0.1,localhost"
+        extras = ["--bind=%s:%s" % (wsl_wslpath(PROJECT_DIR), mount),
+                  "--bind=%s:/home/sandbox" % WSL_HOME]
 
         for name, value in (("OPENCODE_CONFIG_CONTENT", sandbox_json),
                             ("HTTP_PROXY", OFFLINE_PROXY_URL), ("HTTPS_PROXY", OFFLINE_PROXY_URL),
                             ("http_proxy", OFFLINE_PROXY_URL), ("https_proxy", OFFLINE_PROXY_URL),
                             ("NO_PROXY", no_proxy), ("no_proxy", no_proxy)):
-            env_args.append("--setenv=%s=%s" % (name, value))
+            extras.append("--setenv=%s=%s" % (name, value))
 
-        arguments = wsl_nspawn_base(wsl, distro) + \
-                    ["--bind=%s:%s" % (wsl_wslpath(PROJECT_DIR), mount),
-                     "--bind=%s:/home/sandbox" % WSL_HOME] + \
-                    env_args + ["--", WSL_LAUNCHER_PATH, str(port), mount]
+        wsl_write_extras(wsl, distro, extras)
+
+        arguments = wsl_nspawn_base(wsl, distro) + [WSL_LAUNCHER_PATH, str(port), mount]
 
         write_info("project folder mounted at %s (read-write)" % mount)
         rc = subprocess.run(arguments).returncode
