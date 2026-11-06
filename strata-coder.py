@@ -3085,7 +3085,10 @@ WSL_NSPAWN_WRAPPER = (
 # so everything a container command needs lives in these pushed files, never in an inline
 # "sh -c" argument. The port arrives as argument 1.
 
+# argument 2 is the mounted project folder: systemd-nspawn has no --working-directory option and
+# its --chdir= needs systemd 257, so the working directory is set inside this script instead.
 WSL_LAUNCHER_SH = '''#!/bin/sh
+cd "$2" || exit 1
 socat TCP-LISTEN:"$1",fork,reuseaddr UNIX-CONNECT:/run/strata-coder-wsl/relay.sock &
 SPID=$!
 sleep 1
@@ -3402,13 +3405,15 @@ def run_opencode_wsl(handle, port, open_code_json):
             env_args.append("--setenv=%s=%s" % (name, value))
 
         arguments = wsl_nspawn_base(wsl, distro) + \
-                    ["--working-directory=%s" % mount,
-                     "--bind=%s:%s" % (wsl_wslpath(PROJECT_DIR), mount),
+                    ["--bind=%s:%s" % (wsl_wslpath(PROJECT_DIR), mount),
                      "--bind=%s:/home/sandbox" % WSL_HOME] + \
-                    env_args + ["--", WSL_LAUNCHER_PATH, str(port)]
+                    env_args + ["--", WSL_LAUNCHER_PATH, str(port), mount]
 
         write_info("project folder mounted at %s (read-write)" % mount)
-        subprocess.run(arguments)
+        rc = subprocess.run(arguments).returncode
+
+        if rc:
+            write_warn("the WSL container exited with code %d" % rc)
     finally:
         reset_terminal_mouse()
         wsl_stop_relay(wsl, distro)
