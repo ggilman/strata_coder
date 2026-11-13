@@ -28,8 +28,10 @@ CLI_PATH = os.path.join(HERE, "strata-coder.py")
 # ----------------------------------------------------------------------------------------------------
 
 STATUS_RETRIES = 3
+POLL_SECONDS = 2
+POLL_MS = POLL_SECONDS * 1000
 PANEL_TITLE = " Strata speed  %s  %s "
-PANEL_HINT = " Ctrl+C quits - updates every 2 s at %s"
+PANEL_HINT = " Ctrl+C quits - updates every %d s at %%s" % POLL_SECONDS
 
 LIVE_ANSI = {"Green": "\033[32m", "Yellow": "\033[33m", "DarkGray": "\033[90m"}
 LIVE_GUI = {"Green": "#1a9e3f", "Yellow": "#b58900", "DarkGray": "#8a8a8a"}
@@ -40,9 +42,9 @@ BAR_BORDER_GUI = "#cfcfcf"
 BAR_WIDTH = 16
 BAR_UNI = ("\u2588", "\u2591")
 BAR_ASC = ("#", "-")
-GUI_HINT = "updates every 2 s at %s - close this window to quit"
-NO_SERVER_TEXT = "no Strata server is answering on port %d - retrying every 2 s"
-LOST_TEXT = "lost the connection to the server (%s) - retrying every 2 s"
+GUI_HINT = "updates every %d s at %%s - close this window to quit" % POLL_SECONDS
+NO_SERVER_TEXT = "no Strata server is answering on port %%d - retrying every %d s" % POLL_SECONDS
+LOST_TEXT = "lost the connection to the server (%%s) - retrying every %d s" % POLL_SECONDS
 
 
 def bar_glyphs():
@@ -84,25 +86,6 @@ def load_cli():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def is_available():
-    try:
-        import tkinter as tk
-    except ImportError:
-        return False
-
-    try:
-        root = tk.Tk()
-    except Exception:
-        return False
-
-    try:
-        root.destroy()
-    except Exception:
-        pass
-
-    return True
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -305,7 +288,7 @@ def show_status_panel(sc, server_port):
                 if failures >= STATUS_RETRIES:
                     sc.fail("lost the connection to the server (%s)" % exc)
 
-                time.sleep(2)
+                time.sleep(POLL_SECONDS)
                 continue
 
             failures = 0
@@ -342,7 +325,7 @@ def show_status_panel(sc, server_port):
             panel_top_drawn = True
             previous_lines = block.count("\n")
 
-            time.sleep(2)
+            time.sleep(POLL_SECONDS)
     except KeyboardInterrupt:
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -553,6 +536,7 @@ def show_status_window(sc, server_port):
         except BaseException:
             with poll_lock:
                 latest_poll["in_flight"] = False
+            root.after(POLL_MS, start_poll)
 
     def check_poll():
         ready = False
@@ -564,12 +548,12 @@ def show_status_window(sc, server_port):
                 ready = True
         if ready:
             render_poll_result(data, exc)
-            root.after(2000, start_poll)
+            root.after(POLL_MS, start_poll)
         root.after(100, check_poll)
 
     initial_data, initial_exc = poll_once(base)
     render_poll_result(initial_data, initial_exc)
-    root.after(2000, start_poll)
+    root.after(POLL_MS, start_poll)
     root.after(100, check_poll)
 
     try:
@@ -590,27 +574,8 @@ def show_status_window(sc, server_port):
 CHILD_ENV = "STRATA_STATUS_GUI_CHILD"
 
 
-def spawn_detached_gui(server_port):
-    import subprocess
-
-    env = dict(os.environ)
-    env[CHILD_ENV] = "1"
-
-    options = {"env": env,
-               "stdin": subprocess.DEVNULL,
-               "stdout": subprocess.DEVNULL,
-               "stderr": subprocess.DEVNULL}
-
-    if os.name == "nt":
-        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    else:
-        options["start_new_session"] = True
-
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), str(server_port)], **options)
-
-
 def run_status(sc, server_port, no_gui=False):
-    if no_gui or not is_available():
+    if no_gui or not sc.is_available():
         show_status_panel(sc, server_port)
         return
 
@@ -618,7 +583,7 @@ def run_status(sc, server_port, no_gui=False):
         show_status_window(sc, server_port)
         return
 
-    spawn_detached_gui(server_port)
+    sc.spawn_detached_gui(os.path.abspath(__file__), {CHILD_ENV: "1"}, [str(server_port)])
     sc.write_step("status window opened in the background - the command finished; close the window to quit")
 
 
@@ -639,17 +604,7 @@ def main():
 
     sc = load_cli()
 
-    port = args.port
-
-    if port is None:
-        port = 8080
-        status_setup = sc.read_json(sc.SETUP_PATH)
-
-        if status_setup:
-            status_port = sc.get_int_setting(status_setup.get("port"), 0)
-
-            if status_port > 0:
-                port = status_port
+    port = args.port if args.port is not None else sc.saved_setup_port()
 
     run_status(sc, port, args.no_gui)
 

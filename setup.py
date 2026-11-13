@@ -383,8 +383,8 @@ def variant_info_text(sc, variant, grade, note, ram_gb, is_best, fastest, peers)
                  % (variant["download_gb"], variant["arena_gb"]))
     lines.append("Needs about %d GB RAM; this PC has %s GB."
                  % (variant["min_ram_gb"], ram_gb))
-    lines.append("Trained context: 262144 tokens (256k); beyond that Strata stretches it with "
-                 "YaRN and answers get weaker.")
+    lines.append("Trained context: %d tokens (%dk); beyond that Strata stretches it with "
+                 "YaRN and answers get weaker." % (TRAINED_CONTEXT, TRAINED_CONTEXT // 1024))
 
     nudge = speed_nudge(variant, peers, ram_gb).strip()
 
@@ -409,25 +409,6 @@ def load_cli():
     return module
 
 
-def is_available():
-    try:
-        import tkinter as tk
-    except ImportError:
-        return False
-
-    try:
-        root = tk.Tk()
-    except Exception:
-        return False
-
-    try:
-        root.destroy()
-    except Exception:
-        pass
-
-    return True
-
-
 def run_setup_gui(sc, overrides=None):
     """Show the setup window and return the chosen settings dict, or None on Cancel.
 
@@ -443,19 +424,7 @@ def run_setup_gui(sc, overrides=None):
     saved = sc.read_json(sc.SETUP_PATH) or {}
     ram_gb = sc._ram_gb()
 
-    default_data_dir = overrides.get("dataDir") or ""
-
-    if not default_data_dir and saved.get("dataDir"):
-        default_data_dir = saved["dataDir"]
-
-    if not default_data_dir:
-        prior = sc.read_json(sc.STRATA_SETTINGS_PATH)
-
-        if prior and prior.get("data_dir") and os.path.exists(prior["data_dir"]):
-            default_data_dir = prior["data_dir"]
-
-    if not default_data_dir:
-        default_data_dir = os.path.join(os.path.expanduser("~"), "ai-models", "models")
+    default_data_dir = overrides.get("dataDir") or sc.default_model_folder(saved)
 
     default_context = overrides.get("context")
 
@@ -463,7 +432,7 @@ def run_setup_gui(sc, overrides=None):
         default_context = sc.get_int_setting(saved.get("context"), 0)
 
     default_kv = overrides.get("kv") or str(saved.get("kv") or "int8")
-    default_port = overrides.get("port") or sc.get_int_setting(saved.get("port"), 8080) or 8080
+    default_port = overrides.get("port") or sc.saved_setup_port(saved)
 
     default_isolation = sc.saved_isolation(saved)
 
@@ -473,25 +442,10 @@ def run_setup_gui(sc, overrides=None):
     if default_isolation == "wsl" and os.name != "nt":
         default_isolation = "none"
 
-    default_variant = None
+    family, model = overrides["variant"] if "variant" in overrides else ("", "")
 
-    if "variant" in overrides:
-        family, model = overrides["variant"]
-        candidates = [v for v in sc.VARIANTS
-                      if (not family or v["family"] == family)
-                      and (not model or v["model"] == model)]
-
-        if candidates:
-            default_variant = sc.pick_best_variant(candidates, ram_gb) or candidates[0]
-
-    if not default_variant and saved.get("family") and saved.get("model"):
-        default_variant = next(
-            (v for v in sc.VARIANTS
-             if v["family"] == saved["family"] and v["model"] == saved["model"]),
-            None)
-
-    if not default_variant:
-        default_variant = sc.pick_best_variant(sc.VARIANTS, ram_gb) or sc.VARIANTS[0]
+    default_variant = sc.pick_variant_default(family, model, saved, ram_gb) or \
+        sc.pick_best_variant(sc.VARIANTS, ram_gb) or sc.VARIANTS[0]
 
     context_values = {}
     context_labels = []
@@ -781,8 +735,10 @@ def run_setup_gui(sc, overrides=None):
 
         port_text = port_var.get().strip()
 
-        if not port_text.isdecimal() or not 1 <= int(port_text) <= 65535:
-            messagebox.showerror("Strata Coder setup", "Port must be a number from 1 through 65535.")
+        if not port_text.isdecimal() or not sc.PORT_MIN <= int(port_text) <= sc.PORT_MAX:
+            messagebox.showerror("Strata Coder setup",
+                                 "Port must be a number from %d through %d."
+                                 % (sc.PORT_MIN, sc.PORT_MAX))
             return
 
         outcome["result"] = {
@@ -811,23 +767,6 @@ def run_setup_gui(sc, overrides=None):
 
 
 CHILD_ENV = "STRATA_SETUP_GUI_CHILD"
-
-
-def spawn_detached_gui(overrides=None):
-    env = dict(os.environ)
-    env[CHILD_ENV] = json.dumps(overrides or {})
-
-    options = {"env": env,
-               "stdin": subprocess.DEVNULL,
-               "stdout": subprocess.DEVNULL,
-               "stderr": subprocess.DEVNULL}
-
-    if os.name == "nt":
-        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
-    else:
-        options["start_new_session"] = True
-
-    subprocess.Popen([sys.executable, os.path.abspath(__file__)], **options)
 
 
 def apply_setup(sc, result):
@@ -869,15 +808,16 @@ def main():
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 
+    sc = load_cli()
+
     if os.environ.get(CHILD_ENV) is None:
-        if not is_available():
+        if not sc.is_available():
             raise SystemExit("no display available for the setup window - run: "
                              "python strata-coder.py -Setup -NoGui")
 
-        spawn_detached_gui()
+        sc.spawn_detached_gui(os.path.abspath(__file__), {CHILD_ENV: "{}"})
         return
 
-    sc = load_cli()
     result = run_setup_gui(sc, json.loads(os.environ[CHILD_ENV]))
 
     if result is None:

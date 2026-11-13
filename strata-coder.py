@@ -77,6 +77,7 @@ SANDBOX_CONTAINER = "strata-coder-opencode"
 SANDBOX_HOME_VOLUME = "strata-coder-opencode-home"
 SANDBOX_RELAY = "strata-coder-relay"
 SANDBOX_RELAY_IMAGE = "alpine/socat:latest"
+SANDBOX_RELAY_PORT = 8080
 
 WSL_DIR = os.path.join(APP_DIR, "wsl")
 WSL_ROOTFS = "/var/lib/machines/strata-coder"
@@ -240,11 +241,12 @@ SSD_BUDGET_RAM_GB = 80
 # OpenCode inside a container with no internet; wsl = the same container wall run by systemd-nspawn
 # inside a systemd-enabled WSL 2 distro on Windows, with no container engine installed at all.
 ISOLATION_CHOICES = ["none", "local", "docker", "podman", "wsl"]
-ISOLATION_LABELS = {"none": "None", "local": "Local Only", "docker": "Docker",
-                    "podman": "Podman", "wsl": "WSL Containers"}
 CONTAINER_ISOLATIONS = ("docker", "podman")
 
 LOG_KEEP = 20
+DEFAULT_PORT = 8080
+PORT_MIN = 1
+PORT_MAX = 65535
 DEFAULT_CONTEXT_LIMIT = 131072
 MAX_OUTPUT_LIMIT = 32768
 MIN_OUTPUT_LIMIT = 256
@@ -272,7 +274,7 @@ def _enable_virt_terminal():
 COLOR_ON = sys.stdout.isatty() and (not IS_WINDOWS or _enable_virt_terminal())
 
 RESET, CYAN, GREEN, GRAY, YELLOW, RED, DARKGRAY = (
-    "\033[0m", "\033[36m", "\033[32m", "\033[90m", "\033[33m", "\033[31m", "\033[90m",
+    "\033[0m", "\033[36m", "\033[32m", "\033[37m", "\033[33m", "\033[31m", "\033[90m",
 )
 
 GRADE_COLORS = {"green": GREEN, "yellow": YELLOW, "red": RED}
@@ -397,6 +399,29 @@ def saved_isolation(saved):
     return "none"
 
 
+def default_model_folder(saved):
+    """The model folder default: saved setup.json, else Strata's last data_dir if it
+    still exists, else the ai-models default."""
+    if saved and saved.get("dataDir"):
+        return saved["dataDir"]
+
+    prior = read_json(STRATA_SETTINGS_PATH)
+
+    if prior and prior.get("data_dir") and os.path.exists(prior["data_dir"]):
+        return prior["data_dir"]
+
+    return os.path.join(os.path.expanduser("~"), "ai-models", "models")
+
+
+def saved_setup_port(saved=None):
+    """The server port saved in setup.json, or DEFAULT_PORT."""
+    if saved is None:
+        saved = read_json(SETUP_PATH)
+
+    port = get_int_setting((saved or {}).get("port"), 0)
+    return port if port > 0 else DEFAULT_PORT
+
+
 def grade_variant(variant, ram_gb):
     """('green' | 'yellow' | 'red', the reason) for this PC's RAM: green runs at full speed,
     yellow runs with a cost, red will not run."""
@@ -429,6 +454,30 @@ def pick_best_variant(candidates, ram_gb):
         return max(comfortable, key=lambda c: c["quality"])
 
     return fitting[0]
+
+
+def variants_for(family, model):
+    return [v for v in VARIANTS
+            if (not family or v["family"] == family)
+            and (not model or v["model"] == model.upper())]
+
+
+def pick_variant_default(family, model, saved, ram_gb):
+    """The variant the -Family/-Model overrides point at, else the saved setup.json pair,
+    else None: the caller picks its own final fallback."""
+    if family or model:
+        candidates = variants_for(family, model)
+
+        if candidates:
+            return pick_best_variant(candidates, ram_gb) or candidates[0]
+
+    if saved and saved.get("family") and saved.get("model"):
+        return next(
+            (v for v in VARIANTS
+             if v["family"] == saved["family"] and v["model"] == saved["model"]),
+            None)
+
+    return None
 
 
 def close_session_resources():
@@ -842,7 +891,7 @@ def strata_server_processes():
 
 def server_port(process):
     match = re.search(r"--port\s+\"?(\d+)", process["command"])
-    return int(match.group(1)) if match else 8080
+    return int(match.group(1)) if match else DEFAULT_PORT
 
 
 def stop_strata_servers(on_port=0):
@@ -925,13 +974,7 @@ def wait_strata_ready(process, server_port):
 # ----------------------------------------------------------------------------------------------------
 
 def get_candidates(family_filter, model_filter):
-    candidates = list(VARIANTS)
-
-    if family_filter:
-        candidates = [c for c in candidates if c["family"] == family_filter]
-
-    if model_filter:
-        candidates = [c for c in candidates if c["model"] == model_filter.upper()]
+    candidates = variants_for(family_filter, model_filter)
 
     if not candidates:
         known = ", ".join("%s/%s" % (v["family"], v["model"]) for v in VARIANTS)
@@ -1334,10 +1377,48 @@ def load_status():
     return load_companion(STATUS_PATH, "strata_status_panel", "to show the status panel")
 
 
+def is_available():
+    try:
+        import tkinter as tk
+    except ImportError:
+        return False
+
+    try:
+        root = tk.Tk()
+    except Exception:
+        return False
+
+    try:
+        root.destroy()
+    except Exception:
+        pass
+
+    return True
+
+
+def spawn_detached_gui(script_path, env_vars=None, extra_args=None):
+    env = dict(os.environ)
+
+    if env_vars:
+        env.update(env_vars)
+
+    options = {"env": env,
+               "stdin": subprocess.DEVNULL,
+               "stdout": subprocess.DEVNULL,
+               "stderr": subprocess.DEVNULL}
+
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+    else:
+        options["start_new_session"] = True
+
+    subprocess.Popen([sys.executable, script_path] + list(extra_args or ()), **options)
+
+
 def run_setup_menu(state):
     menu = load_setup()
 
-    if state["no_gui"] or not menu.is_available():
+    if state["no_gui"] or not is_available():
         return False
 
     overrides = {}
@@ -1360,7 +1441,7 @@ def run_setup_menu(state):
     if state["isolation_specified"]:
         overrides["isolation"] = state["isolation"]
 
-    menu.spawn_detached_gui(overrides)
+    spawn_detached_gui(MENU_PATH, {menu.CHILD_ENV: json.dumps(overrides)})
 
     write_step("Setup window opened in the background - this command finished; press OK in the window "
                "and the install runs in its own console window")
@@ -1625,10 +1706,11 @@ def prompt_port(header, default_port):
 
         number = get_int_setting(answer, 0)
 
-        if 1 <= number <= 65535:
+        if PORT_MIN <= number <= PORT_MAX:
             return number
 
-        write_warn("Enter a port number from 1 through 65535 or leave the field blank.")
+        write_warn("Enter a port number from %d through %d or leave the field blank."
+                   % (PORT_MIN, PORT_MAX))
 
 
 def prompt_yes_no(message, default):
@@ -1664,37 +1746,14 @@ def prompt_setup_params(spec, state):
     menu = load_setup()
     saved = read_json(SETUP_PATH)
 
-    default_data_dir = None
+    default_data_dir = state["data_dir"] if state["data_dir_specified"] and state["data_dir"] \
+        else default_model_folder(saved)
 
-    if state["data_dir_specified"] and state["data_dir"]:
-        default_data_dir = state["data_dir"]
-    elif saved and saved.get("dataDir"):
-        default_data_dir = saved["dataDir"]
-
-    if not default_data_dir:
-        prior_settings = read_json(STRATA_SETTINGS_PATH)
-
-        if prior_settings and prior_settings.get("data_dir") and os.path.exists(prior_settings["data_dir"]):
-            default_data_dir = prior_settings["data_dir"]
-
-    if not default_data_dir:
-        default_data_dir = os.path.join(os.path.expanduser("~"), "ai-models", "models")
-
-    default_context = 0
-    default_kv = "int8"
-    default_port = 8080
+    default_context = get_int_setting((saved or {}).get("context"), 0)
+    default_kv = str(saved.get("kv")) if saved and saved.get("kv") else "int8"
     default_isolation = saved_isolation(saved)
 
-    if saved:
-        default_context = get_int_setting(saved.get("context"), default_context)
-
-        if saved.get("kv"):
-            default_kv = str(saved["kv"])
-
-        saved_port = get_int_setting(saved.get("port"), 0)
-
-        if saved_port > 0:
-            default_port = saved_port
+    default_port = saved_setup_port(saved)
 
     if state["context_specified"]:
         default_context = state["context"]
@@ -1705,19 +1764,11 @@ def prompt_setup_params(spec, state):
     if state["port_specified"]:
         default_port = state["port"]
 
-    selected = None
-
     if state["family"] or state["model"]:
         requested = get_candidates(state["family"], state["model"])
-        selected = pick_best_variant(requested, spec["ram_gb"])
-
-        if not selected:
-            selected = requested[0]
-
-    if not selected and saved and saved.get("family") and saved.get("model"):
-        selected = next(
-            (v for v in VARIANTS if v["family"] == saved["family"] and v["model"] == saved["model"]),
-            None)
+        selected = pick_best_variant(requested, spec["ram_gb"]) or requested[0]
+    else:
+        selected = pick_variant_default("", "", saved, spec["ram_gb"])
 
     if not selected:
         selected = pick_best_variant(VARIANTS, spec["ram_gb"])
@@ -2955,7 +3006,8 @@ def start_sandbox_relay(backend, tool, port):
     rc, lines = run_native(tool, [
         "run", "-d", "--rm", "--name", SANDBOX_RELAY] + host_gateway_arguments(backend) +
         [SANDBOX_RELAY_IMAGE,
-         "tcp-listen:8080,fork,reuseaddr", "tcp-connect:host.docker.internal:%d" % port])
+         "tcp-listen:%d,fork,reuseaddr" % SANDBOX_RELAY_PORT,
+         "tcp-connect:host.docker.internal:%d" % port])
 
     if rc != 0:
         return False
@@ -3016,9 +3068,10 @@ def run_opencode_sandbox(isolation, tag, port, open_code_json):
 
         relay_started = True
         base_url = "http://%s" % SANDBOX_RELAY
-        probe_port = 8080
+        probe_port = SANDBOX_RELAY_PORT
 
-        if not sandbox_models_reachable(backend, tool, tag, "http://%s:8080/v1/models" % SANDBOX_RELAY):
+        if not sandbox_models_reachable(backend, tool, tag,
+                                        "http://%s:%d/v1/models" % (SANDBOX_RELAY, SANDBOX_RELAY_PORT)):
             run_native(tool, ["rm", "-f", SANDBOX_RELAY])
             fail("the Strata server refused the sandboxed connection through the relay.",
                  "A server started before the sandbox was turned on listens only on 127.0.0.1 and lacks the "
@@ -3534,13 +3587,57 @@ def parse_args():
 
     args, unknown = parser.parse_known_args()
 
-    if args.port is not None and not 1 <= args.port <= 65535:
-        parser.error("-Port must be between 1 and 65535")
+    if args.port is not None and not PORT_MIN <= args.port <= PORT_MAX:
+        parser.error("-Port must be between %d and %d" % (PORT_MIN, PORT_MAX))
 
     if unknown:
         parser.error("unrecognized arguments: %s" % " ".join(unknown))
 
     return args
+
+
+def platform_machine():
+    import platform
+    return platform.machine()
+
+
+def first_mount_with_space(need_gb, exclude):
+    if IS_WINDOWS:
+        try:
+            buf = ctypes.create_unicode_buffer(256)
+            ctypes.windll.kernel32.GetLogicalDriveStringsW(255, buf)
+            roots = [r for r in buf.value.split("\0") if r]
+            candidates = []
+            for root in roots:
+                try:
+                    if ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(root)) == 3:
+                        if shutil.disk_usage(root).free >= need_gb * (1024 ** 3):
+                            candidates.append(root)
+                except OSError:
+                    pass
+            return candidates[0] if candidates else None
+        except Exception:
+            return None
+
+    best = None
+    try:
+        with open("/proc/mounts") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) < 2 or not parts[0].startswith("/dev/"):
+                    continue
+                mount = parts[1]
+                if mount == os.path.abspath(exclude) or os.path.abspath(exclude).startswith(mount + "/"):
+                    continue
+                try:
+                    if shutil.disk_usage(mount).free >= need_gb * (1024 ** 3):
+                        best = mount
+                        break
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return best
 
 
 def main():
@@ -3554,7 +3651,7 @@ def main():
         "context": args.context if args.context is not None else 0,
         "kv": args.kv or "",
         "data_dir": args.data_dir or "",
-        "port": args.port if args.port is not None else 8080,
+        "port": args.port if args.port is not None else DEFAULT_PORT,
         "isolation": args.isolation or "",
         "isolation_specified": args.isolation is not None,
         "context_specified": args.context is not None,
@@ -3624,13 +3721,7 @@ def main():
             sys.exit(0)
 
         if args.status:
-            port = 8080
-            status_setup = read_json(SETUP_PATH)
-            if status_setup:
-                status_port = get_int_setting(status_setup.get("port"), 0)
-                if status_port > 0:
-                    port = status_port
-            port = args.port if args.port is not None else port
+            port = args.port if args.port is not None else saved_setup_port()
             load_status().run_status(sys.modules[__name__], port, args.no_gui)
             sys.exit(0)
 
@@ -3655,7 +3746,8 @@ def main():
             TRANSCRIPT_PATH = os.path.join(
                 LOG_DIR, "run-%s.log" % time.strftime("%Y%m%d-%H%M%S"))
             TRANSCRIPT = open(TRANSCRIPT_PATH, "w", encoding="utf-8", newline="\n")
-        except Exception:
+        except Exception as exc:
+            write_warn("run logging is off: could not create the log (%s)" % exc)
             TRANSCRIPT = None
             TRANSCRIPT_PATH = None
 
@@ -4728,50 +4820,6 @@ def main():
             tb = tb.tb_next
         fail("unexpected error: %s%s" % (exc, line),
              "Run the script again. If the issue repeats, inspect the run log.")
-
-
-def platform_machine():
-    import platform
-    return platform.machine()
-
-
-def first_mount_with_space(need_gb, exclude):
-    if IS_WINDOWS:
-        try:
-            buf = ctypes.create_unicode_buffer(256)
-            ctypes.windll.kernel32.GetLogicalDriveStringsW(255, buf)
-            roots = [r for r in buf.value.split("\0") if r]
-            candidates = []
-            for root in roots:
-                try:
-                    if ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(root)) == 3:
-                        if shutil.disk_usage(root).free >= need_gb * (1024 ** 3):
-                            candidates.append(root)
-                except OSError:
-                    pass
-            return candidates[0] if candidates else None
-        except Exception:
-            return None
-
-    best = None
-    try:
-        with open("/proc/mounts") as handle:
-            for line in handle:
-                parts = line.split()
-                if len(parts) < 2 or not parts[0].startswith("/dev/"):
-                    continue
-                mount = parts[1]
-                if mount == os.path.abspath(exclude) or os.path.abspath(exclude).startswith(mount + "/"):
-                    continue
-                try:
-                    if shutil.disk_usage(mount).free >= need_gb * (1024 ** 3):
-                        best = mount
-                        break
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    return best
 
 
 if __name__ == "__main__":
