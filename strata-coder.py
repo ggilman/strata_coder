@@ -263,12 +263,13 @@ def _enable_virt_terminal():
         mode = ctypes.c_uint32()
         if ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             ctypes.windll.kernel32.SetConsoleMode(handle, ctypes.c_uint32(mode.value | 0x0004))
+            return True
     except Exception:
         pass
-    return True
+    return False
 
 
-COLOR_ON = sys.stdout.isatty() and (IS_WINDOWS and _enable_virt_terminal() or True)
+COLOR_ON = sys.stdout.isatty() and (not IS_WINDOWS or _enable_virt_terminal())
 
 RESET, CYAN, GREEN, GRAY, YELLOW, RED, DARKGRAY = (
     "\033[0m", "\033[36m", "\033[32m", "\033[90m", "\033[33m", "\033[31m", "\033[90m",
@@ -354,7 +355,7 @@ def update_profile_block(path, begin, end, block, strip_pattern=None):
 
     text = ""
     if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        with open(path, "r", encoding="utf-8", errors="surrogateescape") as handle:
             text = handle.read()
 
     pattern = r"(?ms)^[ \t]*" + re.escape(begin) + r".*?^[ \t]*" + re.escape(end) + r"[ \t]*\r?\n?"
@@ -366,7 +367,8 @@ def update_profile_block(path, begin, end, block, strip_pattern=None):
     if text and not text.endswith("\n"):
         text += "\n"
 
-    write_text_file(path, text + block + "\n")
+    with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as handle:
+        handle.write(text + block + "\n")
 
 
 def get_int_setting(value, fallback):
@@ -450,6 +452,7 @@ def close_session_resources():
 def lock_file(path):
     handle = open(path, "a+")
     if IS_WINDOWS:
+        handle.seek(0)
         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
     else:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2335,8 +2338,9 @@ def show_ram_stability(spec, variant, context_tokens, kv_quant, root, tag, data_
         if 0 < fit_tokens < configured:
             fit_tokens = (fit_tokens // 1024) * 1024
 
-            write_info("a context of %d tokens or less keeps about %d GB of headroom"
-                       % (fit_tokens, COMFORTABLE_HEADROOM_GB))
+            if fit_tokens > 0:
+                write_info("a context of %d tokens or less keeps about %d GB of headroom"
+                           % (fit_tokens, COMFORTABLE_HEADROOM_GB))
 
 
 def path_is_under(path, parent):
@@ -2547,17 +2551,19 @@ def invoke_model_tuning(root, config_path, mode):
         errors="replace",
         env=env)
 
-    for line in iter(process.stdout.readline, ""):
-        line = line.rstrip("\r\n")
-
-        if line.strip():
-            _emit(None, "    | " + line)
-
-    process.wait()
     try:
-        process.stdout.close()
-    except Exception:
-        pass
+        for line in iter(process.stdout.readline, ""):
+            line = line.rstrip("\r\n")
+
+            if line.strip():
+                _emit(None, "    | " + line)
+
+        process.wait()
+    finally:
+        try:
+            process.stdout.close()
+        except Exception:
+            pass
 
     return process.returncode == 0
 
@@ -2850,6 +2856,17 @@ def stage_sandbox_binaries(version, avx2):
     build = os.path.join(SANDBOX_DIR, "build")
     os.makedirs(build, exist_ok=True)
 
+    stamp_value = "%s %s" % (version, "" if avx2 is None else str(bool(avx2)))
+    stamp_path = os.path.join(SANDBOX_DIR, "build-version")
+    try:
+        with open(stamp_path, encoding="utf-8") as handle:
+            stale = handle.read().strip() != stamp_value
+    except OSError:
+        stale = True
+
+    if stale and os.path.isfile(os.path.join(build, "opencode")):
+        os.remove(os.path.join(build, "opencode"))
+
     if not os.path.isfile(os.path.join(build, "opencode")):
         asset = "opencode-linux-x64-baseline.tar.gz" if avx2 is False \
             else "opencode-linux-x64.tar.gz"
@@ -2875,6 +2892,7 @@ def stage_sandbox_binaries(version, avx2):
         shutil.move(staged, os.path.join(build, "rg"))
         shutil.rmtree(os.path.join(SANDBOX_DIR, "unpack-rg"), ignore_errors=True)
 
+    write_text_file(stamp_path, stamp_value + "\n")
     write_text_file(os.path.join(build, "Dockerfile"), SANDBOX_DOCKERFILE)
 
     return build
@@ -4422,8 +4440,6 @@ def main():
                 write_info("the server will listen on 0.0.0.0 so the container can reach it; "
                            "Windows Firewall blocks other devices by default")
 
-            log_handle = open(server_log, "wb")
-
             popen_kwargs = {}
             if IS_WINDOWS:
                 # CREATE_NO_WINDOW, not DETACHED_PROCESS: the server needs a
@@ -4439,18 +4455,21 @@ def main():
             else:
                 popen_kwargs["start_new_session"] = True
 
-            server_process = subprocess.Popen(
-                [python, os.path.join(strata_root, "serve", "server.py"),
-                 "--engine", "strata", "--config", strata_config_path, "--port", str(port)] +
-                (["--host", "0.0.0.0"] if sandbox_backend else []),
-                cwd=strata_root,
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                env=env,
-                **popen_kwargs
-            )
-            log_handle.close()
+            log_handle = open(server_log, "wb")
+            try:
+                server_process = subprocess.Popen(
+                    [python, os.path.join(strata_root, "serve", "server.py"),
+                     "--engine", "strata", "--config", strata_config_path, "--port", str(port)] +
+                    (["--host", "0.0.0.0"] if sandbox_backend else []),
+                    cwd=strata_root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    **popen_kwargs
+                )
+            finally:
+                log_handle.close()
 
             write_info("loading the model; the first start may take several minutes")
             write_info("server output: %s" % server_log)

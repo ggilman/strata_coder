@@ -127,10 +127,10 @@ def poll_once(base):
     try:
         request = urllib.request.Request(base + "/status")
         with urllib.request.urlopen(request, timeout=5) as response:
-            status_info = json.load(response)
+            status_info = json.load(response) or {}
         request = urllib.request.Request(base + "/v1/status")
         with urllib.request.urlopen(request, timeout=5) as response:
-            v1_status = json.load(response)
+            v1_status = json.load(response) or {}
     except Exception as exc:
         return None, exc
 
@@ -333,8 +333,10 @@ def show_status_panel(sc, server_port):
 
             if interactive and panel_top_drawn:
                 sys.stdout.write("\033[%dA" % previous_lines)
-
-            sys.stdout.write(block)
+                sys.stdout.write(block)
+                sys.stdout.write("\033[0J")
+            else:
+                sys.stdout.write(block)
             sys.stdout.flush()
 
             panel_top_drawn = True
@@ -460,7 +462,8 @@ def show_status_window(sc, server_port):
             slot["fill_color"] = fill_color
 
         bar_text = bar.get("text") or (
-            "%.1f / %.1f GiB (%.0f%%)" % (bar["used"], bar["total"], bar["pct"]))
+            ("%.1f / %.1f GiB (%.0f%%)" % (bar["used"], bar["total"], bar["pct"]))
+            if "used" in bar else "%.0f%% util" % bar["pct"])
         if slot["bar_text"] != bar_text:
             slot["text_label"].configure(text=bar_text)
             slot["bar_text"] = bar_text
@@ -530,10 +533,13 @@ def show_status_window(sc, server_port):
     poll_lock = threading.Lock()
 
     def poll_worker():
-        data, exc = poll_once(base)
+        try:
+            data, error = poll_once(base)
+        except BaseException as exc:
+            data, error = None, exc
         with poll_lock:
             latest_poll["data"] = data
-            latest_poll["exc"] = exc
+            latest_poll["exc"] = error
             latest_poll["ready"] = True
             latest_poll["in_flight"] = False
 
@@ -542,8 +548,11 @@ def show_status_window(sc, server_port):
             if latest_poll["in_flight"]:
                 return
             latest_poll["in_flight"] = True
-        thread = threading.Thread(target=poll_worker, daemon=True)
-        thread.start()
+        try:
+            threading.Thread(target=poll_worker, daemon=True).start()
+        except BaseException:
+            with poll_lock:
+                latest_poll["in_flight"] = False
 
     def check_poll():
         ready = False

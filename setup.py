@@ -626,7 +626,7 @@ def run_setup_gui(sc, overrides=None):
     context_row = ttk.Frame(body)
     context_row.grid(row=4, column=1, sticky="w")
     ttk.Combobox(context_row, textvariable=context_var, values=context_labels,
-                 state="readonly", width=34).pack(side="left")
+                 width=34).pack(side="left")
     ttk.Button(context_row, text="\u24d8", width=4,
                command=lambda: info_popup("Context size", context_info_text())).pack(
         side="left", padx=(6, 0))
@@ -636,7 +636,7 @@ def run_setup_gui(sc, overrides=None):
     kv_row = ttk.Frame(body)
     kv_row.grid(row=5, column=1, sticky="w")
     ttk.Combobox(kv_row, textvariable=kv_var, values=kv_labels,
-                 state="readonly", width=34).pack(side="left")
+                 width=34).pack(side="left")
     ttk.Button(kv_row, text="\u24d8", width=4,
                command=lambda: info_popup("KV cache", kv_info_text())).pack(side="left",
                                                                             padx=(6, 0))
@@ -661,13 +661,13 @@ def run_setup_gui(sc, overrides=None):
         radio = ttk.Radiobutton(body, text=label, variable=isolation_var, value=value)
         radio.grid(row=line, column=1, sticky="w", pady=1)
         ttk.Button(body, text="\u24d8", width=4,
-                   command=lambda which=value: info_popup(label, isolation_info(which))).grid(
+                   command=lambda which=value, label=label: info_popup(label, isolation_info(which))).grid(
             row=line, column=2, sticky="w", padx=(6, 0))
 
     add_label("scode shortcut:", 12)
     shell_var = tk.StringVar(value="auto")
     ttk.Combobox(body, textvariable=shell_var, values=alias_shells,
-                 state="readonly", width=12).grid(row=12, column=1, sticky="w")
+                 width=12).grid(row=12, column=1, sticky="w")
 
     alias_status = ttk.Label(body, text="", foreground="#666666", wraplength=240, justify="left")
     alias_status.grid(row=13, column=1, sticky="w", padx=(12, 0))
@@ -724,10 +724,17 @@ def run_setup_gui(sc, overrides=None):
             failed += failures
 
         if deleted:
-            engine_status.configure(
-                foreground="green",
-                text="removed %d engine file(s); -Setup re-creates it on the next run (needs network)"
-                     % len(deleted))
+            text = ("removed %d engine file(s); -Setup re-creates it on the next run (needs network)"
+                    % len(deleted))
+
+            if failed:
+                engine_status.configure(
+                    foreground="#cc6600",
+                    text=text + "; could not remove " + "; ".join(failed))
+            else:
+                engine_status.configure(
+                    foreground="green",
+                    text=text)
         elif failed:
             engine_status.configure(foreground="red",
                                     text="could not remove " + "; ".join(failed))
@@ -774,7 +781,7 @@ def run_setup_gui(sc, overrides=None):
 
         port_text = port_var.get().strip()
 
-        if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+        if not port_text.isdecimal() or not 1 <= int(port_text) <= 65535:
             messagebox.showerror("Strata Coder setup", "Port must be a number from 1 through 65535.")
             return
 
