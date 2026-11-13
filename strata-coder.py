@@ -2525,13 +2525,57 @@ def get_setup_args(variant, directory, server_port, context_tokens, kv_quant, gg
     return arguments
 
 
-def invoke_model_setup(root, variant, directory, server_port, context_tokens, kv_quant, gguf_dir, tag):
+def invoke_model_tuning(root, config_path, mode):
+    python = venv_python(root)
+
+    if not os.path.isfile(python) or not os.path.isfile(os.path.join(root, "strata.py")):
+        return False
+
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    process = subprocess.Popen(
+        [python, os.path.join(root, "strata.py"), "tune", "auto", config_path,
+         "--mode", mode],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env)
+
+    for line in iter(process.stdout.readline, ""):
+        line = line.rstrip("\r\n")
+
+        if line.strip():
+            _emit(None, "    | " + line)
+
+    process.wait()
+    try:
+        process.stdout.close()
+    except Exception:
+        pass
+
+    return process.returncode == 0
+
+
+def invoke_model_setup(root, variant, directory, server_port, context_tokens, kv_quant, gguf_dir, tag,
+                       tune=None):
     os.makedirs(directory, exist_ok=True)
 
     exit_code = invoke_strata_setup(
         root, get_setup_args(variant, directory, server_port, context_tokens, kv_quant, gguf_dir))
 
-    return exit_code, test_strata_config(root, tag)
+    configured = test_strata_config(root, tag)
+
+    if tune and configured:
+        if not invoke_model_tuning(root, os.path.join(root, "strata-%s.json" % tag), tune):
+            write_warn("the tuning did not finish; the model runs with its standard settings")
+
+    return exit_code, configured
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -4083,8 +4127,11 @@ def main():
                     stop_strata_servers()
                     server_running = False
 
+                # a runner version update re-baselines the same way a fresh install
+                # does, so it only needs the quick pass
                 exit_code, configured = invoke_model_setup(
-                    new_root, variant, data_dir, port, state["context"], state["kv"], gguf_dir, tag)
+                    new_root, variant, data_dir, port, state["context"], state["kv"], gguf_dir, tag,
+                    "quick")
 
                 if not configured:
                     shutil.rmtree(new_root, ignore_errors=True)
@@ -4162,8 +4209,16 @@ def main():
                            "(the setup window's Delete Strata engine button removed it)")
                 write_info("Strata re-creates the engine during setup, so this run needs network access")
 
+            # a model swap on an already-installed runner re-routes the new expert
+            # counts, sizes and quants across the memory tiers and PCIe bus, so it
+            # earns the thorough sweep; a fresh install or a settings-only change
+            # just re-establishes the baseline and only needs the quick pass
+            tune = "thorough" if (strata_present and not strata_target
+                                  and not model_ready and not config_drift) else "quick"
+
             exit_code, configured = invoke_model_setup(
-                strata_root, variant, data_dir, port, state["context"], state["kv"], gguf_dir, tag)
+                strata_root, variant, data_dir, port, state["context"], state["kv"], gguf_dir, tag,
+                tune)
 
             if not configured:
                 assert_not_blocked_by_smart_app_control(run_started)
