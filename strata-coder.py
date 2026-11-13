@@ -97,7 +97,7 @@ SCRIPT_PATH = os.path.abspath(__file__)
 MENU_PATH = os.path.join(os.path.dirname(SCRIPT_PATH), "setup.py")
 STATUS_PATH = os.path.join(os.path.dirname(SCRIPT_PATH), "status.py")
 
-PINNED_STRATA = "v0.1.40.3"
+PINNED_STRATA = "v0.2.13"
 
 VARIANTS = [
     # "speed_tok_s": answers written per second in a short chat, "prompt_tok_s": tokens/s read on a
@@ -106,7 +106,7 @@ VARIANTS = [
     {
         "family": "qwen",
         "model": "IQ3_S",
-        "min_ram_gb": 60,
+        "min_ram_gb": 62,
         "download_gb": 83.6,
         "arena_gb": 50.3,
         "quality": 90,
@@ -119,7 +119,7 @@ VARIANTS = [
     {
         "family": "qwen",
         "model": "IQ3_XXS",
-        "min_ram_gb": 58,
+        "min_ram_gb": 60,
         "download_gb": 75.8,
         "arena_gb": 42.9,
         "quality": 80,
@@ -132,7 +132,7 @@ VARIANTS = [
     {
         "family": "qwen",
         "model": "IQ2_XS",
-        "min_ram_gb": 46,
+        "min_ram_gb": 48,
         "download_gb": 68.0,
         "arena_gb": 35.5,
         "quality": 70,
@@ -184,7 +184,7 @@ VARIANTS = [
     {
         "family": "coder",
         "model": "IQ1_M",
-        "min_ram_gb": 30,
+        "min_ram_gb": 32,
         "download_gb": 58.4,
         "arena_gb": 23.4,
         "quality": 60,
@@ -214,7 +214,6 @@ VARIANTS = [
         "arena_gb": 77.0,
         "quality": 98,
         "budget": True,
-        "experimental": True,
         "quality_word": "best",
         "title": "Qwen3.8-Flash-Next (Unsloth) UD-Q4_K_XL (4-bit, the best quality)",
         "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
