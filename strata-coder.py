@@ -7,7 +7,8 @@ Modes:
     strata-coder.py [-CheckOnly] [-Family qwen|swift|coder|unsloth] [-Model NAME] [-Context N]
         [-Kv int8|k8v4|q4_0] [-DataDir PATH] [-Port N] [-NoLaunch] [-Update]
         [-Stop] [-Status] [-Setup] [-Isolation none|local|docker|podman|wsl] [-Alias] [-NoAlias] [-NoGui]
-        [-AliasShell auto|cmd|powershell|bash|zsh] [-StartOpencode|-NoOpencode] [-Help]
+        [-AliasShell auto|cmd|powershell|bash|zsh] [-StartOpencode|-NoOpencode]
+        [-MakeOffline [-Dest PATH]] [-Help]
 """
 
 import argparse
@@ -420,6 +421,15 @@ def saved_setup_port(saved=None):
 
     port = get_int_setting((saved or {}).get("port"), 0)
     return port if port > 0 else DEFAULT_PORT
+
+
+OFFLINE_SELECTION_ENV = "STRATA_OFFLINE_SELECTION"
+OFFLINE_GUI_CHILD_ENV = "STRATA_OFFLINE_GUI_CHILD"
+BUNDLE_ZIP_NAME = "offline-bundle.zip"
+
+
+def default_bundle_folder():
+    return os.path.join(os.path.expanduser("~"), "Documents", "strata-offline-bundle")
 
 
 def grade_variant(variant, ram_gb):
@@ -1198,9 +1208,21 @@ Options:
                              opening OpenCode the run ends with a small
                              window that holds the server - its Close
                              button stops the server and ends the process.
-  -StartOpencode             Force Start OpenCode on for this run, even when
+   -StartOpencode             Force Start OpenCode on for this run, even when
                              setup.json has it unchecked.
-  -Stop                      Stop the Strata server.
+   -MakeOffline               Build an offline installer bundle: a GUI window
+                             (console menu with -NoGui) chooses which pieces to
+                             pack - Strata, OpenCode, ripgrep and any models
+                             found on this PC, all checked by default; items
+                             not on this PC are downloaded instead. The output
+                             folder holds one offline-bundle.zip (everything
+                             except the models, which sit loose in a models
+                             folder that stays even when empty) plus a
+                             reconstruct.py that puts everything back at the
+                             normal locations on a machine with no network.
+   -Dest <path>               Bundle output folder for -MakeOffline (default:
+                             Documents\\strata-offline-bundle).
+   -Stop                      Stop the Strata server.
   -Status                    Live tokens/sec panel: a GUI window when the
                              machine can display one, otherwise refreshing
                              in place in this console (-NoGui forces it).
@@ -1498,6 +1520,902 @@ def run_setup_menu(state):
     write_step("Setup window opened in the background - this command finished; press OK in the window "
                "and the install runs in its own console window")
     return True
+
+
+# ----------------------------------------------------------------------------------------------------
+# Offline installer bundle
+# ----------------------------------------------------------------------------------------------------
+
+def find_strata_roots():
+    """Installed Strata roots on this machine, newest first (must hold setup.py)."""
+    roots = []
+    state_json = read_json(STATE_PATH)
+
+    if state_json and state_json.get("StrataRoot"):
+        roots.append(state_json["StrataRoot"])
+
+    if os.path.isdir(APP_DIR):
+        roots.extend(sorted((d for d in glob.glob(os.path.join(APP_DIR, "strata*"))
+                             if os.path.isdir(d) and d != UNPACK_DIR),
+                            key=os.path.getmtime, reverse=True))
+
+    settings = read_json(STRATA_SETTINGS_PATH)
+
+    if settings and settings.get("installs"):
+        roots.extend(settings["installs"])
+
+    seen = set()
+    found = []
+
+    for root in roots:
+        if root and os.path.isfile(os.path.join(root, "setup.py")) and root not in seen:
+            seen.add(root)
+            found.append(root)
+
+    return found
+
+
+def find_local_models(saved):
+    """[(display name, folder path, size GB)] for model folders on this machine:
+    the model folder plus Strata's last data_dir; any folder holding .gguf files
+    counts as one model, subfolders under a recorded folder are part of its copy."""
+    roots = []
+
+    for candidate in (default_model_folder(saved),
+                      (read_json(STRATA_SETTINGS_PATH) or {}).get("data_dir")):
+        if candidate and os.path.isdir(candidate):
+            candidate = os.path.normpath(candidate)
+
+            if candidate not in roots:
+                roots.append(candidate)
+
+    folders = []
+
+    for root in roots:
+        for current, _dirs, files in os.walk(root):
+            if not any(name.lower().endswith(".gguf") for name in files):
+                continue
+
+            path = os.path.normpath(current)
+
+            if path in [recorded[1] for recorded in folders]:
+                continue
+
+            if any(path.startswith(recorded[1] + os.sep) for recorded in folders):
+                continue
+
+            folders.append((os.path.basename(path), path, get_folder_gb(path)))
+
+    names = {}
+    result = []
+
+    for name, path, gb in folders:
+        display = name
+        copy = 2
+
+        while display in names:
+            display = "%s (%d)" % (name, copy)
+            copy += 1
+
+        names[display] = path
+        result.append((display, path, gb))
+
+    return result
+
+
+def stage_release_asset(repo, asset_name, exe_name, stage_name):
+    """Download a release asset and stage its executable (kept out of the installs)."""
+    release = get_latest_release(repo)
+    asset = next((a for a in (release or {}).get("assets", []) if a.get("name") == asset_name), None)
+
+    if not asset:
+        write_warn("could not stage %s: %s release has no %s" % (exe_name, repo, asset_name))
+        return None
+
+    stage = os.path.join(APP_DIR, stage_name)
+    zip_path = os.path.join(DOWNLOAD_DIR, asset_name)
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    try:
+        staged = get_downloaded_file(asset["browser_download_url"], zip_path, stage, exe_name)
+    except Exception as exc:
+        write_warn("could not stage %s (%s)" % (exe_name, exc))
+        staged = None
+    finally:
+        if os.path.isfile(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+
+    return staged
+
+
+def ask_offline_selection(dest_arg):
+    """The console bundle menu: destination, the three tools, each found model."""
+    menu = load_setup()
+    saved = read_json(SETUP_PATH)
+
+    if dest_arg:
+        dest = dest_arg
+    else:
+        dest = prompt_text(menu.OFFLINE_QUESTIONS["dest"], default_bundle_folder())
+
+    items = {
+        "strata": prompt_yes_no(menu.OFFLINE_QUESTIONS["strata"], True),
+        "opencode": prompt_yes_no(menu.OFFLINE_QUESTIONS["opencode"], True),
+        "ripgrep": prompt_yes_no(menu.OFFLINE_QUESTIONS["ripgrep"], True),
+    }
+
+    models = {}
+
+    for name, path, gb in find_local_models(saved):
+        models[name] = {"path": path,
+                        "include": prompt_yes_no(menu.OFFLINE_QUESTIONS["model"] % (name, gb),
+                                                 True)}
+
+    return {"dest": dest, "items": items, "models": models}
+
+
+def make_offline_bundle(state):
+    write_step("Offline installer bundle")
+
+    if not state["no_gui"] and not os.environ.get(OFFLINE_SELECTION_ENV):
+        if is_available():
+            prefill = {}
+
+            if state["dest"]:
+                prefill["dest"] = state["dest"]
+
+            spawn_detached_gui(MENU_PATH, {OFFLINE_GUI_CHILD_ENV: json.dumps({"prefill": prefill})})
+
+            write_step("Bundle window opened in the background - this command finished; press OK in the window "
+                       "and the bundle builds in its own console window")
+            return
+
+        write_warn("no display available - the console bundle menu runs instead")
+
+    selection = None
+
+    if os.environ.get(OFFLINE_SELECTION_ENV):
+        try:
+            selection = json.loads(os.environ[OFFLINE_SELECTION_ENV])
+        except (ValueError, TypeError):
+            write_warn("the bundle selection was unreadable; the console menu will ask instead")
+
+    if not selection:
+        selection = ask_offline_selection(state["dest"])
+
+    build_offline_bundle(selection)
+
+
+def build_offline_bundle(selection):
+    """Stage the checked pieces, write one offline-bundle.zip (everything but the
+    models), the loose models folder (kept even when empty), reconstruct.py and
+    README-offline.txt into the bundle folder."""
+    dest = os.path.normpath(selection.get("dest") or default_bundle_folder())
+
+    try:
+        os.makedirs(dest, exist_ok=True)
+    except OSError as exc:
+        fail("the bundle folder cannot be created: %s (%s)" % (dest, exc.strerror or exc))
+
+    if os.path.isfile(os.path.join(dest, BUNDLE_ZIP_NAME)):
+        write_info("the previous bundle zip at %s will be replaced" % dest)
+
+    items = selection.get("items") or {}
+    models_choice = selection.get("models") or {}
+    state_json = read_json(STATE_PATH) or {}
+
+    staged_downloads = []
+
+    # Strata
+    strata_source = None
+    engine_present = None
+
+    if items.get("strata", True):
+        roots = find_strata_roots()
+
+        if roots:
+            strata_source = roots[0]
+        else:
+            write_step("Strata is not on this PC - installing it now so the bundle can carry it")
+            strata_source = install_strata_code(PINNED_STRATA)
+
+        if strata_source:
+            engine_present = bool(find_matching_file(strata_source,
+                                                     "strata.exe" if IS_WINDOWS else "strata"))
+
+            if not engine_present:
+                write_warn("the copied Strata install has no engine file on this PC - the bundle "
+                           "cannot serve models until a networked -Setup re-creates the engine")
+    else:
+        write_warn("Strata unchecked: the offline machine gets no server at all")
+        write_skip("Strata not packed")
+
+    # OpenCode
+    opencode_source = None
+
+    if items.get("opencode", True):
+        if os.path.isfile(OPENCODE_EXE):
+            opencode_source = OPENCODE_EXE
+        else:
+            write_step("OpenCode is not on this PC - downloading the baseline build for the bundle")
+            opencode_source = stage_release_asset(
+                "anomalyco/opencode",
+                "opencode-windows-x64-baseline.zip" if IS_WINDOWS else "opencode-linux-x64-baseline.tar.gz",
+                "opencode.exe" if IS_WINDOWS else "opencode", "opencode-unpack")
+
+            if opencode_source:
+                staged_downloads.append(os.path.join(APP_DIR, "opencode-unpack"))
+    else:
+        write_skip("OpenCode unchecked: the offline machine runs Strata only "
+                   "(normal Start OpenCode off behavior)")
+
+    # ripgrep
+    rg_source = None
+
+    if items.get("ripgrep", True):
+        if os.path.isfile(RG_EXE):
+            rg_source = RG_EXE
+        else:
+            write_step("ripgrep is not on this PC - downloading it for the bundle")
+            rg_source = stage_release_asset("BurntSushi/ripgrep", RG_ASSET_FILTER,
+                                            "rg.exe" if IS_WINDOWS else "rg", "ripgrep-unpack")
+
+            if rg_source:
+                staged_downloads.append(os.path.join(APP_DIR, "ripgrep-unpack"))
+    else:
+        write_skip("ripgrep unchecked: OpenCode search on the offline machine will be slower")
+
+    # free space check
+    found_models = find_local_models(read_json(SETUP_PATH))
+    model_reports = []
+    model_gb = 0.0
+
+    for name, path, gb in found_models:
+        entry = models_choice.get(name)
+
+        if isinstance(entry, dict):
+            include = bool(entry.get("include", True))
+        else:
+            include = True if entry is None else bool(entry)
+
+        model_reports.append({"name": name, "path": path, "size_gb": gb, "included": include})
+
+        if include:
+            model_gb += gb
+
+    tools_gb = 0.0
+
+    if strata_source:
+        tools_gb += get_folder_gb(strata_source)
+
+    for source in (opencode_source, rg_source):
+        if source and os.path.isfile(source):
+            tools_gb += os.path.getsize(source) / (1024 ** 3)
+
+    need_gb = round(model_gb + tools_gb * 0.6 + 1, 1)
+
+    if get_free_gb(dest) < need_gb:
+        fail("not enough free space on the bundle drive: about %s GB needed at %s." % (need_gb, dest),
+             "Pick another -Dest folder with room, or uncheck the models.")
+
+    # models: loose copies in the bundle (never zipped)
+    models_out = os.path.join(dest, "models")
+    os.makedirs(models_out, exist_ok=True)
+
+    copied_models = 0
+
+    for report in model_reports:
+        if not report["included"]:
+            continue
+
+        entry = models_choice.get(report["name"])
+        src = None
+
+        if isinstance(entry, dict) and entry.get("path"):
+            src = entry.get("path")
+        else:
+            for name, path, gb in found_models:
+                if name == report["name"]:
+                    src = path
+                    break
+
+        if not src or not os.path.isdir(src):
+            write_warn("model folder for %s is gone; nothing copied" % report["name"])
+            continue
+
+        target = os.path.normpath(os.path.join(models_out, report["name"]))
+
+        if os.path.normpath(src) == target:
+            copied_models += 1
+            continue
+
+        if os.path.exists(target):
+            write_warn("a model folder named %s already exists in the bundle - it will be replaced"
+                       % report["name"])
+            shutil.rmtree(target, ignore_errors=True)
+
+        write_step("Copying model %s (%.1f GB) into the bundle - this can take a long time"
+                   % (report["name"], report["size_gb"]))
+
+        try:
+            shutil.copytree(src, target)
+            copied_models += 1
+        except Exception as exc:
+            write_warn("the model folder copy failed (%s)" % exc)
+
+    if not model_reports:
+        write_info("the models folder in the bundle is empty and kept: drop GGUF files into it by hand "
+                   "before the offline machine runs reconstruct.py")
+
+    # the zip
+    zip_path = os.path.join(dest, BUNDLE_ZIP_NAME)
+    write_step("Writing the bundle zip (everything except the models)")
+
+    file_entries = []
+    scripts_dir = os.path.dirname(SCRIPT_PATH)
+
+    for name in ("strata-coder.py", "setup.py", "status.py", "README.md", "CODE_STRUCTURE.md"):
+        src = os.path.join(scripts_dir, name)
+
+        if os.path.isfile(src):
+            file_entries.append(("scripts/" + name, src))
+
+    if opencode_source:
+        file_entries.append(("opencode/" + os.path.basename(opencode_source), opencode_source))
+
+    if rg_source:
+        file_entries.append(("ripgrep/" + os.path.basename(rg_source), rg_source))
+
+    if os.path.isfile(SETUP_PATH):
+        file_entries.append(("settings/setup.json", SETUP_PATH))
+
+    if os.path.isfile(STRATA_SETTINGS_PATH):
+        file_entries.append(("settings/strata-settings.json", STRATA_SETTINGS_PATH))
+
+    manifest = {
+        "version": 1,
+        "built": time.strftime("%Y-%m-%d %H:%M"),
+        "strata_root": {"name": os.path.basename(strata_source)} if strata_source else None,
+        "strata_version": state_json.get("StrataVersion") or (
+            os.path.basename(strata_source).split("strata-")[-1] if strata_source else None),
+        "model_tag": state_json.get("Model"),
+        "engine_present": engine_present,
+        "venv_python": os.path.join(".venv", "Scripts" if IS_WINDOWS else "bin",
+                                    "python.exe" if IS_WINDOWS else "python"),
+        "opencode": bool(opencode_source),
+        "ripgrep": bool(rg_source),
+        "models": model_reports,
+        "paths": {
+            "app_dir": APP_DIR,
+            "strata_root": strata_source,
+            "model_dir": state_json.get("DataDir") or default_model_folder(read_json(SETUP_PATH)),
+            "strata_settings": STRATA_SETTINGS_PATH,
+        },
+    }
+
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as handle:
+            for arcname, src in file_entries:
+                handle.write(src, arcname)
+
+            if strata_source:
+                arc_root = "strata/" + os.path.basename(strata_source)
+
+                for current, _dirs, files in os.walk(strata_source):
+                    rel = os.path.relpath(current, strata_source)
+                    arc = arc_root if rel == "." else arc_root + "/" + rel.replace(os.sep, "/")
+
+                    for name in files:
+                        handle.write(os.path.join(current, name), arc + "/" + name)
+
+            handle.writestr("manifest.json", json.dumps(manifest, indent=2))
+    except Exception as exc:
+        fail("the bundle zip could not be written (%s)" % exc)
+
+    for stage in staged_downloads:
+        shutil.rmtree(stage, ignore_errors=True)
+
+    # the reconstitution script and the how-to notes
+    write_text_file(os.path.join(dest, "reconstruct.py"), OFFLINE_RECONSTRUCT_TEXT)
+
+    if not IS_WINDOWS:
+        try:
+            os.chmod(os.path.join(dest, "reconstruct.py"), 0o755)
+        except OSError:
+            pass
+
+    readme_lines = [
+        "STRATA CODER OFFLINE BUNDLE - built %s" % time.strftime("%Y-%m-%d"),
+        "",
+        "This folder holds: offline-bundle.zip (everything except the models),",
+        "a models folder with a loose copy of each chosen model (kept even when empty,",
+        "drop GGUF files there if you copied the models off by hand),",
+        "and reconstruct.py, which puts everything back at the normal locations",
+        "for the offline machine's own user.",
+        "",
+        "Steps on the offline machine (no network needed):",
+        "  1. copy this whole folder somewhere writable and run:",
+        "         python reconstruct.py",
+        "  2. it prints where the strata_coder scripts landed (Documents\\strata_coder);",
+        "     from your project folder run that script path to start the server",
+        "     (add the scode shortcut with -Alias if you like)",
+        "",
+        "Notes:",
+        "  - the zip was written on the source PC; the Strata engine inside it was",
+        "    compiled for the source PC's GPU - a very different GPU may need a",
+        "    networked -Setup instead of this bundle",
+    ]
+
+    if not manifest["opencode"]:
+        readme_lines.append("  - no OpenCode in this bundle: runs hold the server in the small window;")
+        readme_lines.append("    Close stops it (or stop manually with -Stop when no window can show)")
+
+    if copied_models == 0:
+        readme_lines.append("  - NO MODELS WERE COPIED: put GGUF folders into the models folder here")
+        readme_lines.append("    (or straight into ai-models\\models) before this machine can serve")
+        readme_lines.append("    anything - without models the setup is not functional")
+
+    write_text_file(os.path.join(dest, "README-offline.txt"), "\n".join(readme_lines) + "\n")
+
+    write_ok("offline bundle ready: %s (zip: %s, loose models folder kept, reconstruct.py beside it)"
+             % (dest, BUNDLE_ZIP_NAME))
+    write_info("copy the WHOLE folder - zip, models, reconstruct.py, README-offline.txt - to the DVD or media")
+
+    if copied_models == 0:
+        write_warn("no models were copied to the bundle: their GGUF files must be added to the bundle's "
+                   "models folder by hand, or the offline machine's setup will not be functional")
+
+
+OFFLINE_RECONSTRUCT_TEXT = r'''#!/usr/bin/env python3
+"""reconstruct.py - reconstitute the offline Strata Coder bundle.
+
+The bundle folder holds one offline-bundle.zip (everything except the models),
+a models folder with loose model folders (put GGUF folders there if the bundle
+was built without models), and this script. Copy the whole bundle folder to
+the offline machine, then run:
+
+    python reconstruct.py
+
+Everything is placed at the normal per-user locations of THIS machine (the
+user folders may differ from the machine that built the bundle); model folders
+are moved when on the same drive (no extra space consumed) and copied
+otherwise; the copied settings are fixed up to point at the new paths.
+
+A hidden --base PATH option (for tests only) places everything under PATH
+instead of the real locations.
+"""
+
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import zipfile
+
+WINDOWS = os.name == "nt"
+
+
+def note(text):
+    print(text)
+
+
+def merge_tree(src, dst):
+    os.makedirs(dst, exist_ok=True)
+
+    for entry in os.listdir(src):
+        s = os.path.join(src, entry)
+        d = os.path.join(dst, entry)
+
+        if os.path.isdir(s):
+            merge_tree(s, d)
+        else:
+            shutil.copy2(s, d)
+
+
+def roots(base):
+    if WINDOWS:
+        app_root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
+        roaming = os.environ.get("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
+        home = os.path.expanduser("~")
+    else:
+        app_root = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+        roaming = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        home = os.path.expanduser("~")
+
+    if base:
+        app_root = base
+        roaming = base
+        home = base
+
+    return {
+        "app": os.path.join(app_root, "strata-coder"),
+        "scripts": os.path.join(home, "Documents", "strata_coder"),
+        "models": os.path.join(home, "ai-models", "models"),
+        "strata_settings": os.path.join(roaming, "Strata" if WINDOWS else "strata",
+                                        "settings.json"),
+    }
+
+
+def same_drive(a, b):
+    return not WINDOWS or os.path.splitdrive(a)[0].lower() == os.path.splitdrive(b)[0].lower()
+
+
+def place_folder(src, target, kind):
+    if os.path.exists(target):
+        note("%s: something is already at %s - keeping the existing copy" % (kind, target))
+        return False
+
+    if same_drive(src, target):
+        shutil.move(src, target)
+        note("%s moved into place (same drive): %s" % (kind, target))
+    else:
+        shutil.copytree(src, target)
+        note("%s copied into place: %s" % (kind, target))
+
+    return True
+
+
+def reconstitute(zf, where, manifest):
+    skip = None
+    root_name = (manifest.get("strata_root") or {}).get("name")
+
+    if root_name and os.path.isdir(os.path.join(where["app"], root_name)):
+        skip = "strata/" + root_name
+        note("Strata %s is already installed at %s - keeping it, skipping the zip's copy"
+             % (manifest.get("strata_version") or "?", os.path.join(where["app"], root_name)))
+
+    for info in zf.infolist():
+        name = info.filename
+
+        if name == "manifest.json":
+            continue
+
+        if name.startswith("settings/"):
+            tail = name[len("settings/"):]
+            target = (where["strata_settings"] if tail == "strata-settings.json"
+                      else os.path.join(where["app"], tail))
+        elif name.startswith("scripts/"):
+            target = os.path.join(where["scripts"], name[len("scripts/"):])
+        elif name.startswith("strata/"):
+            if skip and (name == skip or name.startswith(skip + "/")
+                         or name.startswith(skip + os.sep)):
+                continue
+            target = os.path.join(where["app"], name[len("strata/"):])
+        elif name.startswith("opencode/") or name.startswith("ripgrep/"):
+            target = os.path.join(where["app"], name[len(name.split("/", 1)[0]) + 1:])
+        else:
+            continue
+
+        target = os.path.normpath(target)
+
+        if name.endswith("/"):
+            os.makedirs(target, exist_ok=True)
+            continue
+
+        parent = os.path.dirname(target)
+
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        if os.path.isfile(target):
+            continue
+
+        with zf.open(info) as source, open(target, "wb") as out:
+            shutil.copyfileobj(source, out)
+
+        if not WINDOWS and (name.endswith(".exe") or name.endswith("/opencode")
+                            or name.endswith("/rg")):
+            os.chmod(target, 0o755)
+
+
+def fix_copied_settings(where, manifest, new_root):
+    old = manifest.get("paths") or {}
+    pairs = []
+
+    if old.get("app_dir") and old["app_dir"] != where["app"]:
+        pairs.append((old["app_dir"], where["app"]))
+
+    if new_root and old.get("strata_root") and old["strata_root"] != new_root:
+        pairs.append((old["strata_root"], new_root))
+
+    for report in manifest.get("models") or []:
+        if report.get("path"):
+            pairs.append((report["path"], os.path.join(where["models"], report["name"])))
+
+    pairs.sort(key=lambda pair: -len(pair[0]))
+
+    def transform(value):
+        if isinstance(value, str):
+            new = value
+
+            for source, target in pairs:
+                new = new.replace(source, target)
+
+            return new, new != value
+
+        if isinstance(value, dict):
+            out = {}
+            changed = False
+
+            for key in value:
+                item, item_changed = transform(value[key])
+                out[key] = item
+                changed = changed or item_changed
+
+            return out, changed
+
+        if isinstance(value, list):
+            out = []
+            changed = False
+
+            for item_value in value:
+                item, item_changed = transform(item_value)
+                out.append(item)
+                changed = changed or item_changed
+
+            return out, changed
+
+        return value, False
+
+    def load(path):
+        if not os.path.isfile(path):
+            return None
+
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                return json.load(handle)
+        except ValueError:
+            return None
+
+    setup_path = os.path.join(where["app"], "setup.json")
+
+    if os.path.isfile(setup_path):
+        parsed = load(setup_path)
+
+        if isinstance(parsed, dict):
+            parsed, changed = transform(parsed)
+
+            if parsed.get("dataDir") != where["models"]:
+                parsed["dataDir"] = where["models"]
+                changed = True
+
+            if changed:
+                with open(setup_path, "w", encoding="utf-8") as handle:
+                    json.dump(parsed, handle, indent=2)
+
+                note("setup.json points at the new locations")
+
+    if os.path.isfile(where["strata_settings"]):
+        parsed = load(where["strata_settings"])
+
+        if isinstance(parsed, dict):
+            parsed, changed = transform(parsed)
+
+            if parsed.get("data_dir") != where["models"]:
+                parsed["data_dir"] = where["models"]
+                changed = True
+
+            installs = parsed.get("installs")
+
+            if new_root and isinstance(installs, list):
+                merged = []
+
+                for entry in installs:
+                    if new_root not in merged:
+                        merged.append(new_root)
+
+                if merged != installs:
+                    parsed["installs"] = merged
+                    changed = True
+
+            if changed:
+                with open(where["strata_settings"], "w", encoding="utf-8") as handle:
+                    json.dump(parsed, handle, indent=2)
+
+                note("Strata settings point at the new locations")
+
+    if not new_root:
+        return
+
+    for config_path in glob.glob(os.path.join(new_root, "strata-*.json")):
+        parsed = load(config_path)
+
+        if not isinstance(parsed, dict):
+            continue
+
+        parsed, changed = transform(parsed)
+        missing = False
+
+        stack = [parsed]
+
+        while stack:
+            current = stack.pop()
+
+            if isinstance(current, dict):
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+            elif isinstance(current, str) and current.lower().endswith(".gguf"):
+                if not os.path.isfile(current):
+                    missing = True
+
+        if missing:
+            os.remove(config_path)
+            note("the copied model config points at GGUF files that are not present - removed "
+                 "so the first scode run reconfigures offline from the model folder")
+        elif changed:
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(parsed, handle, indent=2)
+
+            note("model config fixed to the new paths: %s" % config_path)
+
+
+def place_models(here, where):
+    src_root = os.path.join(here, "models")
+    placed = 0
+
+    if not os.path.isdir(src_root):
+        return placed
+
+    os.makedirs(where["models"], exist_ok=True)
+
+    for entry in sorted(os.listdir(src_root)):
+        src = os.path.join(src_root, entry)
+
+        if os.path.isdir(src):
+            if not any(name.lower().endswith(".gguf")
+                       for _current, _dirs, files in os.walk(src) for name in files):
+                continue
+
+            if place_folder(src, os.path.join(where["models"], entry), "model %s" % entry):
+                placed += 1
+        elif entry.lower().endswith(".gguf"):
+            target = os.path.join(where["models"], entry)
+
+            if os.path.isfile(target):
+                continue
+
+            if same_drive(src, target):
+                shutil.move(src, target)
+            else:
+                shutil.copy2(src, target)
+
+            placed += 1
+
+    return placed
+
+
+def probe_venv(where, manifest, new_root):
+    rel = manifest.get("venv_python")
+
+    if not rel or not new_root:
+        return
+
+    exe = os.path.join(new_root, rel)
+
+    if not os.path.isfile(exe):
+        note("warning: the copied Strata has no venv python at %s - the server cannot start" % exe)
+        return
+
+    if probe_ok(exe):
+        return
+
+    note("the copied Strata venv does not run on this machine - rebuilding it from this Python")
+    venv_dir = os.path.dirname(os.path.dirname(exe))
+    site_dir = os.path.join(venv_dir, "Lib" if WINDOWS else "lib", "site-packages")
+    backup = os.path.join(venv_dir, ".site-backup")
+
+    try:
+        if os.path.isdir(site_dir):
+            merge_tree(site_dir, backup)
+
+        subprocess.run([sys.executable, "-m", "venv", venv_dir, "--clear"], timeout=180)
+
+        if os.path.isdir(backup):
+            merge_tree(backup, site_dir)
+            shutil.rmtree(backup, ignore_errors=True)
+    except Exception as exc:
+        note("the venv rebuild failed (%s)" % exc)
+        return
+
+    if probe_ok(exe):
+        note("the rebuilt venv runs fine")
+    else:
+        note("warning: even the rebuilt venv fails - the offline machine may need a "
+             "networked -Setup on a machine that has network")
+
+
+def probe_ok(exe):
+    try:
+        proc = subprocess.run([exe, "-c", "import sys"], timeout=30)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def write_state(where, manifest, new_root):
+    state = {}
+
+    if manifest.get("strata_version"):
+        state["StrataVersion"] = manifest["strata_version"]
+
+    if manifest.get("model_tag"):
+        state["Model"] = manifest["model_tag"]
+
+    if new_root:
+        state["StrataRoot"] = new_root
+
+    state["DataDir"] = where["models"]
+
+    with open(os.path.join(where["app"], "state.json"), "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+
+    note("state written: %s" % os.path.join(where["app"], "state.json"))
+
+
+def report(where, manifest, placed, new_root):
+    note("")
+    note("Reconstituted. From your project folder run:")
+    note("    python %s%sstrata-coder.py" % (where["scripts"], os.sep))
+    note("Optional scode shortcut (once):")
+    note("    python %s%sstrata-coder.py -Alias" % (where["scripts"], os.sep))
+
+    if not manifest.get("opencode"):
+        note("this bundle has no OpenCode: runs hold the server in the small window "
+             "(Close stops it); stop manually with -Stop when no window can show")
+
+    if placed == 0:
+        note("no models were placed: the setup is NOT functional until GGUF files sit in "
+             "the bundle's models folder (rerun this script after adding them) or in "
+             "%s by hand" % where["models"])
+
+    if manifest.get("engine_present") is False:
+        note("the bundle has no Strata engine file - a networked -Setup is needed before "
+             "this machine can serve anything")
+
+    note("Note: the Strata engine was compiled for the source PC's GPU; a very different "
+         "GPU may need a networked -Setup instead of this bundle.")
+
+
+def main():
+    base = None
+    args = sys.argv[1:]
+
+    if len(args) >= 2 and args[0] == "--base":
+        base = args[1]
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    zip_path = os.path.join(here, "offline-bundle.zip")
+
+    if not os.path.isfile(zip_path):
+        raise SystemExit("no offline-bundle.zip next to this script: %s" % zip_path)
+
+    where = roots(base)
+    os.makedirs(where["app"], exist_ok=True)
+    os.makedirs(where["scripts"], exist_ok=True)
+
+    with zipfile.ZipFile(zip_path) as zf:
+        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+        reconstitute(zf, where, manifest)
+
+    root_name = (manifest.get("strata_root") or {}).get("name")
+    new_root = os.path.join(where["app"], root_name) if root_name and os.path.isdir(
+        os.path.join(where["app"], root_name)) else None
+
+    placed = place_models(here, where)
+    fix_copied_settings(where, manifest, new_root)
+    write_state(where, manifest, new_root)
+    probe_venv(where, manifest, new_root)
+    report(where, manifest, placed, new_root)
+
+
+if __name__ == "__main__":
+    main()
+'''
 
 
 def _interactive_available():
@@ -3638,6 +4556,8 @@ def parse_args():
     parser.add_argument("-DataDir", dest="data_dir")
     parser.add_argument("-Port", dest="port", type=int)
     parser.add_argument("-NoLaunch", dest="no_launch", action="store_true")
+    parser.add_argument("-MakeOffline", dest="make_offline", action="store_true")
+    parser.add_argument("-Dest", dest="dest")
     parser.add_argument("-StartOpencode", dest="start_opencode", action="store_true")
     parser.add_argument("-NoOpencode", dest="no_opencode", action="store_true")
     parser.add_argument("-NoAlias", dest="no_alias", action="store_true")
@@ -3734,6 +4654,8 @@ def main():
         "no_launch": args.no_launch,
         "no_opencode": args.no_opencode,
         "opencode_specified": args.no_opencode or args.start_opencode,
+        "make_offline": args.make_offline,
+        "dest": args.dest or "",
         "no_alias": args.no_alias,
         "no_gui": args.no_gui,
         "update": args.update,
@@ -3825,6 +4747,15 @@ def main():
             write_warn("run logging is off: could not create the log (%s)" % exc)
             TRANSCRIPT = None
             TRANSCRIPT_PATH = None
+
+        # --------------------------------------------------------------------------------------------
+        # Offline installer bundle
+        # --------------------------------------------------------------------------------------------
+
+        if args.make_offline:
+            make_offline_bundle(state)
+            close_session_resources()
+            sys.exit(0)
 
         # --------------------------------------------------------------------------------------------
         # Hardware check

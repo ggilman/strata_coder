@@ -326,6 +326,45 @@ def start_opencode_info_text():
     ])
 
 
+OFFLINE_QUESTIONS = {
+    "dest": "Bundle folder (the zip, the loose models folder and reconstruct.py go here)",
+    "strata": "Pack the Strata install (its engine and settings)?",
+    "opencode": "Pack OpenCode?",
+    "ripgrep": "Pack ripgrep?",
+    "model": "Copy model %s (%.1f GB) to the bundle?",
+}
+
+
+def offline_info_text(which):
+    return {
+        "strata": "On: the whole Strata install on this PC (its engine, Python venv and model "
+                  "settings) is packed, so the offline machine needs no network to serve models. "
+                  "If Strata is not installed here, it is installed first (this build machine "
+                  "needs network; the offline target does not).\nOff: the offline machine gets no "
+                  "Strata at all - it cannot run the server.",
+        "opencode": "On: OpenCode's executable is packed so the offline machine can code with it. "
+                    "Off: the normal Start OpenCode off behavior - the offline machine runs "
+                    "Strata only; runs end holding the server in the small window.\nIf OpenCode "
+                    "is not on this PC it is downloaded (the baseline build, so any x86_64 CPU "
+                    "works).",
+        "ripgrep": "On: rg.exe is packed so OpenCode search on the offline machine is fast. "
+                   "Off: OpenCode still works, search is slower.",
+        "model": "Models are too big for the zip, so each chosen model folder is copied loose "
+                 "into the bundle's models folder next to the zip. Unchecked models are simply "
+                 "not copied - many people uncheck them and copy the GGUF files off by hand. "
+                 "The models folder is kept in the bundle even when empty: drop folders of "
+                 "GGUF files there and reconstruct.py places them like chosen models. "
+                 "Without models anywhere, the offline setup is not functional.",
+        "dest": "The output folder that becomes the whole offline installer: offline-bundle.zip "
+                "(everything except the models), the models folder (loose copies, kept even when "
+                "empty), reconstruct.py and README-offline.txt. Burn or copy that folder to any "
+                "media; on the offline machine only reconstruct.py runs - it places everything "
+                "at that machine's own normal per-user locations, moves model folders on the "
+                "same drive and copies across drives, and fixes the copied settings to the new "
+                "paths.",
+    }[which]
+
+
 def speed_nudge(variant, peers, ram_gb):
     """plain words: what a smaller size of the same family would buy in speed."""
     speed = variant.get("speed_tok_s")
@@ -837,6 +876,149 @@ def apply_setup(sc, result):
     subprocess.Popen(command, **options)
 
 
+def run_make_offline_gui(sc, prefill=None):
+    """The offline bundle window: check boxes for the packable pieces - Strata,
+    OpenCode, ripgrep and every model folder found on this PC, all checked by
+    default - plus the output folder. Returns the selection dict, or None when
+    the window is closed without pressing OK."""
+
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+
+    prefill = prefill or {}
+
+    saved = sc.read_json(sc.SETUP_PATH) or {}
+    found_models = sc.find_local_models(saved)
+
+    default_dest = prefill.get("dest") or sc.default_bundle_folder()
+
+    root = tk.Tk()
+    root.title("Strata Coder offline bundle")
+
+    body = ttk.Frame(root, padding=12)
+    body.grid(sticky="nsew")
+
+    intro = ("Checked items go into the bundle: copied from this PC, or downloaded if they are "
+             "not here. Models stay loose beside the zip because they are too big; the models "
+             "folder is kept even when empty, so GGUFs copied off by hand have a home. "
+             + ("%d model folder(s) found on this PC." % len(found_models)
+                if found_models else "No model folders found on this PC."))
+
+    ttk.Label(body, text=intro, wraplength=580, justify="left").grid(
+        row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+    def info_popup(title, text, color="black"):
+        popup = tk.Toplevel(root)
+        popup.title(title)
+        popup.resizable(False, False)
+
+        ttk.Label(popup, text=text, foreground=color, wraplength=560,
+                  justify="left").pack(padx=14, pady=(12, 4))
+        ttk.Button(popup, text="Close", command=popup.destroy).pack(padx=14, pady=(4, 12))
+        popup.transient(root)
+
+    def check_row(line, box_text, var, popup_title, info_key):
+        ttk.Checkbutton(body, text=box_text, variable=var).grid(row=line, column=1, sticky="w")
+        ttk.Button(body, text="\u24d8", width=4,
+                   command=lambda which=info_key, what=popup_title: info_popup(
+                       what, offline_info_text(which))).grid(
+            row=line, column=2, sticky="w", padx=(6, 0))
+
+    item_boxes = {"strata": "Strata install (checked = pack it)",
+                  "opencode": "OpenCode (checked = pack it)",
+                  "ripgrep": "ripgrep (checked = pack it)"}
+    item_titles = {"strata": "Strata install", "opencode": "OpenCode", "ripgrep": "ripgrep"}
+    item_vars = {}
+
+    for offset, key in enumerate(("strata", "opencode", "ripgrep")):
+        var = tk.StringVar(value="1")
+        item_vars[key] = var
+        check_row(1 + offset, item_boxes[key], var, item_titles[key], key)
+
+    model_vars = []
+
+    for offset, (name, _path, gb) in enumerate(found_models):
+        var = tk.StringVar(value="1")
+        model_vars.append(var)
+        check_row(4 + offset, "%s (%.1f GB) (checked = copy it)" % (name, gb),
+                  var, "Model %s" % name, "model")
+
+    dest_line = 4 + len(found_models)
+    ttk.Label(body, text="Save bundle to:").grid(row=dest_line, column=0, sticky="w",
+                                                 padx=(0, 8), pady=3)
+    dest_var = tk.StringVar(value=default_dest)
+    ttk.Entry(body, textvariable=dest_var, width=72).grid(row=dest_line, column=1, sticky="w")
+
+    def browse():
+        picked = filedialog.askdirectory(title="Bundle folder",
+                                         initialdir=os.path.expanduser("~"))
+
+        if picked:
+            dest_var.set(os.path.normpath(picked))
+
+    ttk.Button(body, text="Browse...", width=10, command=browse).grid(
+        row=dest_line, column=2, sticky="w", padx=(6, 0))
+
+    outcome = {}
+
+    def on_ok():
+        dest = dest_var.get().strip()
+
+        if not dest:
+            messagebox.showerror("Strata Coder offline bundle", "Pick the bundle folder.")
+            return
+
+        outcome["result"] = {
+            "dest": dest,
+            "items": {key: var.get() != "0" for key, var in item_vars.items()},
+            "models": {name: {"path": path, "include": var.get() != "0"}
+                       for (name, path, gb), var in zip(found_models, model_vars)},
+        }
+
+        root.destroy()
+
+    buttons = ttk.Frame(body)
+    buttons.grid(row=dest_line + 1, column=0, columnspan=3, sticky="e", pady=(14, 0))
+    ttk.Button(buttons, text="Cancel", command=root.destroy).pack(side="right", padx=(8, 0))
+    ttk.Button(buttons, text="OK", command=on_ok).pack(side="right")
+
+    root.resizable(False, False)
+    root.mainloop()
+
+    return outcome.get("result")
+
+
+def apply_make_offline(sc, result):
+    command = [sys.executable, CLI_PATH, "-MakeOffline", "-NoGui"]
+
+    if result.get("dest"):
+        command += ["-Dest", result["dest"]]
+
+    env = dict(os.environ)
+    env[sc.OFFLINE_SELECTION_ENV] = json.dumps({
+        "dest": result.get("dest") or "",
+        "items": result.get("items") or {},
+        "models": result.get("models") or {},
+    })
+
+    options = {"env": env}
+
+    if sc.IS_WINDOWS:
+        if ctypes.windll.kernel32.GetConsoleWindow() == 0:
+            options["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+    else:
+        for terminal in ("x-terminal-emulator", "xterm"):
+            path = shutil.which(terminal)
+
+            if path:
+                command = [path, "-e"] + command
+                break
+
+        options["start_new_session"] = True
+
+    subprocess.Popen(command, **options)
+
+
 def main():
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
@@ -845,6 +1027,16 @@ def main():
         sys.stderr = open(os.devnull, "w")
 
     sc = load_cli()
+
+    if os.environ.get(sc.OFFLINE_GUI_CHILD_ENV) is not None:
+        payload = json.loads(os.environ[sc.OFFLINE_GUI_CHILD_ENV] or "{}")
+
+        result = run_make_offline_gui(sc, payload.get("prefill"))
+
+        if result is not None:
+            apply_make_offline(sc, result)
+
+        return
 
     if os.environ.get(CHILD_ENV) is None:
         if not sc.is_available():

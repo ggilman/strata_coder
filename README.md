@@ -1,7 +1,11 @@
 # strata-coder
 
 This tool runs a local AI coding assistant: [OpenCode](https://opencode.ai), backed by **Qwen3.8-Flash-Next** served by
-[Strata](https://github.com/Niko1221/Strata). Everything installs per-user, so no admin rights and no Docker are needed.
+[Strata](https://github.com/Niko1221/Strata). OpenCode is optional: Strata can run on its own (uncheck **Start
+OpenCode** in the setup menu, or use `-NoOpencode` - runs then end holding the server, whose local endpoint
+`http://127.0.0.1:<port>/v1` you can call as an OpenAI/Anthropic API). And `-MakeOffline` builds an offline
+installer bundle - burn it to a DVD and reconstitute everything on a machine with no network access at all
+(see "The offline bundle" below). Everything installs per-user, so no admin rights and no Docker are needed.
 
 ## Install (once)
 
@@ -45,7 +49,8 @@ scode
 `scode` starts the server if needed and opens OpenCode in the current folder; when you quit
 OpenCode the server stops and RAM/VRAM are freed. Every command in the table below works the same
 way through `scode`. If **Start OpenCode** is unchecked in the setup menu, `scode` instead ends with
-a small window holding the server — the command returns right away and Close stops the server.
+a small window holding the server — the command returns right away, the window names the endpoint
+(`http://127.0.0.1:<port>/v1`, callable as an OpenAI/Anthropic API), and Close stops the server.
 
 If you skipped the shortcut, run the full path instead (`python D:\...\strata_coder\strata-coder.py`),
 put the `strata_coder` folder on your user PATH and type `strata-coder`, or add the shortcut later
@@ -58,6 +63,7 @@ specific shell when detection picks the wrong one.
 | `strata-coder -CheckOnly` | Shows the specs, the chosen model, disk space, and what is installed. Changes nothing |
 | `strata-coder -NoLaunch` | Sets up and starts the server only |
 | `strata-coder -NoOpencode` | Same as leaving Start OpenCode unchecked in the setup menu: OpenCode is never checked for or installed, isolation is ignored, and a run ends with a small window holding the server instead of OpenCode (its Close button stops the server); `-StartOpencode` forces it back on for the run |
+| `strata-coder -MakeOffline` | Builds an offline installer bundle (GUI menu, console with `-NoGui`): check boxes for the Strata install, OpenCode, ripgrep and every model folder found on this PC — all checked by default, uncheck any to leave out; a checked piece not on this PC is downloaded. The `-Dest` output folder (default `Documents\strata-offline-bundle`) gets one `offline-bundle.zip` (everything except the models), the chosen model folders copied loose beside it, and `reconstruct.py` — burn or copy the whole folder to media and reconstitute it on a machine with no network (see "The offline bundle" below) |
 | `strata-coder -Stop` | Stops the Strata server |
 | `strata-coder -Status` | Live dashboard of the running server: tokens/sec for the current answer plus the average over all answers, context use, GPU/RAM, uptime — in a GUI window when the machine can display one, otherwise refreshing in place in the console (Ctrl+C or closing the window quits) |
 | `python status.py [port]` | Opens the status dashboard directly; port defaults to the saved one |
@@ -213,8 +219,9 @@ installers). The window opens **detached**: the command you typed finishes right
 own, so your terminal is free; close the window to back out. The form has a variant dropdown (variants that don't
 fit this PC's RAM are marked), model folder with a **Browse…** button, port, an **Isolation** radio group
 (**None / Local Only / Docker / Podman / WSL Containers**), a **Start OpenCode** check box (unchecked: OpenCode is
-never checked for or installed and runs end with a small window that holds the server — its Close button stops the
-server, freeing RAM/VRAM), and **Context** and **KV cache** dropdowns — every one of them has an **ⓘ** popup that
+never checked for or installed and runs end with a small window that holds the server and names its local
+endpoint — its Close button stops the server, freeing RAM/VRAM), and **Context** and **KV cache** dropdowns —
+every one of them has an **ⓘ** popup that
 spells out its trade-offs.
 Fields come up pre-filled from `setup.json`, and command-line parameters (e.g. `strata-coder -Setup -Port 8081`)
 pre-fill over the saved values.
@@ -248,6 +255,37 @@ runs on its own. Without a display it refreshes a box-drawing panel in place in 
 quits). `-NoGui` forces the console panel, and the port defaults to the saved one — or pass it:
 `python status.py 8081`. The code for both presentations lives in `status.py`.
 
+## The offline bundle
+
+`scode -MakeOffline` builds everything a network-free machine needs, so you can burn it to a DVD or put
+it on a USB drive and reconstitute it later — the target machine never needs network access. The menu
+(GUI window; console with `-NoGui`) has a check box for every piece: the Strata install, OpenCode,
+ripgrep, and each model folder found on this PC (named with its size). All start checked; uncheck what
+you want left out — models are the big ones, so many people uncheck them and copy the GGUF folders off
+themselves (only models found on this PC are offered; a checked piece that is **not** on this PC is
+downloaded instead, so this build machine needs network but the offline target does not).
+
+The output folder (`-Dest`, default `Documents\strata-offline-bundle`) ends up holding one
+`offline-bundle.zip` — everything except the models: the complete Strata install (its engine, venv and
+model config), OpenCode, ripgrep, `setup.json`, Strata's `settings.json`, and the three scripts — plus
+the chosen model folders copied **loose** beside the zip (too big to zip), a `models` folder that is
+kept even when empty (drop GGUF folders you copied off by hand into it), `reconstruct.py`, and
+`README-offline.txt`. When no models were chosen the run says so: without models anywhere the offline
+setup will not be functional.
+
+On the offline machine: copy the whole bundle folder somewhere writable and run
+`python reconstruct.py`. It extracts the zip into that machine's own normal per-user locations (its
+user folders may differ from yours), places each folder in `models\` into `%USERPROFILE%\ai-models\models`
+— **moving** on the same drive so no extra space is consumed, **copying** across drives (a DVD is always
+a copy) — rewrites the copied settings (`state.json`, `setup.json`, Strata's `settings.json`, the
+model config file inside the Strata root) to the new paths, and if the copied model config points at
+GGUF files that are not present, drops that config so the first `scode` run reconfigures offline from
+the GGUFs sitting in the model folder. It prints where the scripts landed (`Documents\strata_coder`)
+and how to run them, and probes the copied Strata venv (rebuilding it from that machine's own Python
+if it does not run). A bundle built without OpenCode behaves exactly like Start OpenCode unchecked.
+One hardware caveat: the Strata engine in the zip was compiled on the source PC — if the offline
+machine's GPU is very different, a `-Setup` run on a networked machine is the way back.
+
 ## What it does
 
 1. **Checks the PC.** It looks at the NVIDIA GPU (needs RTX 20 or newer, 12 GB+ VRAM, and driver 580+), RAM, and CPU,
@@ -263,7 +301,8 @@ quits). `-NoGui` forces the console panel, and the port defaults to the saved on
 4. **Installs** Strata, the model, OpenCode, and [ripgrep](https://github.com/BurntSushi/ripgrep) into `%LOCALAPPDATA%\strata-coder\`. If interrupted, run it again and the download resumes. ripgrep is the `rg` command OpenCode uses for content search; its folder is added to `PATH` when OpenCode starts, and a failed ripgrep download is only a warning (search still works, just slower).
 5. **Starts the server** hidden on `http://127.0.0.1:8080/v1`, with its output in `%LOCALAPPDATA%\strata-coder\logs\server.log`. The server is OpenAI- and Anthropic-compatible. Each run also keeps a transcript in `logs\run-*.log`. A fresh install uses the tested Strata release (v0.1.40.3); `strata-coder -Update` moves Strata and OpenCode to their newest releases and keeps the old Strata if the new one fails to set up.
 6. **Opens OpenCode** in the current folder. Its config is in `%LOCALAPPDATA%\strata-coder\opencode.json`, so nothing is
-   written into your project.
+   written into your project. With Start OpenCode unchecked (`-NoOpencode`), OpenCode is never installed and the
+   run instead ends holding the server in a small window that names its local endpoint.
 
 When you quit OpenCode, the script stops the Strata server so RAM and VRAM are freed. With `-NoLaunch` the server keeps
 running after the script exits; stop it with `strata-coder -Stop`. With Start OpenCode unchecked the same cleanup happens
