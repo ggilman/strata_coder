@@ -91,6 +91,7 @@ GRADE_LETTERS = {"green": "+", "yellow": "!", "red": "x"}
 GUI_GRADE_COLORS = {"green": "#0a7d28", "yellow": "#a06b00", "red": "#c00000"}
 
 FASTEST_ICON = "\u26a1"
+PRESENT_ICON = "\U0001f4c4"
 QUALITY_STARS = {"best": "\u2605\u2605\u2605", "above IQ3_S": "\u2605\u2605\u2605",
                  "great": "\u2605\u2605", "better": "\u2605\u2605",
                  "good": "\u2605", "code only": "\u2605"}
@@ -101,7 +102,7 @@ def quality_stars(variant, star="\u2605"):
 
 
 def variant_label(variant, grade="", fastest=False, star="\u2605",
-                  fastest_icon=FASTEST_ICON):
+                  fastest_icon=FASTEST_ICON, present=False, present_icon=PRESENT_ICON):
     """The one-line label of a variant: '+ Qwen3.8-Flash-Next IQ3_S (60 GB, ~53 tok/s) \u2605\u2605\u2605'.
     grade and fastest come from the CLI (grade_variant() plus the fastest variant this PC can
     run); everything the short label drops - the full title, the grade reason, the best marker -
@@ -112,7 +113,8 @@ def variant_label(variant, grade="", fastest=False, star="\u2605",
         facts += ", ~%d tok/s%s" % (variant["speed_tok_s"],
                                     " " + fastest_icon if fastest else "")
 
-    text = "%s (%s) %s" % (short_name(variant), facts, quality_stars(variant, star))
+    name = "%s %s" % (present_icon, short_name(variant)) if present else short_name(variant)
+    text = "%s (%s) %s" % (name, facts, quality_stars(variant, star))
 
     if grade in GRADE_LETTERS:
         text = "%s %s" % (GRADE_LETTERS[grade], text)
@@ -120,10 +122,11 @@ def variant_label(variant, grade="", fastest=False, star="\u2605",
     return text
 
 
-def grade_legend(star="\u2605", fastest_icon=FASTEST_ICON):
+def grade_legend(star="\u2605", fastest_icon=FASTEST_ICON, present_icon=PRESENT_ICON):
     return ["+ full speed   ! runs with a cost   x not enough RAM here",
             "quality: %s good   %s%s better   %s%s%s best    %s = the fastest this PC can run"
-            % (star, star, star, star, star, star, fastest_icon),
+            "    %s = already on this PC"
+            % (star, star, star, star, star, star, fastest_icon, present_icon),
             "tok/s = answers per second (60+ is faster than reading)"]
 
 
@@ -398,7 +401,7 @@ def short_name(variant):
     return variant["title"].rsplit(" (", 1)[0]
 
 
-def variant_info_text(sc, variant, grade, note, ram_gb, is_best, fastest, peers):
+def variant_info_text(sc, variant, grade, note, ram_gb, is_best, fastest, peers, present=False):
     """the full details behind one variant, shown in the GUI's info popup."""
     lines = [variant["title"], ""]
 
@@ -435,8 +438,10 @@ def variant_info_text(sc, variant, grade, note, ram_gb, is_best, fastest, peers)
     lines.append("")
     lines.append("Quality: %s. More stars answer better but run slower; fewer stars run faster."
                  % variant.get("quality_word", ""))
-    lines.append("Model files: about %s GB to download; uses about %d GB of RAM while running."
-                 % (variant["download_gb"], variant["arena_gb"]))
+    lines.append("Model files: %s; uses about %d GB of RAM while running."
+                 % ("already on this PC (about %s GB)" % variant["download_gb"]
+                    if present else "about %s GB to download" % variant["download_gb"],
+                    variant["arena_gb"]))
     lines.append("Needs about %d GB RAM; this PC has %s GB."
                  % (variant["min_ram_gb"], ram_gb))
     lines.append("Trained context: %d tokens (%dk); beyond that Strata stretches it with "
@@ -656,12 +661,30 @@ def run_setup_gui(sc, overrides=None):
     variant_list.pack(side="left", fill="both")
     variant_scroll.pack(side="left", fill="y")
 
-    for index, v in enumerate(variant_rows):
-        grade, _note = grades[index]
-        variant_list.insert(tk.END, variant_label(v, grade, v is fastest_variant))
-        variant_list.itemconfig(index, foreground=GUI_GRADE_COLORS[grade])
+    data_dir_var = tk.StringVar(value=default_data_dir)
+    present_map = {}
 
-    variant_list.selection_set(default_index)
+    def refresh_variants(*_args):
+        cur_dir = data_dir_var.get().strip() or default_data_dir
+        selection = variant_list.curselection()
+        picked_idx = selection[0] if selection else default_index
+        yview = variant_list.yview()
+        variant_list.delete(0, tk.END)
+
+        for index, v in enumerate(variant_rows):
+            grade, _note = grades[index]
+            is_present = sc.variant_present(v, cur_dir, saved)
+            present_map[index] = is_present
+            variant_list.insert(
+                tk.END,
+                variant_label(v, grade, v is fastest_variant, present=is_present))
+            variant_list.itemconfig(index, foreground=GUI_GRADE_COLORS[grade])
+
+        variant_list.selection_set(picked_idx)
+        if yview:
+            variant_list.yview_moveto(yview[0])
+
+    refresh_variants()
     variant_list.see(default_index)
 
     ttk.Label(body, text="\n".join(grade_legend()), foreground="#666666",
@@ -686,21 +709,24 @@ def run_setup_gui(sc, overrides=None):
 
         info_popup(short_name(v),
                    variant_info_text(sc, v, grade, note, ram_gb, v is best_variant,
-                                     v is fastest_variant, variant_rows),
+                                     v is fastest_variant, variant_rows,
+                                     present=present_map.get(index, False)),
                    GUI_GRADE_COLORS[grade])
 
     ttk.Button(body, text="\u24d8", width=4, command=show_variant_info).grid(
         row=1, column=3, sticky="nw", padx=(6, 0))
 
     add_label("Model folder:", 3)
-    data_dir_var = tk.StringVar(value=default_data_dir)
-    ttk.Entry(body, textvariable=data_dir_var, width=72).grid(row=3, column=1, sticky="w")
+    data_dir_entry = ttk.Entry(body, textvariable=data_dir_var, width=72)
+    data_dir_entry.grid(row=3, column=1, sticky="w")
+    data_dir_entry.bind("<FocusOut>", refresh_variants)
 
     def browse():
         picked = filedialog.askdirectory(title="Model folder",
                                          initialdir=data_dir_var.get() or os.path.expanduser("~"))
         if picked:
             data_dir_var.set(os.path.normpath(picked))
+            refresh_variants()
 
     ttk.Button(body, text="Browse...", width=10, command=browse).grid(row=3, column=2,
                                                                       sticky="w", padx=(6, 0))

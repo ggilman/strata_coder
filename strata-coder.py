@@ -1664,6 +1664,77 @@ def find_strata_roots():
     return found
 
 
+def variant_tag(variant):
+    tag = (variant["model"] if variant["family"] == "qwen"
+           else "%s-%s" % (variant["family"], variant["model"]))
+    return tag.lower()
+
+
+def variant_present(variant, data_dir=None, saved=None):
+    """True when this variant is already configured in Strata or its GGUF shards are on disk."""
+    tag = variant_tag(variant)
+
+    for root in find_strata_roots():
+        if test_strata_config(root, tag):
+            config = read_json(os.path.join(root, "strata-%s.json" % tag))
+            native = get_config_arg_value(config, "--native") if config else None
+
+            if not native or os.path.isfile(native):
+                return True
+
+    shard_filter = model_shard_filter(variant["model"], True)
+    any_shard_filter = model_shard_filter(variant["model"], False)
+
+    hf_cache = (os.environ.get("HF_HUB_CACHE")
+                or (os.path.join(os.environ["HF_HOME"], "hub")
+                    if os.environ.get("HF_HOME") else None)
+                or os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub"))
+
+    repo = variant.get("repo")
+
+    if repo:
+        snapshots_dir = os.path.join(hf_cache, "models--" + repo.replace("/", "--"), "snapshots")
+
+        if os.path.isdir(snapshots_dir):
+            for snap in glob.glob(os.path.join(snapshots_dir, "*")):
+                for candidate in (snap, os.path.join(snap, variant["model"])):
+                    if (os.path.isdir(candidate)
+                            and count_matching(candidate, shard_filter) >= 1
+                            and count_matching(candidate, any_shard_filter) >= 2):
+                        return True
+
+    if saved is None:
+        saved = read_json(SETUP_PATH) or {}
+
+    search_dirs = []
+
+    for candidate in (data_dir,
+                      default_model_folder(saved),
+                      (read_json(STRATA_SETTINGS_PATH) or {}).get("data_dir")):
+        if candidate and os.path.isdir(candidate):
+            norm = os.path.normpath(os.path.expanduser(candidate))
+
+            if norm not in search_dirs:
+                search_dirs.append(norm)
+
+    is_swift = variant.get("family") == "swift"
+
+    for root in search_dirs:
+        for current, _dirs, files in os.walk(root):
+            if not any(fnmatch.fnmatch(name, shard_filter) for name in files):
+                continue
+
+            if count_matching(current, any_shard_filter) < 2:
+                continue
+
+            rel_path = os.path.relpath(current, root).lower()
+
+            if ("swift" in rel_path) == is_swift:
+                return True
+
+    return False
+
+
 def find_local_models(saved):
     """[(display name, folder path, size GB)] for model folders on this machine:
     the model folder plus Strata's last data_dir; any folder holding .gguf files
@@ -2890,19 +2961,22 @@ def prompt_setup_params(spec, state):
         fastest_variant = max(fitting, key=lambda v: v["speed_tok_s"]) if fitting else None
         star = "\u2605" if _encodable("\u2605") else "*"
         fastest_icon = "\u26a1" if _encodable("\u26a1") else ">>"
+        present_icon = "\U0001f4c4" if _encodable("\U0001f4c4") else "[local]"
         variant_options = []
 
         for v in variant_rows:
             grade, _note = grade_variant(v, spec["ram_gb"])
+            present = variant_present(v, default_data_dir, saved)
             variant_options.append({
                 "value": v,
                 "name": v["model"],
-                "label": menu.variant_label(v, grade, v is fastest_variant, star, fastest_icon),
+                "label": menu.variant_label(v, grade, v is fastest_variant, star, fastest_icon,
+                                            present=present, present_icon=present_icon),
                 "color": GRADE_COLORS[grade] if COLOR_ON else None,
             })
 
         selected = prompt_choice(menu.QUESTIONS["variant"], variant_options, selected,
-                                 menu.grade_legend(star, fastest_icon))
+                                 menu.grade_legend(star, fastest_icon, present_icon=present_icon))
 
     selected_data_dir = default_data_dir
 
