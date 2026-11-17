@@ -2736,7 +2736,7 @@ def prompt_setup_params(spec, state):
 
     if state["family"] or state["model"]:
         requested = get_candidates(state["family"], state["model"])
-        selected = pick_best_variant(requested, spec["ram_gb"]) or requested[0]
+        selected = pick_best_variant(requested, spec["ram_gb"]) or (requested[0] if requested else None)
     else:
         selected = pick_variant_default("", "", saved, spec["ram_gb"])
 
@@ -2861,10 +2861,9 @@ def get_smart_app_control_state():
             value, _ = winreg.QueryValueEx(key, "VerifiedAndReputablePolicyState")
         finally:
             winreg.CloseKey(key)
-    except OSError:
+        return {0: "off", 1: "on", 2: "evaluation"}.get(int(value))
+    except (OSError, TypeError, ValueError):
         return None
-
-    return {0: "off", 1: "on", 2: "evaluation"}.get(int(value))
 
 
 def get_smart_app_control_blocks(since_epoch):
@@ -2928,15 +2927,22 @@ def _ram_gb():
                 ("ullAvailExtendedVirtual", ctypes.c_uint64),
             ]
 
-        status = MEMORYSTATUSEX()
-        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-        return round(status.ullTotalPhys / (1024 ** 3), 1)
+        try:
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return 0
+            return round(status.ullTotalPhys / (1024 ** 3), 1)
+        except Exception:
+            return 0
 
-    with open("/proc/meminfo") as handle:
-        for line in handle:
-            if line.startswith("MemTotal:"):
-                return round(int(line.split()[1]) * 1024 / (1024 ** 3), 1)
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    return round(int(line.split()[1]) * 1024 / (1024 ** 3), 1)
+    except (OSError, ValueError, IndexError):
+        pass
     return 0
 
 
@@ -2974,8 +2980,9 @@ def _cpu_spec():
                     name = value
                 elif key == "cpu cores" and cores is None:
                     cores = get_int_setting(value, None)
-                elif key == "flags":
+                elif key == "flags" and not flags:
                     flags = value
+                if name != "unknown CPU" and cores is not None and flags:
                     break
     except OSError:
         pass
@@ -2999,7 +3006,7 @@ def get_system_spec():
             finally:
                 winreg.CloseKey(key)
             spec["os"] = (product + (" " + display if display else "")).strip()
-        except OSError:
+        except (OSError, TypeError, ValueError):
             spec["os"] = "Windows %s" % sys.getwindowsversion().major
     else:
         pretty = ""
@@ -3011,7 +3018,11 @@ def get_system_spec():
                         break
         except OSError:
             pass
-        spec["os"] = (pretty or "Linux") + " " + os.uname().release
+        try:
+            release = " " + os.uname().release
+        except Exception:
+            release = ""
+        spec["os"] = (pretty or "Linux") + release
 
     spec["ram_gb"] = _ram_gb()
     spec["cpu"], spec["cores"], spec["avx2"] = _cpu_spec()
@@ -3123,13 +3134,20 @@ def delete_strata_engine(root, data_dir):
     return deleted, failed
 
 
+def _read_exact(reader, size):
+    data = reader.read(size)
+    if len(data) != size:
+        raise EOFError("unexpected end of GGUF file")
+    return data
+
+
 def read_gguf_string(reader):
-    (length,) = struct.unpack("<Q", reader.read(8))
+    (length,) = struct.unpack("<Q", _read_exact(reader, 8))
 
     if length > 1048576:
         raise ValueError("GGUF string length %d is out of range" % length)
 
-    return reader.read(length).decode("utf-8", "replace")
+    return _read_exact(reader, length).decode("utf-8", "replace")
 
 
 GGUF_VALUE_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
@@ -3137,45 +3155,51 @@ GGUF_VALUE_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8
 
 def read_gguf_value(reader, value_type, depth=0):
     if value_type == 0:
-        return reader.read(1)[0]
+        return _read_exact(reader, 1)[0]
     if value_type == 1:
-        return struct.unpack("<b", reader.read(1))[0]
+        return struct.unpack("<b", _read_exact(reader, 1))[0]
     if value_type == 2:
-        return struct.unpack("<H", reader.read(2))[0]
+        return struct.unpack("<H", _read_exact(reader, 2))[0]
     if value_type == 3:
-        return struct.unpack("<h", reader.read(2))[0]
+        return struct.unpack("<h", _read_exact(reader, 2))[0]
     if value_type == 4:
-        return struct.unpack("<I", reader.read(4))[0]
+        return struct.unpack("<I", _read_exact(reader, 4))[0]
     if value_type == 5:
-        return struct.unpack("<i", reader.read(4))[0]
+        return struct.unpack("<i", _read_exact(reader, 4))[0]
     if value_type == 6:
-        return struct.unpack("<f", reader.read(4))[0]
+        return struct.unpack("<f", _read_exact(reader, 4))[0]
     if value_type == 7:
-        return reader.read(1)[0] != 0
+        return _read_exact(reader, 1)[0] != 0
     if value_type == 8:
         return read_gguf_string(reader)
     if value_type == 9:
-        (element_type,) = struct.unpack("<I", reader.read(4))
-        (count,) = struct.unpack("<Q", reader.read(8))
+        (element_type,) = struct.unpack("<I", _read_exact(reader, 4))
+        (count,) = struct.unpack("<Q", _read_exact(reader, 8))
 
         if depth >= 2:
             raise ValueError("GGUF array nesting is too deep")
 
+        if count > 1048576:
+            raise ValueError("GGUF array count %d is out of range" % count)
+
         element_size = GGUF_VALUE_SIZES.get(element_type, 0)
 
         if element_size > 0:
-            reader.seek(count * element_size, 1)
+            skip = count * element_size
+            if skip > 0:
+                reader.seek(skip - 1, 1)
+                _read_exact(reader, 1)
         else:
             for _ in range(count):
                 read_gguf_value(reader, element_type, depth + 1)
 
         return None
     if value_type == 10:
-        return struct.unpack("<Q", reader.read(8))[0]
+        return struct.unpack("<Q", _read_exact(reader, 8))[0]
     if value_type == 11:
-        return struct.unpack("<q", reader.read(8))[0]
+        return struct.unpack("<q", _read_exact(reader, 8))[0]
     if value_type == 12:
-        return struct.unpack("<d", reader.read(8))[0]
+        return struct.unpack("<d", _read_exact(reader, 8))[0]
 
     raise ValueError("unknown GGUF value type %d" % value_type)
 
@@ -3187,23 +3211,23 @@ def read_gguf_meta(path):
         with open(path, "rb") as raw:
             reader = io.BufferedReader(raw)
 
-            if reader.read(4) != b"GGUF":
+            if _read_exact(reader, 4) != b"GGUF":
                 return None
 
-            (version,) = struct.unpack("<I", reader.read(4))
+            (version,) = struct.unpack("<I", _read_exact(reader, 4))
 
             if version < 2 or version > 3:
                 return None
 
-            reader.read(8)
-            (n_kv,) = struct.unpack("<Q", reader.read(8))
+            _read_exact(reader, 8)
+            (n_kv,) = struct.unpack("<Q", _read_exact(reader, 8))
 
             if n_kv > 1048576:
                 return None
 
             for _ in range(n_kv):
                 key = read_gguf_string(reader)
-                (value_type,) = struct.unpack("<I", reader.read(4))
+                (value_type,) = struct.unpack("<I", _read_exact(reader, 4))
                 meta[key] = read_gguf_value(reader, value_type)
     except Exception:
         return None
@@ -3901,6 +3925,8 @@ def stage_sandbox_binaries(version, avx2):
         os.remove(os.path.join(build, "opencode"))
 
     if not os.path.isfile(os.path.join(build, "opencode")):
+        if not version:
+            raise RuntimeError("could not determine the OpenCode release version")
         asset = "opencode-linux-x64-baseline.tar.gz" if avx2 is False \
             else "opencode-linux-x64.tar.gz"
         url = "https://github.com/anomalyco/opencode/releases/download/%s/%s" % (version, asset)
@@ -4154,20 +4180,28 @@ class Handler(socketserver.BaseRequestHandler):
             except Exception:
                 pass
 
-        thread = threading.Thread(target=pump, args=(up, self.request))
-        thread.daemon = True
-        thread.start()
-        pump(self.request, up)
-        thread.join(timeout=3)
+        try:
+            thread = threading.Thread(target=pump, args=(up, self.request))
+            thread.daemon = True
+            thread.start()
+            pump(self.request, up)
+            thread.join(timeout=3)
+        finally:
+            for sock in (up, self.request):
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
 
 class Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
 
 
+os.makedirs(SOCK_DIR, exist_ok=True)
 try:
     os.unlink(SOCK_PATH)
-except FileNotFoundError:
+except OSError:
     pass
 
 server = Server(SOCK_PATH, Handler)
@@ -4225,6 +4259,8 @@ def wsl_exe():
 
 def wsl_wslpath(win_path):
     drive, rest = os.path.splitdrive(os.path.abspath(win_path))
+    if not drive:
+        return rest.replace("\\", "/")
     return "/mnt/%s%s" % (drive[0].lower(), rest.replace("\\", "/"))
 
 
@@ -4593,11 +4629,14 @@ def platform_machine():
 def first_mount_with_space(need_gb, exclude):
     if IS_WINDOWS:
         try:
+            excluded_drive = os.path.splitdrive(os.path.abspath(exclude))[0].lower() if exclude else ""
             buf = ctypes.create_unicode_buffer(256)
             ctypes.windll.kernel32.GetLogicalDriveStringsW(255, buf)
             roots = [r for r in buf.value.split("\0") if r]
             candidates = []
             for root in roots:
+                if excluded_drive and os.path.splitdrive(root)[0].lower() == excluded_drive:
+                    continue
                 try:
                     if ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(root)) == 3:
                         if shutil.disk_usage(root).free >= need_gb * (1024 ** 3):
@@ -4829,6 +4868,7 @@ def main():
 
         if state["setup"] and not state["check_only"]:
             if run_setup_menu(state):
+                close_session_resources()
                 sys.exit(0)
 
             saved_setup = prompt_setup_params(spec, state)
@@ -4857,7 +4897,7 @@ def main():
             if not state["port_specified"]:
                 saved_port = get_int_setting(saved_setup.get("port"), 0)
 
-                if saved_port > 0:
+                if PORT_MIN <= saved_port <= PORT_MAX:
                     state["port"] = saved_port
 
             if not state["isolation_specified"]:
@@ -4901,7 +4941,7 @@ def main():
                            % variant["title"])
 
         if not variant:
-            smallest = min(candidates, key=lambda v: v["min_ram_gb"]) \
+            smallest = min(candidates or VARIANTS, key=lambda v: v["min_ram_gb"]) \
                 if (family_specified or model_specified) else min(VARIANTS, key=lambda v: v["min_ram_gb"])
 
             message = ("%s/%s needs about %d GB RAM; this PC has %s GB."
@@ -5547,7 +5587,10 @@ def main():
             os.makedirs(LOG_DIR, exist_ok=True)
 
             if os.path.isfile(server_log):
-                shutil.move(server_log, os.path.join(LOG_DIR, "server.prev.log"))
+                try:
+                    shutil.move(server_log, os.path.join(LOG_DIR, "server.prev.log"))
+                except OSError:
+                    pass
 
             env = dict(os.environ)
             env["PYTHONUNBUFFERED"] = "1"
@@ -5859,6 +5902,7 @@ def main():
         if stop_strata_servers(port) == 0:
             write_skip("no Strata server process was found")
     except SystemExit:
+        close_session_resources()
         raise
     except KeyboardInterrupt:
         close_session_resources()
