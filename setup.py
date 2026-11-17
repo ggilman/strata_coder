@@ -37,6 +37,7 @@ QUESTIONS = {
     "kv": "KV cache",
     "port": "Server port",
     "isolation": "Isolation - keep OpenCode away from the internet?",
+    "startOpencode": "Start OpenCode?",
     "alias": "Add the scode shortcut to %s?",
 }
 
@@ -309,6 +310,22 @@ def isolation_options():
     return options
 
 
+def start_opencode_info_text():
+    return "\n".join([
+        "Start OpenCode",
+        "",
+        "On (the default): everything works as usual - OpenCode is checked for, installed,",
+        "and opened when you run scode.",
+        "",
+        "Off: setup never checks for or installs OpenCode, and isolation settings do nothing",
+        "because nothing OpenCode-related runs. When you run scode, the server still starts,",
+        "and instead of opening OpenCode the run ends with a small window that says Strata",
+        "is running: the terminal is free the moment the window opens, and clicking Close",
+        "stops the server and ends the process, freeing RAM and VRAM. If no window can be",
+        "shown, the server stays running and must be stopped manually with scode -Stop.",
+    ])
+
+
 def speed_nudge(variant, peers, ram_gb):
     """plain words: what a smaller size of the same family would buy in speed."""
     speed = variant.get("speed_tok_s")
@@ -441,6 +458,14 @@ def run_setup_gui(sc, overrides=None):
 
     if default_isolation == "wsl" and os.name != "nt":
         default_isolation = "none"
+
+    default_start_opencode = overrides.get("startOpencode")
+
+    if default_start_opencode is None:
+        default_start_opencode = (saved or {}).get("startOpencode")
+
+    if default_start_opencode is None:
+        default_start_opencode = True
 
     family, model = overrides["variant"] if "variant" in overrides else ("", "")
 
@@ -618,13 +643,22 @@ def run_setup_gui(sc, overrides=None):
                    command=lambda which=value, label=label: info_popup(label, isolation_info(which))).grid(
             row=line, column=2, sticky="w", padx=(6, 0))
 
-    add_label("scode shortcut:", 12)
+    add_label("Start OpenCode:", 12)
+    start_opencode_var = tk.StringVar(value="1" if default_start_opencode else "0")
+    ttk.Checkbutton(body, text="Start OpenCode (on by default)",
+                    variable=start_opencode_var).grid(row=12, column=1, sticky="w")
+    ttk.Button(body, text="\u24d8", width=4,
+               command=lambda: info_popup("Start OpenCode",
+                                          start_opencode_info_text())).grid(
+        row=12, column=2, sticky="w", padx=(6, 0))
+
+    add_label("scode shortcut:", 13)
     shell_var = tk.StringVar(value="auto")
     ttk.Combobox(body, textvariable=shell_var, values=alias_shells,
-                 width=12).grid(row=12, column=1, sticky="w")
+                 width=12).grid(row=13, column=1, sticky="w")
 
     alias_status = ttk.Label(body, text="", foreground="#666666", wraplength=240, justify="left")
-    alias_status.grid(row=13, column=1, sticky="w", padx=(12, 0))
+    alias_status.grid(row=14, column=1, sticky="w", padx=(12, 0))
 
     def do_alias():
         shell = sc.get_calling_shell() if shell_var.get() == "auto" else shell_var.get()
@@ -642,14 +676,14 @@ def run_setup_gui(sc, overrides=None):
                  % shell_names.get(shell, shell))
 
     scode_row = ttk.Frame(body)
-    scode_row.grid(row=13, column=0, sticky="w")
+    scode_row.grid(row=14, column=0, sticky="w")
     ttk.Button(scode_row, text="Set Alias", width=10, command=do_alias).pack(side="left")
     ttk.Button(scode_row, text="\u24d8", width=4,
                command=lambda: info_popup("scode shortcut", scode_info_text())).pack(
         side="left", padx=(6, 0))
 
     engine_status = ttk.Label(body, text="", foreground="#666666", wraplength=240, justify="left")
-    engine_status.grid(row=14, column=1, sticky="w", padx=(12, 0))
+    engine_status.grid(row=15, column=1, sticky="w", padx=(12, 0))
 
     def do_purge_engine():
         state_json = sc.read_json(sc.STATE_PATH) or {}
@@ -697,7 +731,7 @@ def run_setup_gui(sc, overrides=None):
                                     text="no downloaded Strata engine found - nothing to delete")
 
     engine_row = ttk.Frame(body)
-    engine_row.grid(row=14, column=0, sticky="w")
+    engine_row.grid(row=15, column=0, sticky="w")
     ttk.Button(engine_row, text="Delete Strata", width=14,
                command=do_purge_engine).pack(side="left")
     ttk.Button(engine_row, text="\u24d8", width=4,
@@ -749,6 +783,7 @@ def run_setup_gui(sc, overrides=None):
             "kv": kv,
             "port": int(port_text),
             "isolation": isolation_var.get(),
+            "startOpencode": start_opencode_var.get() != "0",
         }
 
         root.destroy()
@@ -756,7 +791,7 @@ def run_setup_gui(sc, overrides=None):
     variant_list.bind("<Double-Button-1>", lambda _event: on_ok())
 
     buttons = ttk.Frame(body)
-    buttons.grid(row=15, column=0, columnspan=4, sticky="e", pady=(14, 0))
+    buttons.grid(row=16, column=0, columnspan=4, sticky="e", pady=(14, 0))
     ttk.Button(buttons, text="Cancel", command=root.destroy).pack(side="right", padx=(8, 0))
     ttk.Button(buttons, text="OK", command=on_ok).pack(side="right")
 
@@ -779,6 +814,7 @@ def apply_setup(sc, result):
         "-Kv", result["kv"],
         "-Port", str(result["port"]),
         "-Isolation", result["isolation"],
+        "-StartOpencode" if result.get("startOpencode", True) else "-NoOpencode",
         "-NoAlias",
         "-NoGui",
     ]

@@ -7,7 +7,7 @@ Modes:
     strata-coder.py [-CheckOnly] [-Family qwen|swift|coder|unsloth] [-Model NAME] [-Context N]
         [-Kv int8|k8v4|q4_0] [-DataDir PATH] [-Port N] [-NoLaunch] [-Update]
         [-Stop] [-Status] [-Setup] [-Isolation none|local|docker|podman|wsl] [-Alias] [-NoAlias] [-NoGui]
-        [-AliasShell auto|cmd|powershell|bash|zsh] [-Help]
+        [-AliasShell auto|cmd|powershell|bash|zsh] [-StartOpencode|-NoOpencode] [-Help]
 """
 
 import argparse
@@ -1192,6 +1192,14 @@ Options:
   -Setup                     Interactive setup menu, then install and stop.
   -CheckOnly                 Show specs and installs; change nothing.
   -NoLaunch                  Set up and start the server without OpenCode.
+  -NoOpencode                Same as leaving Start OpenCode unchecked in the
+                             setup menu: OpenCode is never checked for or
+                             installed, isolation is ignored, and instead of
+                             opening OpenCode the run ends with a small
+                             window that holds the server - its Close
+                             button stops the server and ends the process.
+  -StartOpencode             Force Start OpenCode on for this run, even when
+                             setup.json has it unchecked.
   -Stop                      Stop the Strata server.
   -Status                    Live tokens/sec panel: a GUI window when the
                              machine can display one, otherwise refreshing
@@ -1415,6 +1423,47 @@ def spawn_detached_gui(script_path, env_vars=None, extra_args=None):
     subprocess.Popen([sys.executable, script_path] + list(extra_args or ()), **options)
 
 
+SESSION_HOLD_ENV = "STRATA_SESSION_HOLD"
+
+
+def session_hold_gui():
+    """The detached child of a run whose Start OpenCode switch is off: this process is
+    attached to the small window instead of a terminal. Closing the window stops the
+    Strata server so RAM/VRAM are freed; the parent command already finished."""
+    try:
+        payload = json.loads(os.environ[SESSION_HOLD_ENV])
+    except (ValueError, TypeError):
+        payload = {}
+
+    port = int(payload.get("port") or 0)
+
+    if port:
+        write_info("holding the Strata session on port %d" % port)
+
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+
+        root = tk.Tk()
+        root.title("Strata Coder")
+        root.resizable(False, False)
+
+        hold_text = ("Strata is running - use it as an OpenAI/Anthropic API at:\nhttp://127.0.0.1:%d/v1\nClick Close to exit the process" % port
+                     if port else "Strata is running.\nClick Close to exit the process")
+
+        ttk.Label(root, text=hold_text).pack(padx=14, pady=(14, 4))
+        ttk.Button(root, text="Close", command=root.destroy).pack(padx=14, pady=(4, 14))
+
+        root.mainloop()
+    except Exception as exc:
+        write_warn("the hold window failed (%s)" % exc)
+
+    write_step("Closing the session window")
+
+    if stop_strata_servers(port) == 0:
+        write_skip("no Strata server process was found")
+
+
 def run_setup_menu(state):
     menu = load_setup()
 
@@ -1440,6 +1489,9 @@ def run_setup_menu(state):
 
     if state["isolation_specified"]:
         overrides["isolation"] = state["isolation"]
+
+    if state["opencode_specified"]:
+        overrides["startOpencode"] = not state["no_opencode"]
 
     spawn_detached_gui(MENU_PATH, {menu.CHILD_ENV: json.dumps(overrides)})
 
@@ -1835,6 +1887,17 @@ def prompt_setup_params(spec, state):
         fail("the WSL isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
              "For the same wall on this system use docker or podman: -Isolation docker or podman")
 
+    default_start_opencode = (saved or {}).get("startOpencode")
+
+    if default_start_opencode is None:
+        default_start_opencode = True
+
+    if state["opencode_specified"]:
+        selected_start_opencode = not state["no_opencode"]
+    else:
+        selected_start_opencode = prompt_yes_no(menu.QUESTIONS["startOpencode"],
+                                                default_start_opencode)
+
     calling_shell = get_calling_shell()
 
     if state["no_alias"]:
@@ -1850,6 +1913,7 @@ def prompt_setup_params(spec, state):
         "dataDir": selected_data_dir,
         "port": selected_port,
         "isolation": selected_isolation,
+        "startOpencode": selected_start_opencode,
     }
 
     os.makedirs(APP_DIR, exist_ok=True)
@@ -3574,6 +3638,8 @@ def parse_args():
     parser.add_argument("-DataDir", dest="data_dir")
     parser.add_argument("-Port", dest="port", type=int)
     parser.add_argument("-NoLaunch", dest="no_launch", action="store_true")
+    parser.add_argument("-StartOpencode", dest="start_opencode", action="store_true")
+    parser.add_argument("-NoOpencode", dest="no_opencode", action="store_true")
     parser.add_argument("-NoAlias", dest="no_alias", action="store_true")
     parser.add_argument("-NoGui", dest="no_gui", action="store_true")
     parser.add_argument("-Update", dest="update", action="store_true")
@@ -3589,6 +3655,9 @@ def parse_args():
 
     if args.port is not None and not PORT_MIN <= args.port <= PORT_MAX:
         parser.error("-Port must be between %d and %d" % (PORT_MIN, PORT_MAX))
+
+    if args.no_opencode and args.start_opencode:
+        parser.error("-StartOpencode and -NoOpencode contradict each other")
 
     if unknown:
         parser.error("unrecognized arguments: %s" % " ".join(unknown))
@@ -3643,6 +3712,10 @@ def first_mount_with_space(need_gb, exclude):
 def main():
     global TRANSCRIPT, TRANSCRIPT_PATH, SETUP_LOCK, COLOR_ON
 
+    if os.environ.get(SESSION_HOLD_ENV):
+        session_hold_gui()
+        sys.exit(0)
+
     args = parse_args()
 
     state = {
@@ -3659,6 +3732,8 @@ def main():
         "data_dir_specified": args.data_dir is not None,
         "port_specified": args.port is not None,
         "no_launch": args.no_launch,
+        "no_opencode": args.no_opencode,
+        "opencode_specified": args.no_opencode or args.start_opencode,
         "no_alias": args.no_alias,
         "no_gui": args.no_gui,
         "update": args.update,
@@ -3857,6 +3932,9 @@ def main():
             if not state["isolation_specified"]:
                 state["isolation"] = saved_isolation(saved_setup)
 
+            if not state["opencode_specified"] and saved_setup.get("startOpencode") is False:
+                state["no_opencode"] = True
+
         isolation = state["isolation"] or "none"
 
         if isolation == "wsl" and not IS_WINDOWS:
@@ -3866,6 +3944,16 @@ def main():
         local_guard = isolation == "local"
         container_backend = isolation if isolation in CONTAINER_ISOLATIONS else None
         wsl_active = isolation == "wsl"
+
+        opencode_off = state["no_opencode"]
+
+        if opencode_off:
+            if isolation != "none":
+                write_warn("isolation is ignored while Start OpenCode is off: nothing OpenCode-related runs")
+
+            local_guard = False
+            container_backend = None
+            wsl_active = False
 
         candidates = get_candidates(family_filter, model_filter)
 
@@ -3985,7 +4073,7 @@ def main():
         open_code_present = False
         open_code_version = None
 
-        if os.path.isfile(OPENCODE_EXE):
+        if not opencode_off and os.path.isfile(OPENCODE_EXE):
             rc, version_output = run_native(OPENCODE_EXE, ["--version"])
 
             if rc == 0:
@@ -3994,6 +4082,9 @@ def main():
 
         if open_code_present:
             write_ok("OpenCode %s" % open_code_version)
+        elif opencode_off:
+            write_info("OpenCode: off (not checked or installed; tick Start OpenCode in the setup "
+                       "menu to use it)")
         else:
             write_info("OpenCode: not installed (target: %s)" % OPENCODE_DIR)
 
@@ -4137,7 +4228,7 @@ def main():
         if strata_target or not model_ready:
             tools_need_gb += 3
 
-        if not open_code_present or open_code_release:
+        if not opencode_off and (not open_code_present or open_code_release):
             tools_need_gb += 1
 
         if IS_WINDOWS:
@@ -4187,7 +4278,9 @@ def main():
             else:
                 model_line = "would be downloaded (about %s GB)" % variant["download_gb"]
 
-            if open_code_release:
+            if opencode_off:
+                opencode_line = "off (Start OpenCode unchecked; not checked or installed)"
+            elif open_code_release:
                 opencode_line = "would be updated to %s" % open_code_release["tag_name"]
             elif open_code_present:
                 opencode_line = "installed"
@@ -4352,7 +4445,9 @@ def main():
         # OpenCode installation
         # --------------------------------------------------------------------------------------------
 
-        if not open_code_present or open_code_release:
+        if opencode_off:
+            write_skip("OpenCode not installed (Start OpenCode is off)")
+        elif not open_code_present or open_code_release:
             write_step("Updating OpenCode" if open_code_release else "Installing OpenCode")
 
             release = open_code_release or get_latest_release("anomalyco/opencode")
@@ -4687,19 +4782,22 @@ def main():
 
         open_code_json = json.dumps(open_code_config, indent=2)
 
-        old_open_code_json = ""
-        if os.path.isfile(OPENCODE_CFG):
-            try:
-                with open(OPENCODE_CFG, "r", encoding="utf-8-sig") as handle:
-                    old_open_code_json = handle.read()
-            except OSError:
-                pass
-
-        if old_open_code_json.strip() != open_code_json.strip():
-            write_text_file(OPENCODE_CFG, open_code_json)
-            write_ok("OpenCode config written: " + OPENCODE_CFG)
+        if opencode_off:
+            write_skip("OpenCode config not written (Start OpenCode is off)")
         else:
-            write_skip("OpenCode config is already current")
+            old_open_code_json = ""
+            if os.path.isfile(OPENCODE_CFG):
+                try:
+                    with open(OPENCODE_CFG, "r", encoding="utf-8-sig") as handle:
+                        old_open_code_json = handle.read()
+                except OSError:
+                    pass
+
+            if old_open_code_json.strip() != open_code_json.strip():
+                write_text_file(OPENCODE_CFG, open_code_json)
+                write_ok("OpenCode config written: " + OPENCODE_CFG)
+            else:
+                write_skip("OpenCode config is already current")
 
         # --------------------------------------------------------------------------------------------
         # Launch OpenCode
@@ -4722,6 +4820,28 @@ def main():
                            "interfaces; the model is reached through a WSL-side relay")
 
             write_info("stop the Strata server with: strata-coder -Stop (or scode -Stop)")
+            sys.exit(0)
+
+        if opencode_off:
+            if is_available():
+                try:
+                    spawn_detached_gui(SCRIPT_PATH, {SESSION_HOLD_ENV: json.dumps({"port": port})})
+
+                    write_step("Ready - this command finished; the terminal is free")
+                    write_info("Strata is running on http://127.0.0.1:%d/v1" % port)
+                    write_info("a small window now holds the session instead of OpenCode: click its "
+                               "Close button to stop the Strata server and end the process")
+
+                    sys.exit(0)
+                except OSError as exc:
+                    write_warn("the hold window could not be opened (%s)" % exc)
+
+            write_step("Ready")
+            write_info("server: http://127.0.0.1:%d/v1" % port)
+            write_info("OpenCode is off (Start OpenCode unchecked) and no hold window could be opened "
+                       "for this display")
+            write_info("the Strata server stays running and keeps RAM/VRAM in use - it must be "
+                       "stopped manually: strata-coder -Stop (or scode -Stop)")
             sys.exit(0)
 
         write_step("Opening OpenCode in a %s sandbox from %s"

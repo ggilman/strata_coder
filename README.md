@@ -44,7 +44,8 @@ scode
 
 `scode` starts the server if needed and opens OpenCode in the current folder; when you quit
 OpenCode the server stops and RAM/VRAM are freed. Every command in the table below works the same
-way through `scode`.
+way through `scode`. If **Start OpenCode** is unchecked in the setup menu, `scode` instead ends with
+a small window holding the server — the command returns right away and Close stops the server.
 
 If you skipped the shortcut, run the full path instead (`python D:\...\strata_coder\strata-coder.py`),
 put the `strata_coder` folder on your user PATH and type `strata-coder`, or add the shortcut later
@@ -56,6 +57,7 @@ specific shell when detection picks the wrong one.
 | `strata-coder` | Sets up whatever is missing, starts the server, and opens OpenCode in the current folder |
 | `strata-coder -CheckOnly` | Shows the specs, the chosen model, disk space, and what is installed. Changes nothing |
 | `strata-coder -NoLaunch` | Sets up and starts the server only |
+| `strata-coder -NoOpencode` | Same as leaving Start OpenCode unchecked in the setup menu: OpenCode is never checked for or installed, isolation is ignored, and a run ends with a small window holding the server instead of OpenCode (its Close button stops the server); `-StartOpencode` forces it back on for the run |
 | `strata-coder -Stop` | Stops the Strata server |
 | `strata-coder -Status` | Live dashboard of the running server: tokens/sec for the current answer plus the average over all answers, context use, GPU/RAM, uptime — in a GUI window when the machine can display one, otherwise refreshing in place in the console (Ctrl+C or closing the window quits) |
 | `python status.py [port]` | Opens the status dashboard directly; port defaults to the saved one |
@@ -178,9 +180,17 @@ plain `+ - |` frames are used instead.
       standard packages inside the distro (`systemd-container`, `debootstrap`) and builds the
       sandbox rootfs there; the Strata server and GPU stay on Windows and `-Status` works
       unchanged.
- 7. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
-   Git Bash), the same as `strata-coder -Alias`. Open a new shell window afterwards to pick it up. The GUI handles the
-   shortcut differently: it is an instant action there, not a question — see the GUI section.
+  7. **Start OpenCode?** — yes/no (default yes). With yes, everything works as usual. With **no**, OpenCode is never
+       checked for or installed (the Isolation choice does nothing while it is off), and running `scode` afterwards
+       starts the server and then ends with a small window that says "Strata is running", names the
+       local endpoint (`http://127.0.0.1:<port>/v1`) you can call the server as an OpenAI/Anthropic API at,
+       and tells you to click Close to exit the
+       process": the command returns and your terminal is free the moment the window opens, and clicking Close stops
+       the Strata server and ends the attached process, freeing RAM/VRAM. If no window can be shown the server stays
+       running and must be stopped manually with `scode -Stop`. Re-tick it in the setup menu to go back to normal.
+  8. **Add the `scode` shortcut?** — yes/no. Adds the `scode` alias to the detected shell (Command Prompt, PowerShell, or
+       Git Bash), the same as `strata-coder -Alias`. Open a new shell window afterwards to pick it up. The GUI handles the
+       shortcut differently: it is an instant action there, not a question — see the GUI section.
 
 When the install finishes, `-Setup` prints a **memory stability** summary: the estimated peak RAM the
 server will use with your chosen variant, context, and KV cache (the KV cache size is measured from the
@@ -202,8 +212,10 @@ The same menu also exists as one Tkinter window, opened directly with `python se
 installers). The window opens **detached**: the command you typed finishes right away and the window lives on its
 own, so your terminal is free; close the window to back out. The form has a variant dropdown (variants that don't
 fit this PC's RAM are marked), model folder with a **Browse…** button, port, an **Isolation** radio group
-(**None / Local Only / Docker / Podman / WSL Containers**), and
-**Context** and **KV cache** dropdowns — every one of them has an **ⓘ** popup that spells out its trade-offs.
+(**None / Local Only / Docker / Podman / WSL Containers**), a **Start OpenCode** check box (unchecked: OpenCode is
+never checked for or installed and runs end with a small window that holds the server — its Close button stops the
+server, freeing RAM/VRAM), and **Context** and **KV cache** dropdowns — every one of them has an **ⓘ** popup that
+spells out its trade-offs.
 Fields come up pre-filled from `setup.json`, and command-line parameters (e.g. `strata-coder -Setup -Port 8081`)
 pre-fill over the saved values.
 
@@ -254,7 +266,9 @@ quits). `-NoGui` forces the console panel, and the port defaults to the saved on
    written into your project.
 
 When you quit OpenCode, the script stops the Strata server so RAM and VRAM are freed. With `-NoLaunch` the server keeps
-running after the script exits; stop it with `strata-coder -Stop`.
+running after the script exits; stop it with `strata-coder -Stop`. With Start OpenCode unchecked the same cleanup happens
+when you click Close in the hold window — the window is where the process lives, not the terminal (which is already free);
+if no window could be opened, the server stays running and must be stopped manually with `strata-coder -Stop`.
 
 ## Isolation
 
