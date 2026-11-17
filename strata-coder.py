@@ -510,26 +510,34 @@ def close_session_resources():
 
 def lock_file(path):
     handle = open(path, "a+")
-    if IS_WINDOWS:
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-    else:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        if IS_WINDOWS:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        handle.close()
+        raise
     return handle
 
 
 def lock_file_blocking(path):
     handle = open(path, "a+")
-    if IS_WINDOWS:
-        while True:
-            try:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                break
-            except OSError:
-                time.sleep(1)
-    else:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    try:
+        if IS_WINDOWS:
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    except BaseException:
+        handle.close()
+        raise
     return handle
 
 
@@ -540,6 +548,8 @@ def unlock_file(handle):
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
     finally:
         handle.close()
 
@@ -628,7 +638,7 @@ def http_head_size(url):
     request.add_header("User-Agent", "strata-coder")
     with urllib.request.urlopen(request, timeout=15) as response:
         value = response.headers.get("Content-Length")
-        return int(value) if value else None
+        return int(value) if value and value.strip().isdigit() else None
 
 
 def download_file(url, out_file):
@@ -685,16 +695,37 @@ def download_file(url, out_file):
         raise RuntimeError("could not download %s (%s)" % (url, exc))
 
 
+def _is_within_directory(base_dir, target_path):
+    base_real = os.path.realpath(base_dir)
+    target_real = os.path.realpath(target_path)
+    try:
+        return os.path.commonpath([base_real, target_real]) == base_real
+    except ValueError:
+        return False
+
+
 def extract_archive(archive, destination):
     os.makedirs(destination, exist_ok=True)
     if archive.lower().endswith(".zip"):
         with zipfile.ZipFile(archive) as zf:
+            for member in zf.infolist():
+                target = os.path.join(destination, member.filename)
+                if not _is_within_directory(destination, target):
+                    raise RuntimeError("unsafe path in archive: %s" % member.filename)
             zf.extractall(destination)
     else:
         with tarfile.open(archive, "r:*") as tf:
             try:
                 tf.extractall(destination, filter="data")
             except TypeError:
+                for member in tf.getmembers():
+                    target = os.path.join(destination, member.name)
+                    if not _is_within_directory(destination, target):
+                        raise RuntimeError("unsafe path in archive: %s" % member.name)
+                    if member.issym() or member.islnk():
+                        link_base = os.path.dirname(target) if member.issym() else destination
+                        if not _is_within_directory(destination, os.path.join(link_base, member.linkname)):
+                            raise RuntimeError("unsafe link in archive: %s" % member.name)
                 tf.extractall(destination)
 
 
@@ -804,7 +835,7 @@ def strata_health(server_port):
         request = urllib.request.Request("http://127.0.0.1:%d/health" % server_port)
         with urllib.request.urlopen(request, timeout=5) as response:
             health = json.load(response)
-        if health.get("service") == "strata":
+        if isinstance(health, dict) and health.get("service") == "strata":
             return health
     except Exception:
         pass
@@ -816,7 +847,10 @@ def strata_models(server_port):
         request = urllib.request.Request("http://127.0.0.1:%d/v1/models" % server_port)
         with urllib.request.urlopen(request, timeout=10) as response:
             body = json.load(response)
-        return [m for m in body.get("data", []) if m and m.get("id") and str(m["id"]).strip()]
+        if not isinstance(body, dict):
+            return []
+        return [m for m in (body.get("data") or [])
+                if isinstance(m, dict) and m.get("id") and str(m["id"]).strip()]
     except Exception:
         return []
 
@@ -1407,11 +1441,27 @@ def load_status():
     return load_companion(STATUS_PATH, "strata_status_panel", "to show the status panel")
 
 
+def _enable_dpi_awareness():
+    if not IS_WINDOWS:
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 def is_available():
     try:
         import tkinter as tk
     except ImportError:
         return False
+
+    _enable_dpi_awareness()
 
     try:
         root = tk.Tk()
@@ -1453,11 +1503,14 @@ def session_hold_gui():
     attached to the small window instead of a terminal. Closing the window stops the
     Strata server so RAM/VRAM are freed; the parent command already finished."""
     try:
-        payload = json.loads(os.environ[SESSION_HOLD_ENV])
+        payload = json.loads(os.environ.get(SESSION_HOLD_ENV) or "{}")
     except (ValueError, TypeError):
         payload = {}
 
-    port = int(payload.get("port") or 0)
+    if not isinstance(payload, dict):
+        payload = {}
+
+    port = get_int_setting(payload.get("port"), 0)
 
     if port:
         write_info("holding the Strata session on port %d" % port)
@@ -1466,15 +1519,71 @@ def session_hold_gui():
         import tkinter as tk
         from tkinter import ttk
 
+        _enable_dpi_awareness()
+
         root = tk.Tk()
         root.title("Strata Coder")
         root.resizable(False, False)
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.bind("<Escape>", lambda _event: root.destroy())
 
-        hold_text = ("Strata is running - use it as an OpenAI/Anthropic API at:\nhttp://127.0.0.1:%d/v1\nClick Close to exit the process" % port
-                     if port else "Strata is running.\nClick Close to exit the process")
+        body = ttk.Frame(root, padding=16)
+        body.pack(fill="both", expand=True)
 
-        ttk.Label(root, text=hold_text).pack(padx=14, pady=(14, 4))
-        ttk.Button(root, text="Close", command=root.destroy).pack(padx=14, pady=(4, 14))
+        header_font = ("Segoe UI", 11, "bold") if IS_WINDOWS else ("Sans", 11, "bold")
+        code_font = ("Consolas", 10) if IS_WINDOWS else ("Monospace", 10)
+
+        ttk.Label(body, text="Strata Server Running", font=header_font).pack(
+            anchor="w", pady=(0, 6))
+
+        if port:
+            endpoint = "http://127.0.0.1:%d/v1" % port
+            ttk.Label(body, text="OpenAI / Anthropic compatible API endpoint:").pack(anchor="w")
+            ttk.Label(body, text=endpoint, font=code_font, foreground="#107c10").pack(
+                anchor="w", pady=(2, 6))
+            ttk.Label(body, text="Click Close when finished to stop the server and free RAM/VRAM.",
+                      foreground="#555555").pack(anchor="w", pady=(0, 12))
+        else:
+            endpoint = None
+            ttk.Label(body, text="Strata is running.\nClick Close when finished to stop the server.").pack(
+                anchor="w", pady=(0, 12))
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x")
+
+        if endpoint:
+            copy_after = {"id": None}
+
+            def copy_endpoint():
+                try:
+                    root.clipboard_clear()
+                    root.clipboard_append(endpoint)
+                    root.update_idletasks()
+                    copy_btn.configure(text="Copied!")
+                    if copy_after["id"] is not None:
+                        try:
+                            root.after_cancel(copy_after["id"])
+                        except Exception:
+                            pass
+                    copy_after["id"] = root.after(
+                        1500, lambda: copy_btn.configure(text="Copy Endpoint"))
+                except Exception:
+                    pass
+
+            copy_btn = ttk.Button(btn_row, text="Copy Endpoint", width=15, command=copy_endpoint)
+            copy_btn.pack(side="left", padx=(0, 6))
+
+        if os.path.isfile(STATUS_PATH):
+            def open_status():
+                extra = [str(port)] if port else None
+                spawn_detached_gui(STATUS_PATH, {"STRATA_STATUS_GUI_CHILD": "1"}, extra)
+
+            ttk.Button(btn_row, text="Open Status", width=13, command=open_status).pack(
+                side="left", padx=(0, 6))
+
+        close_btn = ttk.Button(btn_row, text="Close", width=10, command=root.destroy)
+        close_btn.pack(side="right")
+        close_btn.focus_set()
 
         root.mainloop()
     except Exception as exc:
@@ -1606,14 +1715,17 @@ def find_local_models(saved):
 def stage_release_asset(repo, asset_name, exe_name, stage_name):
     """Download a release asset and stage its executable (kept out of the installs)."""
     release = get_latest_release(repo)
-    asset = next((a for a in (release or {}).get("assets", []) if a.get("name") == asset_name), None)
+    asset = next(
+        (a for a in (release or {}).get("assets", [])
+         if fnmatch.fnmatch(a.get("name", ""), asset_name)),
+        None)
 
     if not asset:
         write_warn("could not stage %s: %s release has no %s" % (exe_name, repo, asset_name))
         return None
 
     stage = os.path.join(APP_DIR, stage_name)
-    zip_path = os.path.join(DOWNLOAD_DIR, asset_name)
+    zip_path = os.path.join(DOWNLOAD_DIR, asset["name"])
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
     try:
@@ -2059,6 +2171,15 @@ def place_folder(src, target, kind):
     return True
 
 
+def _within_dir(base_dir, target_path):
+    base_real = os.path.realpath(base_dir)
+    target_real = os.path.realpath(target_path)
+    try:
+        return os.path.commonpath([base_real, target_real]) == base_real
+    except ValueError:
+        return False
+
+
 def reconstitute(zf, where, manifest):
     skip = None
     root_name = (manifest.get("strata_root") or {}).get("name")
@@ -2074,12 +2195,18 @@ def reconstitute(zf, where, manifest):
         if name == "manifest.json":
             continue
 
+        base_allowed = where["app"]
+
         if name.startswith("settings/"):
             tail = name[len("settings/"):]
-            target = (where["strata_settings"] if tail == "strata-settings.json"
-                      else os.path.join(where["app"], tail))
+            if tail == "strata-settings.json":
+                target = where["strata_settings"]
+                base_allowed = os.path.dirname(where["strata_settings"])
+            else:
+                target = os.path.join(where["app"], tail)
         elif name.startswith("scripts/"):
             target = os.path.join(where["scripts"], name[len("scripts/"):])
+            base_allowed = where["scripts"]
         elif name.startswith("strata/"):
             if skip and (name == skip or name.startswith(skip + "/")
                          or name.startswith(skip + os.sep)):
@@ -2091,6 +2218,9 @@ def reconstitute(zf, where, manifest):
             continue
 
         target = os.path.normpath(target)
+
+        if not _within_dir(base_allowed, target):
+            raise SystemExit("unsafe path in bundle zip: %s" % name)
 
         if name.endswith("/"):
             os.makedirs(target, exist_ok=True)
@@ -2168,7 +2298,7 @@ def fix_copied_settings(where, manifest, new_root):
         try:
             with open(path, "r", encoding="utf-8-sig") as handle:
                 return json.load(handle)
-        except ValueError:
+        except (ValueError, OSError):
             return None
 
     setup_path = os.path.join(where["app"], "setup.json")
@@ -2204,9 +2334,9 @@ def fix_copied_settings(where, manifest, new_root):
             if new_root and isinstance(installs, list):
                 merged = []
 
-                for entry in installs:
-                    if new_root not in merged:
-                        merged.append(new_root)
+                for entry in installs + [new_root]:
+                    if entry and entry not in merged:
+                        merged.append(entry)
 
                 if merged != installs:
                     parsed["installs"] = merged
@@ -2398,9 +2528,14 @@ def main():
     os.makedirs(where["app"], exist_ok=True)
     os.makedirs(where["scripts"], exist_ok=True)
 
-    with zipfile.ZipFile(zip_path) as zf:
-        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
-        reconstitute(zf, where, manifest)
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json is not a JSON object")
+            reconstitute(zf, where, manifest)
+    except (zipfile.BadZipFile, KeyError, ValueError) as exc:
+        raise SystemExit("invalid or damaged offline-bundle.zip (%s)" % exc)
 
     root_name = (manifest.get("strata_root") or {}).get("name")
     new_root = os.path.join(where["app"], root_name) if root_name and os.path.isdir(
