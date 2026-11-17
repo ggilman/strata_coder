@@ -465,6 +465,67 @@ def load_cli():
     return module
 
 
+def _show_info_popup(parent, title, text, color="black"):
+    """Show an info popup transient to parent, closing any prior info popup on parent first."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    existing = getattr(parent, "_active_info_popup", None)
+
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.destroy()
+        except tk.TclError:
+            pass
+
+    popup = tk.Toplevel(parent)
+    popup.title(title)
+    popup.resizable(False, False)
+    popup.transient(parent)
+
+    ttk.Label(popup, text=text, foreground=color, wraplength=560,
+              justify="left").pack(padx=14, pady=(12, 4))
+    close_btn = ttk.Button(popup, text="Close", command=popup.destroy)
+    close_btn.pack(padx=14, pady=(4, 12))
+
+    popup.bind("<Escape>", lambda _event: popup.destroy())
+    popup.bind("<Return>", lambda _event: popup.destroy())
+
+    try:
+        parent.update_idletasks()
+        popup.geometry("+%d+%d" % (parent.winfo_rootx() + 40, parent.winfo_rooty() + 40))
+    except tk.TclError:
+        pass
+
+    close_btn.focus_set()
+    parent._active_info_popup = popup
+    return popup
+
+
+def _spawn_cli_in_terminal(sc, command, env=None):
+    """Spawn strata-coder.py in a console/terminal window."""
+    options = {}
+
+    if env is not None:
+        options["env"] = env
+
+    if sc.IS_WINDOWS:
+        if ctypes.windll.kernel32.GetConsoleWindow() == 0:
+            options["creationflags"] = subprocess.CREATE_NEW_CONSOLE
+    else:
+        for terminal in ("x-terminal-emulator", "xterm"):
+            path = shutil.which(terminal)
+
+            if path:
+                command = [path, "-e"] + command
+                break
+
+        options["start_new_session"] = True
+
+    subprocess.Popen(command, **options)
+
+
 def run_setup_gui(sc, overrides=None):
     """Show the setup window and return the chosen settings dict, or None on Cancel.
 
@@ -476,7 +537,7 @@ def run_setup_gui(sc, overrides=None):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    overrides = overrides or {}
+    overrides = overrides if isinstance(overrides, dict) else {}
     saved = sc.read_json(sc.SETUP_PATH) or {}
     ram_gb = sc._ram_gb()
 
@@ -506,7 +567,10 @@ def run_setup_gui(sc, overrides=None):
     if default_start_opencode is None:
         default_start_opencode = True
 
-    family, model = overrides["variant"] if "variant" in overrides else ("", "")
+    variant_override = overrides.get("variant")
+    family, model = (variant_override
+                     if isinstance(variant_override, (list, tuple)) and len(variant_override) == 2
+                     else ("", ""))
 
     default_variant = sc.pick_variant_default(family, model, saved, ram_gb) or \
         sc.pick_best_variant(sc.VARIANTS, ram_gb) or sc.VARIANTS[0]
@@ -582,9 +646,15 @@ def run_setup_gui(sc, overrides=None):
 
     add_label("Model variant:", 1)
 
-    variant_list = tk.Listbox(body, width=86, height=len(variant_rows),
+    variant_frame = ttk.Frame(body)
+    variant_frame.grid(row=1, column=1, columnspan=2, sticky="w")
+
+    variant_list = tk.Listbox(variant_frame, width=86, height=min(len(variant_rows), 10),
                               activestyle="dotbox", exportselection=False)
-    variant_list.grid(row=1, column=1, columnspan=2, rowspan=2, sticky="w")
+    variant_scroll = ttk.Scrollbar(variant_frame, orient="vertical", command=variant_list.yview)
+    variant_list.configure(yscrollcommand=variant_scroll.set)
+    variant_list.pack(side="left", fill="both")
+    variant_scroll.pack(side="left", fill="y")
 
     for index, v in enumerate(variant_rows):
         grade, _note = grades[index]
@@ -593,6 +663,9 @@ def run_setup_gui(sc, overrides=None):
 
     variant_list.selection_set(default_index)
     variant_list.see(default_index)
+
+    ttk.Label(body, text="\n".join(grade_legend()), foreground="#666666",
+              justify="left").grid(row=2, column=1, columnspan=3, sticky="w", pady=(2, 4))
 
     def selected_index():
         selection = variant_list.curselection()
@@ -604,14 +677,7 @@ def run_setup_gui(sc, overrides=None):
         return selection[0]
 
     def info_popup(title, text, color="black"):
-        popup = tk.Toplevel(root)
-        popup.title(title)
-        popup.resizable(False, False)
-
-        ttk.Label(popup, text=text, foreground=color, wraplength=560,
-                  justify="left").pack(padx=14, pady=(12, 4))
-        ttk.Button(popup, text="Close", command=popup.destroy).pack(padx=14, pady=(4, 12))
-        popup.transient(root)
+        return _show_info_popup(root, title, text, color)
 
     def show_variant_info():
         index = selected_index()
@@ -644,7 +710,7 @@ def run_setup_gui(sc, overrides=None):
     context_row = ttk.Frame(body)
     context_row.grid(row=4, column=1, sticky="w")
     ttk.Combobox(context_row, textvariable=context_var, values=context_labels,
-                 width=34).pack(side="left")
+                 state="readonly", width=34).pack(side="left")
     ttk.Button(context_row, text="\u24d8", width=4,
                command=lambda: info_popup("Context size", context_info_text())).pack(
         side="left", padx=(6, 0))
@@ -654,7 +720,7 @@ def run_setup_gui(sc, overrides=None):
     kv_row = ttk.Frame(body)
     kv_row.grid(row=5, column=1, sticky="w")
     ttk.Combobox(kv_row, textvariable=kv_var, values=kv_labels,
-                 width=34).pack(side="left")
+                 state="readonly", width=34).pack(side="left")
     ttk.Button(kv_row, text="\u24d8", width=4,
                command=lambda: info_popup("KV cache", kv_info_text())).pack(side="left",
                                                                             padx=(6, 0))
@@ -685,7 +751,8 @@ def run_setup_gui(sc, overrides=None):
     add_label("Start OpenCode:", 12)
     start_opencode_var = tk.StringVar(value="1" if default_start_opencode else "0")
     ttk.Checkbutton(body, text="Start OpenCode (on by default)",
-                    variable=start_opencode_var).grid(row=12, column=1, sticky="w")
+                    variable=start_opencode_var, onvalue="1", offvalue="0").grid(
+        row=12, column=1, sticky="w")
     ttk.Button(body, text="\u24d8", width=4,
                command=lambda: info_popup("Start OpenCode",
                                           start_opencode_info_text())).grid(
@@ -694,7 +761,7 @@ def run_setup_gui(sc, overrides=None):
     add_label("scode shortcut:", 13)
     shell_var = tk.StringVar(value="auto")
     ttk.Combobox(body, textvariable=shell_var, values=alias_shells,
-                 width=12).grid(row=13, column=1, sticky="w")
+                 state="readonly", width=12).grid(row=13, column=1, sticky="w")
 
     alias_status = ttk.Label(body, text="", foreground="#666666", wraplength=240, justify="left")
     alias_status.grid(row=14, column=1, sticky="w", padx=(12, 0))
@@ -704,9 +771,14 @@ def run_setup_gui(sc, overrides=None):
 
         try:
             sc.install_scode_alias(shell)
-        except (SystemExit, Exception):
-            alias_status.configure(foreground="red",
-                                   text="could not add the scode shortcut")
+        except (SystemExit, Exception) as exc:
+            detail = str(exc).strip()
+            msg = "could not add the scode shortcut"
+
+            if detail and detail != "1":
+                msg += " (%s)" % detail
+
+            alias_status.configure(foreground="red", text=msg)
             return
 
         alias_status.configure(
@@ -739,16 +811,21 @@ def run_setup_gui(sc, overrides=None):
         searched = set()
         deleted = []
         failed = []
-        data_dir = data_dir_var.get().strip()
+        raw_data_dir = data_dir_var.get().strip()
+        data_dir = os.path.normpath(os.path.expanduser(raw_data_dir)) if raw_data_dir else ""
 
-        for root in roots:
-            if not root or not os.path.isdir(root) or root in searched:
+        for root_dir in roots:
+            if not root_dir or not os.path.isdir(root_dir) or root_dir in searched:
                 continue
 
-            searched.add(root)
-            removed, failures = sc.delete_strata_engine(root, data_dir)
-            deleted += removed
-            failed += failures
+            searched.add(root_dir)
+
+            try:
+                removed, failures = sc.delete_strata_engine(root_dir, data_dir)
+                deleted += removed
+                failed += failures
+            except OSError as exc:
+                failed.append("%s (%s)" % (root_dir, exc.strerror or exc))
 
         if deleted:
             text = ("removed %d engine file(s); -Setup re-creates it on the next run (needs network)"
@@ -794,6 +871,14 @@ def run_setup_gui(sc, overrides=None):
             messagebox.showerror("Strata Coder setup", "The model folder cannot be empty.")
             return
 
+        data_dir = os.path.normpath(os.path.expanduser(data_dir))
+
+        if os.path.isfile(data_dir):
+            messagebox.showerror(
+                "Strata Coder setup",
+                "The model folder path points to an existing file, not a folder:\n%s" % data_dir)
+            return
+
         context = context_values.get(context_var.get())
 
         if context is None:
@@ -828,6 +913,8 @@ def run_setup_gui(sc, overrides=None):
         root.destroy()
 
     variant_list.bind("<Double-Button-1>", lambda _event: on_ok())
+    root.bind("<Return>", lambda _event: on_ok())
+    root.bind("<Escape>", lambda _event: root.destroy())
 
     buttons = ttk.Frame(body)
     buttons.grid(row=16, column=0, columnspan=4, sticky="e", pady=(14, 0))
@@ -858,22 +945,7 @@ def apply_setup(sc, result):
         "-NoGui",
     ]
 
-    options = {}
-
-    if sc.IS_WINDOWS:
-        if ctypes.windll.kernel32.GetConsoleWindow() == 0:
-            options["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-    else:
-        for terminal in ("x-terminal-emulator", "xterm"):
-            path = shutil.which(terminal)
-
-            if path:
-                command = [path, "-e"] + command
-                break
-
-        options["start_new_session"] = True
-
-    subprocess.Popen(command, **options)
+    _spawn_cli_in_terminal(sc, command)
 
 
 def run_make_offline_gui(sc, prefill=None):
@@ -885,7 +957,9 @@ def run_make_offline_gui(sc, prefill=None):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
-    prefill = prefill or {}
+    prefill = prefill if isinstance(prefill, dict) else {}
+    prefill_items = prefill.get("items") if isinstance(prefill.get("items"), dict) else {}
+    prefill_models = prefill.get("models") if isinstance(prefill.get("models"), dict) else {}
 
     saved = sc.read_json(sc.SETUP_PATH) or {}
     found_models = sc.find_local_models(saved)
@@ -908,17 +982,12 @@ def run_make_offline_gui(sc, prefill=None):
         row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
     def info_popup(title, text, color="black"):
-        popup = tk.Toplevel(root)
-        popup.title(title)
-        popup.resizable(False, False)
+        return _show_info_popup(root, title, text, color)
 
-        ttk.Label(popup, text=text, foreground=color, wraplength=560,
-                  justify="left").pack(padx=14, pady=(12, 4))
-        ttk.Button(popup, text="Close", command=popup.destroy).pack(padx=14, pady=(4, 12))
-        popup.transient(root)
-
-    def check_row(line, box_text, var, popup_title, info_key):
-        ttk.Checkbutton(body, text=box_text, variable=var).grid(row=line, column=1, sticky="w")
+    def check_row(line, box_text, var, popup_title, info_key, on_change=None):
+        cb = ttk.Checkbutton(body, text=box_text, variable=var, onvalue="1", offvalue="0",
+                             command=on_change)
+        cb.grid(row=line, column=1, sticky="w")
         ttk.Button(body, text="\u24d8", width=4,
                    command=lambda which=info_key, what=popup_title: info_popup(
                        what, offline_info_text(which))).grid(
@@ -931,19 +1000,65 @@ def run_make_offline_gui(sc, prefill=None):
     item_vars = {}
 
     for offset, key in enumerate(("strata", "opencode", "ripgrep")):
-        var = tk.StringVar(value="1")
+        initial_checked = prefill_items.get(key, True)
+        var = tk.StringVar(value="1" if initial_checked else "0")
         item_vars[key] = var
         check_row(1 + offset, item_boxes[key], var, item_titles[key], key)
 
     model_vars = []
+    model_summary_var = tk.StringVar(value="")
+
+    def update_model_summary(*_args):
+        if not found_models:
+            return
+
+        selected_count = 0
+        selected_gb = 0.0
+
+        for (_name, _path, gb), var in zip(found_models, model_vars):
+            if var.get() != "0":
+                selected_count += 1
+                selected_gb += gb
+
+        model_summary_var.set("Selected models: %d of %d (%.1f GB to copy)"
+                              % (selected_count, len(found_models), selected_gb))
 
     for offset, (name, _path, gb) in enumerate(found_models):
-        var = tk.StringVar(value="1")
+        model_pref = prefill_models.get(name)
+
+        if isinstance(model_pref, dict):
+            initial_model_checked = model_pref.get("include", True)
+        elif model_pref is not None:
+            initial_model_checked = bool(model_pref)
+        else:
+            initial_model_checked = True
+
+        var = tk.StringVar(value="1" if initial_model_checked else "0")
         model_vars.append(var)
         check_row(4 + offset, "%s (%.1f GB) (checked = copy it)" % (name, gb),
-                  var, "Model %s" % name, "model")
+                  var, "Model %s" % name, "model", on_change=update_model_summary)
 
-    dest_line = 4 + len(found_models)
+    next_line = 4 + len(found_models)
+
+    if found_models:
+        update_model_summary()
+        summary_row = ttk.Frame(body)
+        summary_row.grid(row=next_line, column=1, columnspan=2, sticky="w", pady=(4, 4))
+        ttk.Label(summary_row, textvariable=model_summary_var, foreground="#666666").pack(
+            side="left", padx=(0, 10))
+
+        def set_all_models(val):
+            for var in model_vars:
+                var.set(val)
+            update_model_summary()
+
+        ttk.Button(summary_row, text="Select All", width=10,
+                   command=lambda: set_all_models("1")).pack(side="left", padx=(0, 4))
+        ttk.Button(summary_row, text="Deselect All", width=11,
+                   command=lambda: set_all_models("0")).pack(side="left")
+        next_line += 1
+
+    dest_line = next_line
     ttk.Label(body, text="Save bundle to:").grid(row=dest_line, column=0, sticky="w",
                                                  padx=(0, 8), pady=3)
     dest_var = tk.StringVar(value=default_dest)
@@ -951,7 +1066,7 @@ def run_make_offline_gui(sc, prefill=None):
 
     def browse():
         picked = filedialog.askdirectory(title="Bundle folder",
-                                         initialdir=os.path.expanduser("~"))
+                                         initialdir=dest_var.get() or os.path.expanduser("~"))
 
         if picked:
             dest_var.set(os.path.normpath(picked))
@@ -968,6 +1083,14 @@ def run_make_offline_gui(sc, prefill=None):
             messagebox.showerror("Strata Coder offline bundle", "Pick the bundle folder.")
             return
 
+        dest = os.path.normpath(os.path.expanduser(dest))
+
+        if os.path.isfile(dest):
+            messagebox.showerror(
+                "Strata Coder offline bundle",
+                "The bundle folder path points to an existing file, not a folder:\n%s" % dest)
+            return
+
         outcome["result"] = {
             "dest": dest,
             "items": {key: var.get() != "0" for key, var in item_vars.items()},
@@ -976,6 +1099,9 @@ def run_make_offline_gui(sc, prefill=None):
         }
 
         root.destroy()
+
+    root.bind("<Return>", lambda _event: on_ok())
+    root.bind("<Escape>", lambda _event: root.destroy())
 
     buttons = ttk.Frame(body)
     buttons.grid(row=dest_line + 1, column=0, columnspan=3, sticky="e", pady=(14, 0))
@@ -1001,22 +1127,18 @@ def apply_make_offline(sc, result):
         "models": result.get("models") or {},
     })
 
-    options = {"env": env}
+    _spawn_cli_in_terminal(sc, command, env=env)
 
-    if sc.IS_WINDOWS:
-        if ctypes.windll.kernel32.GetConsoleWindow() == 0:
-            options["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-    else:
-        for terminal in ("x-terminal-emulator", "xterm"):
-            path = shutil.which(terminal)
 
-            if path:
-                command = [path, "-e"] + command
-                break
+def _parse_json_env(raw):
+    if not raw:
+        return {}
 
-        options["start_new_session"] = True
-
-    subprocess.Popen(command, **options)
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except (ValueError, TypeError):
+        return {}
 
 
 def main():
@@ -1029,7 +1151,7 @@ def main():
     sc = load_cli()
 
     if os.environ.get(sc.OFFLINE_GUI_CHILD_ENV) is not None:
-        payload = json.loads(os.environ[sc.OFFLINE_GUI_CHILD_ENV] or "{}")
+        payload = _parse_json_env(os.environ.get(sc.OFFLINE_GUI_CHILD_ENV))
 
         result = run_make_offline_gui(sc, payload.get("prefill"))
 
@@ -1046,7 +1168,7 @@ def main():
         sc.spawn_detached_gui(os.path.abspath(__file__), {CHILD_ENV: "{}"})
         return
 
-    result = run_setup_gui(sc, json.loads(os.environ[CHILD_ENV]))
+    result = run_setup_gui(sc, _parse_json_env(os.environ.get(CHILD_ENV)))
 
     if result is None:
         return
