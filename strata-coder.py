@@ -210,6 +210,78 @@ VARIANTS = [
     },
     {
         "family": "unsloth",
+        "model": "UD-IQ1_M",
+        "min_ram_gb": 48,
+        "download_gb": 68.0,
+        "arena_gb": 34.8,
+        "quality": 62,
+        "budget": True,
+        "quality_word": "~1-bit",
+        "title": "Qwen3.8-Flash-Next (Unsloth) UD-IQ1_M (~1-bit Unsloth Dynamic v3.1)",
+        "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    },
+    {
+        "family": "unsloth",
+        "model": "UD-Q2_0",
+        "min_ram_gb": 48,
+        "download_gb": 70.5,
+        "arena_gb": 37.4,
+        "quality": 66,
+        "budget": True,
+        "quality_word": "good",
+        "title": "Qwen3.8-Flash-Next (Unsloth) UD-Q2_0 (2-bit Unsloth Dynamic v3.1)",
+        "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    },
+    {
+        "family": "unsloth",
+        "model": "UD-IQ2_XS",
+        "min_ram_gb": 48,
+        "download_gb": 75.8,
+        "arena_gb": 42.3,
+        "quality": 71,
+        "budget": True,
+        "quality_word": "better",
+        "title": "Qwen3.8-Flash-Next (Unsloth) UD-IQ2_XS (2-bit i-quant Unsloth Dynamic v3.1)",
+        "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    },
+    {
+        "family": "unsloth",
+        "model": "UD-Q2_K_XL",
+        "min_ram_gb": 48,
+        "download_gb": 79.6,
+        "arena_gb": 46.0,
+        "quality": 75,
+        "budget": True,
+        "quality_word": "better+",
+        "title": "Qwen3.8-Flash-Next (Unsloth) UD-Q2_K_XL (2-bit Unsloth Dynamic v3.1 with 3-bit experts)",
+        "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    },
+    {
+        "family": "unsloth",
+        "model": "UD-IQ3_XXS",
+        "min_ram_gb": 48,
+        "download_gb": 83.6,
+        "arena_gb": 50.3,
+        "quality": 81,
+        "budget": True,
+        "quality_word": "great",
+        "title": "Qwen3.8-Flash-Next (Unsloth) UD-IQ3_XXS (3-bit i-quant Unsloth Dynamic v3.1)",
+        "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    },
+    {
+        "family": "unsloth",
+        "model": "UD-Q3_K_XL",
+        "min_ram_gb": 48,
+        "download_gb": 89.5,
+        "arena_gb": 56.2,
+        "quality": 86,
+        "budget": True,
+        "quality_word": "great+",
+        "title": "Qwen3.8-Flash-Next (Unsloth) UD-Q3_K_XL (3-bit Unsloth Dynamic v3.1 with 4-bit experts)",
+        "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+    },
+    {
+        "family": "unsloth",
         "model": "UD-IQ4_XS",
         "min_ram_gb": 48,
         "download_gb": 93.7,
@@ -2699,6 +2771,25 @@ def fix_copied_settings(where, manifest, new_root):
         parsed, changed = transform(parsed)
         missing = False
 
+        tok_dir = parsed.get("tokenizer")
+        if isinstance(tok_dir, str) and tok_dir:
+            if not os.path.isfile(os.path.join(tok_dir, "vocab.json")):
+                missing = True
+
+        cfg_args = parsed.get("args") if isinstance(parsed.get("args"), list) else []
+        for idx, arg in enumerate(cfg_args[:-1]):
+            val = cfg_args[idx + 1]
+            if not isinstance(val, str) or not val:
+                continue
+            if arg == "--pack":
+                if not (os.path.isfile(os.path.join(val, "native_experts.txt"))
+                        or os.path.isfile(os.path.join(val, "index.txt"))
+                        or os.path.isfile(os.path.join(val, "tokenizer", "vocab.json"))):
+                    missing = True
+            elif arg == "--mtp":
+                if not os.path.isdir(val):
+                    missing = True
+
         stack = [parsed]
 
         while stack:
@@ -3639,13 +3730,58 @@ def venv_python(root):
                         "python.exe" if IS_WINDOWS else "python")
 
 
+def test_strata_model_files(config, root=None):
+    if not isinstance(config, dict):
+        return False
+
+    cwd = config.get("cwd") or root or ""
+
+    def resolve_path(raw):
+        if not isinstance(raw, str) or not raw:
+            return None
+        expanded = os.path.expanduser(raw)
+        if os.path.isabs(expanded):
+            return expanded
+        return os.path.abspath(os.path.join(cwd, expanded)) if cwd else os.path.abspath(expanded)
+
+    tokenizer = resolve_path(config.get("tokenizer"))
+    if not tokenizer or not os.path.isfile(os.path.join(tokenizer, "vocab.json")):
+        return False
+
+    args = config.get("args")
+    if not isinstance(args, list) or not args:
+        return False
+
+    for flag in ("--native", "--ple-gguf", "--native-dense-gguf", "--embd-gguf", "--expert-profile"):
+        val = resolve_path(get_config_arg_value(config, flag))
+        if val and not os.path.isfile(val):
+            return False
+
+    pack = resolve_path(get_config_arg_value(config, "--pack"))
+    if pack:
+        if not os.path.isdir(pack):
+            return False
+        if not (os.path.isfile(os.path.join(pack, "native_experts.txt"))
+                or os.path.isfile(os.path.join(pack, "index.txt"))):
+            return False
+
+    mtp = resolve_path(get_config_arg_value(config, "--mtp"))
+    if mtp and not os.path.isdir(mtp):
+        return False
+
+    return True
+
+
 def test_strata_config(root, tag):
     config = read_json(os.path.join(root, "strata-%s.json" % tag))
 
     if not config or not config.get("exe"):
         return False
 
-    return os.path.isfile(config["exe"]) and os.path.isfile(venv_python(root))
+    if not (os.path.isfile(config["exe"]) and os.path.isfile(venv_python(root))):
+        return False
+
+    return test_strata_model_files(config, root)
 
 
 def test_strata_engine_missing(root, tag):
@@ -3862,8 +3998,8 @@ def get_configured_context(root, tag):
 
 def model_shard_filter(model, first_shard):
     if first_shard:
-        return "*%s*00001-of-*.gguf" % model
-    return "*%s*-of-*.gguf" % model
+        return "*-%s-00001-of-*.gguf" % model
+    return "*-%s-*-of-*.gguf" % model
 
 
 def count_matching(dir_path, pattern):
@@ -3973,12 +4109,21 @@ def test_setup_drift(root, tag, context_tokens, kv_quant, data_dir):
     if kv_quant and str(current_kv or "").lower() != str(kv_quant).lower():
         return True
 
+    if not test_strata_model_files(config, root):
+        return True
+
     # the model folder is baked into the engine's model paths; a different
     # folder (or model files that went missing) needs a reconfigure
     native = get_config_arg_value(config, "--native")
 
     if native:
         if not os.path.isfile(native) or not path_is_under(native, data_dir):
+            return True
+
+    pack = get_config_arg_value(config, "--pack")
+
+    if pack and data_dir:
+        if not os.path.isdir(pack) or not path_is_under(pack, data_dir):
             return True
 
     return False

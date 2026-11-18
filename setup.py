@@ -94,8 +94,9 @@ GUI_GRADE_COLORS = {"green": "#0a7d28", "yellow": "#a06b00", "red": "#c00000"}
 FASTEST_ICON = "\u26a1"
 PRESENT_ICON = "\U0001f4c4"
 QUALITY_STARS = {"best": "\u2605\u2605\u2605", "above IQ3_S": "\u2605\u2605\u2605",
-                 "great": "\u2605\u2605", "better": "\u2605\u2605",
-                 "good": "\u2605", "code only": "\u2605"}
+                 "great+": "\u2605\u2605", "great": "\u2605\u2605",
+                 "better+": "\u2605\u2605", "better": "\u2605\u2605",
+                 "good": "\u2605", "~1-bit": "\u2605", "code only": "\u2605"}
 
 
 def quality_stars(variant, star="\u2605"):
