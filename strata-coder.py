@@ -1916,7 +1916,7 @@ def stage_release_asset(repo, asset_name, exe_name, stage_name):
 
 
 def ask_offline_selection(dest_arg):
-    """The console bundle menu: destination, the three tools, each found model."""
+    """The console bundle menu: destination, the tools and container assets, each found model."""
     menu = load_setup()
     saved = read_json(SETUP_PATH)
 
@@ -1929,6 +1929,7 @@ def ask_offline_selection(dest_arg):
         "strata": prompt_yes_no(menu.OFFLINE_QUESTIONS["strata"], True),
         "opencode": prompt_yes_no(menu.OFFLINE_QUESTIONS["opencode"], True),
         "ripgrep": prompt_yes_no(menu.OFFLINE_QUESTIONS["ripgrep"], True),
+        "containers": prompt_yes_no(menu.OFFLINE_QUESTIONS["containers"], True),
     }
 
     models = {}
@@ -1996,6 +1997,7 @@ def build_offline_bundle(selection):
     # Strata
     strata_source = None
     engine_present = None
+    linux_engine_present = False
 
     if items.get("strata", True):
         roots = find_strata_roots()
@@ -2019,6 +2021,7 @@ def build_offline_bundle(selection):
 
     # OpenCode
     opencode_source = None
+    opencode_version = state_json.get("OpenCodeVersion")
 
     if items.get("opencode", True):
         if os.path.isfile(OPENCODE_EXE):
@@ -2032,12 +2035,18 @@ def build_offline_bundle(selection):
 
             if opencode_source:
                 staged_downloads.append(os.path.join(APP_DIR, "opencode-unpack"))
+
+        if not opencode_version:
+            rel = get_latest_release("anomalyco/opencode")
+            if rel and rel.get("tag_name"):
+                opencode_version = str(rel["tag_name"])
     else:
         write_skip("OpenCode unchecked: the offline machine runs Strata only "
                    "(normal Start OpenCode off behavior)")
 
     # ripgrep
     rg_source = None
+    rg_version = state_json.get("RipgrepVersion")
 
     if items.get("ripgrep", True):
         if os.path.isfile(RG_EXE):
@@ -2049,8 +2058,124 @@ def build_offline_bundle(selection):
 
             if rg_source:
                 staged_downloads.append(os.path.join(APP_DIR, "ripgrep-unpack"))
+
+        if not rg_version:
+            rel = get_latest_release("BurntSushi/ripgrep")
+            if rel and rel.get("tag_name"):
+                rg_version = str(rel["tag_name"])
     else:
         write_skip("ripgrep unchecked: OpenCode search on the offline machine will be slower")
+
+    # Container & WSL assets (Linux Strata engine, Linux OpenCode + ripgrep binaries, Docker/Podman image tarballs)
+    pack_containers = bool(items.get("containers", True))
+    sandbox_staged = False
+    exported_images = []
+    strata_ver = state_json.get("StrataVersion") or (
+        os.path.basename(strata_source).split("strata-")[-1] if strata_source else PINNED_STRATA)
+
+    if pack_containers:
+        write_step("Preparing container & WSL assets for the offline bundle")
+
+        if strata_source:
+            if IS_WINDOWS:
+                try:
+                    linux_dir = ensure_linux_strata_engine(strata_source)
+                    linux_engine_present = bool(linux_dir and os.path.isfile(os.path.join(linux_dir, "strata")))
+                except SystemExit:
+                    write_warn("could not fetch the Linux Strata engine; container isolation on an offline "
+                               "Windows PC will not have a Linux engine binary")
+                except Exception as exc:
+                    write_warn("could not fetch the Linux Strata engine (%s)" % exc)
+            else:
+                linux_engine_present = bool(find_linux_strata_engine_dir(strata_source))
+
+        try:
+            ver_for_sandbox = opencode_version or sandbox_opencode_version()
+            if ver_for_sandbox and not opencode_version:
+                opencode_version = ver_for_sandbox
+            stage_sandbox_binaries(ver_for_sandbox, False)
+            strata_build_dir = os.path.join(SANDBOX_DIR, "strata-build")
+            os.makedirs(strata_build_dir, exist_ok=True)
+            write_text_file(os.path.join(strata_build_dir, "Dockerfile"), STRATA_SANDBOX_DOCKERFILE)
+            sandbox_staged = True
+            write_ok("staged Linux OpenCode, ripgrep and Dockerfiles in %s" % SANDBOX_DIR)
+        except SystemExit:
+            write_warn("could not stage the Linux OpenCode/ripgrep sandbox binaries")
+        except Exception as exc:
+            write_warn("could not stage the Linux OpenCode/ripgrep sandbox binaries (%s)" % exc)
+
+        active_backend = None
+        active_tool = None
+        saved_cfg = read_json(SETUP_PATH) or {}
+        preferred_backends = []
+        for cand in (saved_isolation(saved_cfg), saved_strata_isolation(saved_cfg), "docker", "podman"):
+            if cand in CONTAINER_BACKENDS and cand not in preferred_backends:
+                preferred_backends.append(cand)
+
+        for name in preferred_backends:
+            tool, _detail = container_ready(CONTAINER_BACKENDS[name])
+            if tool:
+                active_backend = CONTAINER_BACKENDS[name]
+                active_tool = tool
+                break
+
+        if active_tool and active_backend:
+            images_stage_dir = os.path.join(APP_DIR, "container-images-stage")
+            shutil.rmtree(images_stage_dir, ignore_errors=True)
+            os.makedirs(images_stage_dir, exist_ok=True)
+            staged_downloads.append(images_stage_dir)
+
+            images_to_export = []
+
+            if sandbox_staged:
+                try:
+                    oc_tag = ensure_sandbox_image(active_backend, active_tool, False)
+                    images_to_export.append(("opencode-sandbox.tar", oc_tag))
+                except SystemExit:
+                    write_warn("could not build OpenCode sandbox image (%s) for the offline bundle"
+                               % sandbox_image_tag(opencode_version))
+                except Exception as exc:
+                    write_warn("could not build OpenCode sandbox image (%s)" % exc)
+
+            if strata_source:
+                try:
+                    st_tag = ensure_strata_sandbox_image(active_backend, active_tool, strata_ver)
+                    images_to_export.append(("strata-sandbox.tar", st_tag))
+                except SystemExit:
+                    write_warn("could not build Strata sandbox image (%s) for the offline bundle"
+                               % strata_sandbox_image_tag(strata_ver))
+                except Exception as exc:
+                    write_warn("could not build Strata sandbox image (%s)" % exc)
+
+            rc, _lines = run_native(active_tool, ["image", "inspect", SANDBOX_RELAY_IMAGE])
+            if rc != 0:
+                write_info("pulling %s for the offline bundle" % SANDBOX_RELAY_IMAGE)
+                run_native(active_tool, ["pull", SANDBOX_RELAY_IMAGE])
+            rc, _lines = run_native(active_tool, ["image", "inspect", SANDBOX_RELAY_IMAGE])
+            if rc == 0:
+                images_to_export.append(("sandbox-relay.tar", SANDBOX_RELAY_IMAGE))
+            else:
+                write_warn("could not pull %s for the offline bundle" % SANDBOX_RELAY_IMAGE)
+
+            for tar_name, img_tag in images_to_export:
+                tar_path = os.path.join(images_stage_dir, tar_name)
+                write_info("exporting container image %s -> %s" % (img_tag, tar_name))
+                proc = subprocess.run([active_tool, "save", "-o", tar_path, img_tag],
+                                      capture_output=True, text=True, errors="replace")
+                if proc.returncode == 0 and os.path.isfile(tar_path):
+                    exported_images.append({"arcname": "containers/" + tar_name,
+                                            "file": tar_name,
+                                            "tag": img_tag,
+                                            "path": tar_path})
+                else:
+                    detail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-2:]
+                    write_warn("could not export container image %s (%s)"
+                               % (img_tag, " | ".join(detail) if detail else "save failed"))
+        else:
+            write_info("neither Docker nor Podman is running on this PC - Linux binaries and Dockerfiles "
+                       "are packed, but pre-built container image tarballs could not be exported")
+    else:
+        write_skip("Container & WSL assets unchecked: Linux engine, Linux binaries and container images not packed")
 
     # free space check
     found_models = find_local_models(read_json(SETUP_PATH))
@@ -2078,6 +2203,13 @@ def build_offline_bundle(selection):
     for source in (opencode_source, rg_source):
         if source and os.path.isfile(source):
             tools_gb += os.path.getsize(source) / (1024 ** 3)
+
+    if sandbox_staged and os.path.isdir(SANDBOX_DIR):
+        tools_gb += get_folder_gb(SANDBOX_DIR)
+
+    for img in exported_images:
+        if os.path.isfile(img["path"]):
+            tools_gb += os.path.getsize(img["path"]) / (1024 ** 3)
 
     need_gb = round(model_gb + tools_gb * 0.6 + 1, 1)
 
@@ -2159,18 +2291,28 @@ def build_offline_bundle(selection):
     if os.path.isfile(STRATA_SETTINGS_PATH):
         file_entries.append(("settings/strata-settings.json", STRATA_SETTINGS_PATH))
 
+    for img in exported_images:
+        if os.path.isfile(img["path"]):
+            file_entries.append((img["arcname"], img["path"]))
+
     manifest = {
         "version": 1,
         "built": time.strftime("%Y-%m-%d %H:%M"),
         "strata_root": {"name": os.path.basename(strata_source)} if strata_source else None,
-        "strata_version": state_json.get("StrataVersion") or (
-            os.path.basename(strata_source).split("strata-")[-1] if strata_source else None),
+        "strata_version": strata_ver if strata_source else state_json.get("StrataVersion"),
+        "opencode_version": opencode_version,
+        "ripgrep_version": rg_version,
         "model_tag": state_json.get("Model"),
         "engine_present": engine_present,
+        "linux_engine_present": linux_engine_present,
         "venv_python": os.path.join(".venv", "Scripts" if IS_WINDOWS else "bin",
                                     "python.exe" if IS_WINDOWS else "python"),
         "opencode": bool(opencode_source),
         "ripgrep": bool(rg_source),
+        "containers": pack_containers,
+        "sandbox_staged": sandbox_staged,
+        "container_images": [{"file": img["file"], "tag": img["tag"], "arcname": img["arcname"]}
+                             for img in exported_images],
         "models": model_reports,
         "paths": {
             "app_dir": APP_DIR,
@@ -2191,6 +2333,17 @@ def build_offline_bundle(selection):
                 for current, _dirs, files in os.walk(strata_source):
                     rel = os.path.relpath(current, strata_source)
                     arc = arc_root if rel == "." else arc_root + "/" + rel.replace(os.sep, "/")
+
+                    for name in files:
+                        handle.write(os.path.join(current, name), arc + "/" + name)
+
+            if sandbox_staged and os.path.isdir(SANDBOX_DIR):
+                for current, _dirs, files in os.walk(SANDBOX_DIR):
+                    rel = os.path.relpath(current, SANDBOX_DIR)
+                    parts = [] if rel == "." else rel.split(os.sep)
+                    if parts and parts[0] in ("strata-run", "images", "unpack-opencode", "unpack-rg"):
+                        continue
+                    arc = "sandbox" if rel == "." else "sandbox/" + rel.replace(os.sep, "/")
 
                     for name in files:
                         handle.write(os.path.join(current, name), arc + "/" + name)
@@ -2232,6 +2385,16 @@ def build_offline_bundle(selection):
         "    compiled for the source PC's GPU - a very different GPU may need a",
         "    networked -Setup instead of this bundle",
     ]
+
+    if exported_images:
+        readme_lines.append("  - container images (%s) are packed in the zip;"
+                            % ", ".join(img["tag"] for img in exported_images))
+        readme_lines.append("    reconstruct.py loads them into Docker/Podman automatically if running,")
+        readme_lines.append("    and saves the .tar files under strata-coder\\sandbox\\images")
+    elif pack_containers:
+        readme_lines.append("  - Linux Strata engine and Linux OpenCode/ripgrep binaries are packed,")
+        readme_lines.append("    but Docker/Podman was not running when the bundle was built so no")
+        readme_lines.append("    pre-built container image .tar archives were exported")
 
     if not manifest["opencode"]:
         readme_lines.append("  - no OpenCode in this bundle: runs hold the server in the small window;")
@@ -2386,6 +2549,10 @@ def reconstitute(zf, where, manifest):
             target = os.path.join(where["app"], name[len("strata/"):])
         elif name.startswith("opencode/") or name.startswith("ripgrep/"):
             target = os.path.join(where["app"], name[len(name.split("/", 1)[0]) + 1:])
+        elif name.startswith("sandbox/"):
+            target = os.path.join(where["app"], "sandbox", name[len("sandbox/"):])
+        elif name.startswith("containers/"):
+            target = os.path.join(where["app"], "sandbox", "images", name[len("containers/"):])
         else:
             continue
 
@@ -2403,14 +2570,14 @@ def reconstitute(zf, where, manifest):
         if parent:
             os.makedirs(parent, exist_ok=True)
 
-        if os.path.isfile(target):
+        if os.path.isfile(target) and not (name.startswith("sandbox/") or name.startswith("containers/")):
             continue
 
         with zf.open(info) as source, open(target, "wb") as out:
             shutil.copyfileobj(source, out)
 
         if not WINDOWS and (name.endswith(".exe") or name.endswith("/opencode")
-                            or name.endswith("/rg")):
+                            or name.endswith("/rg") or name.endswith("/strata")):
             os.chmod(target, 0o755)
 
 
@@ -2645,6 +2812,12 @@ def write_state(where, manifest, new_root):
     if manifest.get("strata_version"):
         state["StrataVersion"] = manifest["strata_version"]
 
+    if manifest.get("opencode_version"):
+        state["OpenCodeVersion"] = manifest["opencode_version"]
+
+    if manifest.get("ripgrep_version"):
+        state["RipgrepVersion"] = manifest["ripgrep_version"]
+
     if manifest.get("model_tag"):
         state["Model"] = manifest["model_tag"]
 
@@ -2657,6 +2830,53 @@ def write_state(where, manifest, new_root):
         json.dump(state, handle, indent=2)
 
     note("state written: %s" % os.path.join(where["app"], "state.json"))
+
+
+def load_container_images(where, manifest, base):
+    images = manifest.get("container_images") or []
+    images_dir = os.path.join(where["app"], "sandbox", "images")
+
+    if not images or not os.path.isdir(images_dir) or base:
+        return
+
+    loaded_any = False
+
+    for tool_name in ("docker", "podman"):
+        exe = shutil.which(tool_name)
+        if not exe:
+            continue
+
+        try:
+            probe = subprocess.run([exe, "info"], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=15)
+            if probe.returncode != 0:
+                continue
+        except Exception:
+            continue
+
+        for entry in images:
+            tar_file = entry.get("file") if isinstance(entry, dict) else None
+            tag = entry.get("tag") if isinstance(entry, dict) else None
+            if not tar_file:
+                continue
+            tar_path = os.path.join(images_dir, tar_file)
+            if not os.path.isfile(tar_path):
+                continue
+
+            try:
+                proc = subprocess.run([exe, "load", "-i", tar_path],
+                                      capture_output=True, text=True, timeout=300)
+                if proc.returncode == 0:
+                    note("loaded container image %s into %s" % (tag or tar_file, tool_name))
+                    loaded_any = True
+                else:
+                    note("warning: %s load failed for %s" % (tool_name, tar_file))
+            except Exception as exc:
+                note("warning: %s load failed for %s (%s)" % (tool_name, tar_file, exc))
+
+    if not loaded_any:
+        note("container image archives saved in %s (they will be loaded automatically when "
+             "Docker or Podman runs)" % images_dir)
 
 
 def report(where, manifest, placed, new_root):
@@ -2717,6 +2937,7 @@ def main():
     fix_copied_settings(where, manifest, new_root)
     write_state(where, manifest, new_root)
     probe_venv(where, manifest, new_root)
+    load_container_images(where, manifest, base)
     report(where, manifest, placed, new_root)
 
 
@@ -4248,7 +4469,7 @@ def stage_sandbox_binaries(version, avx2):
     except OSError:
         stale = True
 
-    if stale and os.path.isfile(os.path.join(build, "opencode")):
+    if stale and version and os.path.isfile(os.path.join(build, "opencode")):
         os.remove(os.path.join(build, "opencode"))
 
     if not os.path.isfile(os.path.join(build, "opencode")):
@@ -4284,6 +4505,31 @@ def stage_sandbox_binaries(version, avx2):
     return build
 
 
+def try_load_cached_image(tool, tag, tar_filename, ref_prefix=None):
+    tar_path = os.path.join(SANDBOX_DIR, "images", tar_filename)
+    if not os.path.isfile(tar_path):
+        return None
+
+    write_info("loading pre-built container image from %s" % tar_filename)
+    proc = subprocess.run([tool, "load", "-i", tar_path],
+                          capture_output=True, text=True, errors="replace")
+    if proc.returncode != 0:
+        return None
+
+    rc, _lines = run_native(tool, ["image", "inspect", tag])
+    if rc == 0:
+        return tag
+
+    if ref_prefix:
+        rc, tags = run_native(tool, ["image", "ls", "--filter", "reference=%s" % ref_prefix,
+                                     "--format", "{{.Repository}}:{{.Tag}}"])
+        for found in tags:
+            if found and "<none>" not in found:
+                return found
+
+    return None
+
+
 def prune_old_sandbox_images(tool, keep_tag):
     rc, tags = run_native(tool, ["image", "ls", "--filter", "reference=%s" % SANDBOX_IMAGE,
                                  "--format", "{{.Repository}}:{{.Tag}}"])
@@ -4303,6 +4549,20 @@ def ensure_sandbox_image(backend, tool, avx2):
         write_skip("sandbox image is already built (%s)" % tag)
         prune_old_sandbox_images(tool, tag)
         return tag
+
+    loaded_tag = try_load_cached_image(tool, tag, "opencode-sandbox.tar", ref_prefix=SANDBOX_IMAGE)
+    if loaded_tag:
+        write_ok("loaded pre-built sandbox image (%s)" % loaded_tag)
+        prune_old_sandbox_images(tool, loaded_tag)
+        return loaded_tag
+
+    if not version:
+        rc, tags = run_native(tool, ["image", "ls", "--filter", "reference=%s" % SANDBOX_IMAGE,
+                                     "--format", "{{.Repository}}:{{.Tag}}"])
+        for found in tags:
+            if found and "<none>" not in found:
+                write_skip("using existing sandbox image (%s)" % found)
+                return found
 
     write_info("staging the linux OpenCode and ripgrep binaries for the sandbox image")
 
@@ -4337,6 +4597,10 @@ def sandbox_models_reachable(backend, tool, tag, url):
 
 def start_sandbox_relay(backend, tool, port):
     run_native(tool, ["rm", "-f", SANDBOX_RELAY])
+
+    rc, _lines = run_native(tool, ["image", "inspect", SANDBOX_RELAY_IMAGE])
+    if rc != 0:
+        try_load_cached_image(tool, SANDBOX_RELAY_IMAGE, "sandbox-relay.tar")
 
     rc, lines = run_native(tool, [
         "run", "-d", "--rm", "--name", SANDBOX_RELAY] + host_gateway_arguments(backend) +
@@ -5023,6 +5287,12 @@ def ensure_strata_sandbox_image(backend, tool, strata_version):
         write_skip("Strata sandbox image is already built (%s)" % tag)
         prune_old_strata_sandbox_images(tool, tag)
         return tag
+
+    loaded_tag = try_load_cached_image(tool, tag, "strata-sandbox.tar", ref_prefix=STRATA_SANDBOX_IMAGE)
+    if loaded_tag:
+        write_ok("loaded pre-built Strata sandbox image (%s)" % loaded_tag)
+        prune_old_strata_sandbox_images(tool, loaded_tag)
+        return loaded_tag
 
     build = os.path.join(SANDBOX_DIR, "strata-build")
     os.makedirs(build, exist_ok=True)

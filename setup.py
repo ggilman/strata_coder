@@ -352,6 +352,7 @@ OFFLINE_QUESTIONS = {
     "strata": "Pack the Strata install (its engine and settings)?",
     "opencode": "Pack OpenCode?",
     "ripgrep": "Pack ripgrep?",
+    "containers": "Pack container & WSL assets (Linux Strata engine, Linux binaries, Docker/Podman images)?",
     "model": "Copy model %s (%.1f GB) to the bundle?",
 }
 
@@ -370,6 +371,13 @@ def offline_info_text(which):
                     "works).",
         "ripgrep": "On: rg.exe is packed so OpenCode search on the offline machine is fast. "
                    "Off: OpenCode still works, search is slower.",
+        "containers": "On: stages the Linux x86_64 Strata CUDA engine, the Linux OpenCode and ripgrep "
+                      "executables, and (when Docker or Podman is running on this PC) builds and exports "
+                      "the OpenCode sandbox, Strata sandbox and socat relay container images into the "
+                      "bundle zip. On the offline machine reconstruct.py restores the staged files and "
+                      "loads the images into Docker/Podman so container isolation works without network.\n"
+                      "Off: only host binaries are packed; container isolation on the offline machine "
+                      "would require pre-loaded images or network access.",
         "model": "Models are too big for the zip, so each chosen model folder is copied loose "
                  "into the bundle's models folder next to the zip. Unchecked models are simply "
                  "not copied - many people uncheck them and copy the GGUF files off by hand. "
@@ -1105,13 +1113,16 @@ def run_make_offline_gui(sc, prefill=None):
                        what, offline_info_text(which))).grid(
             row=line, column=2, sticky="w", padx=(6, 0))
 
+    item_keys = ("strata", "opencode", "ripgrep", "containers")
     item_boxes = {"strata": "Strata install (checked = pack it)",
                   "opencode": "OpenCode (checked = pack it)",
-                  "ripgrep": "ripgrep (checked = pack it)"}
-    item_titles = {"strata": "Strata install", "opencode": "OpenCode", "ripgrep": "ripgrep"}
+                  "ripgrep": "ripgrep (checked = pack it)",
+                  "containers": "Container & WSL assets (Linux engine, binaries & Docker/Podman images)"}
+    item_titles = {"strata": "Strata install", "opencode": "OpenCode",
+                   "ripgrep": "ripgrep", "containers": "Container & WSL assets"}
     item_vars = {}
 
-    for offset, key in enumerate(("strata", "opencode", "ripgrep")):
+    for offset, key in enumerate(item_keys):
         initial_checked = prefill_items.get(key, True)
         var = tk.StringVar(value="1" if initial_checked else "0")
         item_vars[key] = var
@@ -1135,6 +1146,8 @@ def run_make_offline_gui(sc, prefill=None):
         model_summary_var.set("Selected models: %d of %d (%.1f GB to copy)"
                               % (selected_count, len(found_models), selected_gb))
 
+    first_model_line = 1 + len(item_keys)
+
     for offset, (name, _path, gb) in enumerate(found_models):
         model_pref = prefill_models.get(name)
 
@@ -1147,10 +1160,10 @@ def run_make_offline_gui(sc, prefill=None):
 
         var = tk.StringVar(value="1" if initial_model_checked else "0")
         model_vars.append(var)
-        check_row(4 + offset, "%s (%.1f GB) (checked = copy it)" % (name, gb),
+        check_row(first_model_line + offset, "%s (%.1f GB) (checked = copy it)" % (name, gb),
                   var, "Model %s" % name, "model", on_change=update_model_summary)
 
-    next_line = 4 + len(found_models)
+    next_line = first_model_line + len(found_models)
 
     if found_models:
         update_model_summary()
