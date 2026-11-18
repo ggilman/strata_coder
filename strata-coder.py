@@ -6,7 +6,8 @@ Runs identically on Windows (cmd, PowerShell, Git Bash) and Linux. Installs per-
 Modes:
     strata-coder.py [-CheckOnly] [-Family qwen|swift|coder|unsloth] [-Model NAME] [-Context N]
         [-Kv int8|k8v4|q4_0] [-DataDir PATH] [-Port N] [-NoLaunch] [-Update]
-        [-Stop] [-Status] [-Setup] [-Isolation none|local|docker|podman|wsl] [-Alias] [-NoAlias] [-NoGui]
+        [-Stop] [-Status] [-Setup] [-Isolation none|local|docker|podman|wsl]
+        [-StrataIsolation none|docker|podman|wsl] [-Alias] [-NoAlias] [-NoGui]
         [-AliasShell auto|cmd|powershell|bash|zsh] [-StartOpencode|-NoOpencode]
         [-MakeOffline [-Dest PATH]] [-Help]
 """
@@ -80,17 +81,28 @@ SANDBOX_RELAY = "strata-coder-relay"
 SANDBOX_RELAY_IMAGE = "alpine/socat:latest"
 SANDBOX_RELAY_PORT = 8080
 
+STRATA_SANDBOX_IMAGE = "strata-coder-strata"
+STRATA_SANDBOX_IMAGE_REVISION = "r1"
+STRATA_SANDBOX_CONTAINER = "strata-coder-strata"
+STRATA_SANDBOX_HOST_RELAY = "strata-coder-strata-relay"
+
 WSL_DIR = os.path.join(APP_DIR, "wsl")
 WSL_ROOTFS = "/var/lib/machines/strata-coder"
 WSL_HOME = "/var/lib/machines/strata-coder-home"
 WSL_RELAY_DIR = "/run/strata-coder-wsl"
 WSL_RELAY_UNIT = "strata-coder-wsl-relay"
+WSL_STRATA_UNIT = "strata-coder-wsl-strata"
+WSL_STRATA_RELAY_UNIT = "strata-coder-wsl-strata-relay"
+WSL_STRATA_MACHINE = "strata-coder-strata"
 WSL_SANDBOX_USER = "sandbox"
 WSL_SCRIPT_DIR = "/usr/local/lib/strata-wsl"
 WSL_LAUNCHER_PATH = WSL_SCRIPT_DIR + "/launch.sh"
+WSL_STRATA_LAUNCHER_PATH = WSL_SCRIPT_DIR + "/launch-strata.sh"
 WSL_PROBE_PATH = WSL_SCRIPT_DIR + "/probe.sh"
 WSL_NSPAWN_SCRIPT = "/tmp/strata-wsl-nspawn.sh"
 WSL_EXTRAS_PATH = "/tmp/strata-wsl-extras"
+WSL_STRATA_NSPAWN_SCRIPT = "/tmp/strata-wsl-strata-nspawn.sh"
+WSL_STRATA_EXTRAS_PATH = "/tmp/strata-wsl-strata-extras"
 WSL_DEBIAN_SUITE = "bookworm"
 WSL_DEBIAN_MIRROR = "http://deb.debian.org/debian"
 WSL_DISTRO_ENV = "STRATA_WSL_DISTRO"
@@ -242,6 +254,7 @@ SSD_BUDGET_RAM_GB = 80
 # OpenCode inside a container with no internet; wsl = the same container wall run by systemd-nspawn
 # inside a systemd-enabled WSL 2 distro on Windows, with no container engine installed at all.
 ISOLATION_CHOICES = ["none", "local", "docker", "podman", "wsl"]
+STRATA_ISOLATION_CHOICES = ["none", "docker", "podman", "wsl"]
 CONTAINER_ISOLATIONS = ("docker", "podman")
 
 LOG_KEEP = 20
@@ -396,6 +409,18 @@ def saved_isolation(saved):
 
     if (saved or {}).get("offline") is True:
         return "local"
+
+    return "none"
+
+
+def saved_strata_isolation(saved):
+    """The Strata server isolation value of a saved setup.json ('local' applies only to OpenCode)."""
+    value = str((saved or {}).get("strataIsolation") or "").strip().lower()
+
+    if value in STRATA_ISOLATION_CHOICES:
+        if value == "wsl" and not IS_WINDOWS:
+            return "none"
+        return value
 
     return "none"
 
@@ -982,6 +1007,71 @@ def stop_strata_servers(on_port=0):
             except OSError as exc:
                 write_warn("could not stop the Strata server (PID %d); %s" % (pid, exc))
 
+    found += stop_strata_containers()
+    found += stop_strata_wsl()
+
+    return found
+
+
+def stop_strata_containers():
+    found = 0
+
+    for backend in CONTAINER_BACKENDS.values():
+        tool = shutil.which(backend["exe"])
+
+        if not tool:
+            continue
+
+        for name in (STRATA_SANDBOX_CONTAINER, STRATA_SANDBOX_HOST_RELAY):
+            rc, ids = run_native(tool, ["ps", "-aq", "--filter", "name=^%s$" % name])
+
+            if rc == 0 and ids:
+                rc_rm, _ = run_native(tool, ["rm", "-f", name])
+
+                if rc_rm == 0 and name == STRATA_SANDBOX_CONTAINER:
+                    found += 1
+                    write_ok("stopped the Strata %s container (%s)" % (backend["label"], name))
+
+    return found
+
+
+def stop_strata_wsl():
+    if not IS_WINDOWS:
+        return 0
+
+    wsl = wsl_exe()
+
+    if not wsl:
+        return 0
+
+    distro = (os.environ.get(WSL_DISTRO_ENV) or "").strip()
+    distro_args = ["-d", distro] if distro else []
+    found = 0
+
+    try:
+        proc = subprocess.run(
+            [wsl] + distro_args + ["-u", "root", "--", "systemctl", "is-active", WSL_STRATA_UNIT],
+            capture_output=True, text=True, errors="replace",
+        )
+        was_active = (proc.stdout or "").strip() == "active"
+
+        for unit in (WSL_STRATA_UNIT, WSL_STRATA_RELAY_UNIT):
+            subprocess.run(
+                [wsl] + distro_args + ["-u", "root", "--", "systemctl", "stop", unit],
+                capture_output=True, text=True, errors="replace",
+            )
+
+        subprocess.run(
+            [wsl] + distro_args + ["-u", "root", "--", "machinectl", "terminate", WSL_STRATA_MACHINE],
+            capture_output=True, text=True, errors="replace",
+        )
+
+        if was_active:
+            found += 1
+            write_ok("stopped the WSL Strata container (%s)" % WSL_STRATA_UNIT)
+    except Exception:
+        pass
+
     return found
 
 
@@ -995,7 +1085,7 @@ def _process_exists_win(pid):
     return False
 
 
-def wait_strata_ready(process, server_port):
+def wait_strata_ready(process, server_port, check_alive=None):
     deadline = time.time() + LOAD_MINUTES * 60
 
     while time.time() < deadline:
@@ -1004,6 +1094,9 @@ def wait_strata_ready(process, server_port):
 
         if process:
             if process.poll() is not None:
+                return False
+        elif check_alive is not None:
+            if not check_alive():
                 return False
         elif not strata_server_processes():
             return False
@@ -1282,7 +1375,12 @@ Options:
                                internet), wsl (same container inside WSL 2,
                                no container engine). Applies to this
                                run; add -Setup to save it.
-                               scode -Setup -Isolation none turns it off.""")
+                               scode -Setup -Isolation none turns it off.
+    -StrataIsolation <mode>    How the Strata server is isolated: none,
+                               docker / podman (container with no internet),
+                               wsl (separate container inside WSL 2, no
+                               container engine). Applies to this run; add
+                               -Setup to save it.""")
 
 
 def install_ripgrep(release):
@@ -1620,6 +1718,9 @@ def run_setup_menu(state):
 
     if state["isolation_specified"]:
         overrides["isolation"] = state["isolation"]
+
+    if state.get("strata_isolation_specified"):
+        overrides["strataIsolation"] = state["strata_isolation"]
 
     if state["opencode_specified"]:
         overrides["startOpencode"] = not state["no_opencode"]
@@ -2928,6 +3029,7 @@ def prompt_setup_params(spec, state):
     default_context = get_int_setting((saved or {}).get("context"), 0)
     default_kv = str(saved.get("kv")) if saved and saved.get("kv") else "int8"
     default_isolation = saved_isolation(saved)
+    default_strata_isolation = saved_strata_isolation(saved)
 
     default_port = saved_setup_port(saved)
 
@@ -3002,18 +3104,6 @@ def prompt_setup_params(spec, state):
     if not state["port_specified"]:
         selected_port = prompt_port(menu.QUESTIONS["port"], default_port)
 
-    selected_isolation = default_isolation
-
-    if state["isolation_specified"]:
-        selected_isolation = state["isolation"]
-    else:
-        selected_isolation = prompt_choice(menu.QUESTIONS["isolation"],
-                                           menu.isolation_options(), default_isolation)
-
-    if selected_isolation == "wsl" and not IS_WINDOWS:
-        fail("the WSL isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
-             "For the same wall on this system use docker or podman: -Isolation docker or podman")
-
     default_start_opencode = (saved or {}).get("startOpencode")
 
     if default_start_opencode is None:
@@ -3024,6 +3114,33 @@ def prompt_setup_params(spec, state):
     else:
         selected_start_opencode = prompt_yes_no(menu.QUESTIONS["startOpencode"],
                                                 default_start_opencode)
+
+    selected_isolation = default_isolation
+
+    if not selected_start_opencode:
+        selected_isolation = "none"
+    elif state["isolation_specified"]:
+        selected_isolation = state["isolation"]
+    else:
+        selected_isolation = prompt_choice(menu.QUESTIONS["isolation"],
+                                           menu.isolation_options(), default_isolation)
+
+    if selected_isolation == "wsl" and not IS_WINDOWS:
+        fail("the WSL isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
+             "For the same wall on this system use docker or podman: -Isolation docker or podman")
+
+    selected_strata_isolation = default_strata_isolation
+
+    if state.get("strata_isolation_specified"):
+        selected_strata_isolation = state["strata_isolation"]
+    else:
+        selected_strata_isolation = prompt_choice(menu.QUESTIONS["strataIsolation"],
+                                                  menu.strata_isolation_options(),
+                                                  default_strata_isolation)
+
+    if selected_strata_isolation == "wsl" and not IS_WINDOWS:
+        fail("the WSL Strata isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
+             "For the same wall on this system use docker or podman: -StrataIsolation docker or podman")
 
     calling_shell = get_calling_shell()
 
@@ -3040,6 +3157,7 @@ def prompt_setup_params(spec, state):
         "dataDir": selected_data_dir,
         "port": selected_port,
         "isolation": selected_isolation,
+        "strataIsolation": selected_strata_isolation,
         "startOpencode": selected_start_opencode,
     }
 
@@ -4273,7 +4391,11 @@ def run_opencode_sandbox(isolation, tag, port, open_code_json):
     base_url = "http://host.docker.internal"
     probe_port = port
 
-    if not sandbox_models_reachable(backend, tool, tag, "http://host.docker.internal:%d/v1/models" % port):
+    if sandbox_models_reachable(backend, tool, tag,
+                                "http://%s:%d/v1/models" % (STRATA_SANDBOX_CONTAINER, port)):
+        base_url = "http://%s" % STRATA_SANDBOX_CONTAINER
+        probe_port = port
+    elif not sandbox_models_reachable(backend, tool, tag, "http://host.docker.internal:%d/v1/models" % port):
         write_info("the internal network resolves no outside names (normal); "
                    "routing the model connection through the socat relay")
 
@@ -4296,7 +4418,7 @@ def run_opencode_sandbox(isolation, tag, port, open_code_json):
 
     sandbox_json = sandbox_config_content(open_code_json, base_url, probe_port)
 
-    no_proxy = "127.0.0.1,localhost,host.docker.internal,%s" % SANDBOX_RELAY
+    no_proxy = "127.0.0.1,localhost,host.docker.internal,%s,%s" % (SANDBOX_RELAY, STRATA_SANDBOX_CONTAINER)
 
     mount = sandbox_mount_path(PROJECT_DIR)
     arguments = [
@@ -4788,6 +4910,610 @@ def run_opencode_wsl(handle, port, open_code_json):
 
 
 # ----------------------------------------------------------------------------------------------------
+# Strata server isolation (Docker/Podman container and WSL systemd-nspawn sandbox)
+# ----------------------------------------------------------------------------------------------------
+
+STRATA_SANDBOX_DOCKERFILE = (
+    "FROM debian:bookworm-slim\n"
+    "RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n"
+    "    ca-certificates python3 python3-numpy python3-jinja2 python3-regex python3-yaml \\\n"
+    "    python3-tqdm python3-requests python3-pil python3-psutil python3-markupsafe \\\n"
+    "    python3-certifi python3-urllib3 python3-idna python3-charset-normalizer \\\n"
+    "    libgomp1 libatomic1 libnuma1 zlib1g procps socat \\\n"
+    "    && rm -rf /var/lib/apt/lists/*\n"
+    "RUN useradd -m -s /bin/bash sandbox\n"
+    "ENV NVIDIA_VISIBLE_DEVICES=all \\\n"
+    "    NVIDIA_DRIVER_CAPABILITIES=compute,utility \\\n"
+    "    PYTHONUNBUFFERED=1 \\\n"
+    "    PYTHONIOENCODING=utf-8\n"
+    "WORKDIR /strata\n"
+)
+
+WSL_STRATA_REVERSE_RELAY_PY = '''#!/usr/bin/env python3
+"""Host-side WSL reverse relay: accepts TCP on 127.0.0.1:<port> in the WSL host
+and forwards each connection to the Unix socket inside /run/strata-coder-wsl/strata.sock
+exposed by the isolated systemd-nspawn Strata container."""
+import os
+import socket
+import sys
+import threading
+
+SOCK_DIR = sys.argv[1]
+PORT = int(sys.argv[2])
+SOCK_PATH = os.path.join(SOCK_DIR, "strata.sock")
+
+
+def pump(src, dst):
+    try:
+        while True:
+            chunk = src.recv(65536)
+            if not chunk:
+                break
+            dst.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def bridge(client):
+    try:
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        upstream.settimeout(30)
+        upstream.connect(SOCK_PATH)
+        upstream.settimeout(None)
+    except OSError:
+        client.close()
+        return
+    t1 = threading.Thread(target=pump, args=(client, upstream), daemon=True)
+    t2 = threading.Thread(target=pump, args=(upstream, client), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    client.close()
+    upstream.close()
+
+
+os.makedirs(SOCK_DIR, exist_ok=True)
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", PORT))
+server.listen(64)
+while True:
+    conn, _ = server.accept()
+    threading.Thread(target=bridge, args=(conn,), daemon=True).start()
+'''
+
+WSL_STRATA_LAUNCHER_SH = (
+    "#!/bin/sh\n"
+    "set -e\n"
+    "PORT=\"$1\"\n"
+    "CFG=\"$2\"\n"
+    "rm -f /run/strata-coder-wsl/strata.sock\n"
+    "socat UNIX-LISTEN:/run/strata-coder-wsl/strata.sock,fork,reuseaddr,unlink-early,mode=666 "
+    "TCP-CONNECT:127.0.0.1:\"$PORT\" &\n"
+    "cd /strata\n"
+    "exec python3 /strata/serve/server.py --engine strata --config \"$CFG\" --port \"$PORT\" --host 127.0.0.1\n"
+)
+
+
+def strata_sandbox_image_tag(strata_version):
+    return "%s:%s-%s" % (STRATA_SANDBOX_IMAGE, strata_version or "latest", STRATA_SANDBOX_IMAGE_REVISION)
+
+
+def prune_old_strata_sandbox_images(tool, keep_tag):
+    rc, tags = run_native(tool, ["image", "ls", "--filter", "reference=%s" % STRATA_SANDBOX_IMAGE,
+                                 "--format", "{{.Repository}}:{{.Tag}}"])
+
+    for old_tag in tags:
+        if old_tag and old_tag != keep_tag:
+            run_native(tool, ["rmi", old_tag])
+
+
+def ensure_strata_sandbox_image(backend, tool, strata_version):
+    tag = strata_sandbox_image_tag(strata_version)
+
+    rc, _lines = run_native(tool, ["image", "inspect", tag])
+
+    if rc == 0:
+        write_skip("Strata sandbox image is already built (%s)" % tag)
+        prune_old_strata_sandbox_images(tool, tag)
+        return tag
+
+    build = os.path.join(SANDBOX_DIR, "strata-build")
+    os.makedirs(build, exist_ok=True)
+    write_text_file(os.path.join(build, "Dockerfile"), STRATA_SANDBOX_DOCKERFILE)
+
+    write_info("building the Strata sandbox image %s "
+               "(the first build downloads the debian base and Python runtime packages)" % tag)
+    proc = subprocess.run([tool, "build", "-t", tag, build],
+                          capture_output=True, text=True, errors="replace")
+
+    if proc.returncode:
+        tail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-4:]
+        fail("the Strata sandbox image build failed (%s)." % " | ".join(tail),
+             "Check that %s is running and try again." % backend["hint"].split(";")[0].lower())
+
+    prune_old_strata_sandbox_images(tool, tag)
+    return tag
+
+
+def find_linux_strata_engine_dir(strata_root):
+    if not IS_WINDOWS:
+        native_dir = os.path.join(strata_root, "engine")
+        if os.path.isfile(os.path.join(native_dir, "strata")):
+            return native_dir
+
+    linux_dir = os.path.join(strata_root, "engine-linux")
+    if os.path.isfile(os.path.join(linux_dir, "strata")):
+        return linux_dir
+
+    feed_engine_dir = os.path.join(strata_root, "engine-feed", "engine")
+    if os.path.isdir(feed_engine_dir):
+        candidates = sorted(
+            glob.glob(os.path.join(feed_engine_dir, "*-linux-x86_64-*")),
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+        for cand in candidates:
+            if os.path.isfile(os.path.join(cand, "strata")):
+                return cand
+
+    return None
+
+
+def ensure_linux_strata_engine(strata_root):
+    existing = find_linux_strata_engine_dir(strata_root)
+    if existing:
+        write_skip("Linux Strata engine is ready (%s)" % existing)
+        return existing
+
+    python = venv_python(strata_root)
+    if not os.path.isfile(python):
+        fail("Strata Python environment was not found: %s" % python)
+
+    write_info("fetching the Linux x86_64 Strata engine for container isolation from the signed feed")
+
+    fetch_script = (
+        "import os, shutil, sys\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, %r)\n"
+        "from strata_cli import update_cmd\n"
+        "from strata_control import engine_component as ec, feed as feedmod, signing, updater\n"
+        "root = Path(%r)\n"
+        "store = root / 'engine-feed'\n"
+        "store.mkdir(parents=True, exist_ok=True)\n"
+        "state = updater.State(store)\n"
+        "hw = dict(updater.detect_hardware(os.environ))\n"
+        "hw['platform'] = 'linux-x86_64'\n"
+        "hw['backend'] = 'cuda'\n"
+        "trusted = signing.load_trusted_keys()\n"
+        "source = os.environ.get(update_cmd.ENV_FEED) or state.data.get('feed_source') or update_cmd.DEFAULT_FEED\n"
+        "ctx = updater.Context(components=store, source=source, trusted=trusted, hardware=hw, environ=dict(os.environ))\n"
+        "feed = updater.open_feed(ctx, state)\n"
+        "pkg, reasons = feedmod.select_engine([p for p in feed.engine], hw)\n"
+        "if pkg is None:\n"
+        "    raise SystemExit('no linux-x86_64 engine in feed: ' + '; '.join(reasons))\n"
+        "dest = store / 'engine' / updater.folder_name(pkg)\n"
+        "if not (dest / 'strata').is_file():\n"
+        "    archive = updater._download(ctx, 'engine', pkg.url, pkg.size, pkg.sha256, pkg.label, feed)\n"
+        "    stage_root, comp = updater.stage_engine(ctx, feed, pkg, archive)\n"
+        "    dest.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    if dest.exists():\n"
+        "        shutil.rmtree(dest, ignore_errors=True)\n"
+        "    shutil.move(str(comp.root), str(dest))\n"
+        "    shutil.rmtree(stage_root, ignore_errors=True)\n"
+        "print(str(dest))\n"
+    ) % (strata_root, strata_root)
+
+    proc = subprocess.run([python, "-c", fetch_script],
+                          cwd=strata_root, capture_output=True, text=True, errors="replace")
+
+    if proc.returncode != 0:
+        detail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-3:]
+        fail("could not acquire the Linux Strata engine for container isolation (%s)."
+             % (" | ".join(detail) if detail else "unknown error"),
+             "Check network access or switch Strata isolation to none with: scode -Setup -StrataIsolation none")
+
+    engine_dir = find_linux_strata_engine_dir(strata_root)
+    if not engine_dir:
+        fail("the Linux Strata engine download completed, but the 'strata' binary was not found.")
+
+    write_ok("Linux Strata engine ready: %s" % engine_dir)
+    return engine_dir
+
+
+def _norm_host_path(path_value):
+    return os.path.normcase(os.path.abspath(path_value))
+
+
+def _is_under_dir(child, parent):
+    norm_child = _norm_host_path(child)
+    norm_parent = _norm_host_path(parent)
+    if norm_child == norm_parent:
+        return True
+    prefix = norm_parent.rstrip("\\/") + os.sep
+    return norm_child.startswith(prefix)
+
+
+def _rel_posix_path(child, parent):
+    rel = os.path.relpath(os.path.abspath(child), os.path.abspath(parent))
+    return rel.replace("\\", "/")
+
+
+def prepare_isolated_strata_config(strata_root, tag, strata_config, engine_dir, runtime_dir, log_in_container):
+    os.makedirs(runtime_dir, exist_ok=True)
+
+    extra_dirs = []
+
+    def register_external_path(candidate):
+        if not candidate or not isinstance(candidate, str):
+            return candidate
+        if not (os.path.isabs(candidate) or os.path.exists(candidate)):
+            return candidate
+        abs_cand = os.path.abspath(candidate)
+        if _is_under_dir(abs_cand, strata_root):
+            rel = _rel_posix_path(abs_cand, strata_root)
+            return "/strata" if rel == "." else "/strata/" + rel
+        if _is_under_dir(abs_cand, engine_dir):
+            rel = _rel_posix_path(abs_cand, engine_dir)
+            return "/strata-engine" if rel == "." else "/strata-engine/" + rel
+
+        mount_root = abs_cand if os.path.isdir(abs_cand) else os.path.dirname(abs_cand)
+        for idx, existing_root in enumerate(extra_dirs):
+            if _is_under_dir(abs_cand, existing_root):
+                rel = _rel_posix_path(abs_cand, existing_root)
+                base = "/strata-models-%d" % idx
+                return base if rel == "." else base + "/" + rel
+            if _is_under_dir(existing_root, mount_root):
+                extra_dirs[idx] = mount_root
+                rel = _rel_posix_path(abs_cand, mount_root)
+                base = "/strata-models-%d" % idx
+                return base if rel == "." else base + "/" + rel
+
+        idx = len(extra_dirs)
+        extra_dirs.append(mount_root)
+        rel = _rel_posix_path(abs_cand, mount_root)
+        base = "/strata-models-%d" % idx
+        return base if rel == "." else base + "/" + rel
+
+    # First pass to find canonical parent directories for external paths
+    raw_args = list(strata_config.get("args") or [])
+    raw_tokenizer = strata_config.get("tokenizer")
+    for item in raw_args + ([raw_tokenizer] if raw_tokenizer else []):
+        if isinstance(item, str) and (os.path.isabs(item) or os.path.exists(item)):
+            register_external_path(item)
+
+    # Re-map with consolidated extra_dirs
+    rewritten = dict(strata_config)
+    rewritten["exe"] = "/strata-engine/strata"
+    rewritten["cwd"] = "/strata"
+    rewritten["lib_dirs"] = ["/strata-engine"]
+    rewritten["log"] = log_in_container
+
+    if isinstance(raw_tokenizer, str) and raw_tokenizer:
+        rewritten["tokenizer"] = register_external_path(raw_tokenizer)
+
+    rewritten["args"] = [register_external_path(a) for a in raw_args]
+
+    config_filename = "strata-%s-isolated.json" % tag
+    host_config_path = os.path.join(runtime_dir, config_filename)
+    write_text_file(host_config_path, json.dumps(rewritten, indent=2))
+
+    mounts = [
+        (os.path.abspath(strata_root), "/strata", True),
+        (os.path.abspath(engine_dir), "/strata-engine", True),
+        (os.path.abspath(runtime_dir), "/strata-run", False),
+    ]
+    for idx, host_dir in enumerate(extra_dirs):
+        mounts.append((host_dir, "/strata-models-%d" % idx, True))
+
+    return "/strata-run/" + config_filename, mounts
+
+
+def start_strata_host_relay(tool, port):
+    run_native(tool, ["rm", "-f", STRATA_SANDBOX_HOST_RELAY])
+
+    rc, _lines = run_native(tool, [
+        "run", "-d", "--rm", "--name", STRATA_SANDBOX_HOST_RELAY,
+        "-p", "127.0.0.1:%d:%d" % (port, port),
+        SANDBOX_RELAY_IMAGE,
+        "tcp-listen:%d,fork,reuseaddr" % port,
+        "tcp-connect:%s:%d" % (STRATA_SANDBOX_CONTAINER, port),
+    ])
+
+    if rc != 0:
+        return False
+
+    rc, _lines = run_native(tool, ["network", "connect", SANDBOX_NETWORK, STRATA_SANDBOX_HOST_RELAY])
+
+    if rc != 0:
+        run_native(tool, ["rm", "-f", STRATA_SANDBOX_HOST_RELAY])
+        return False
+
+    return True
+
+
+def start_strata_container_server(backend_name, image_tag, strata_root, tag, strata_config, port, server_log):
+    backend = CONTAINER_BACKENDS[backend_name]
+    tool, detail = container_ready(backend)
+
+    if not tool:
+        fail_no_container(backend, detail)
+
+    stop_strata_containers()
+
+    engine_dir = ensure_linux_strata_engine(strata_root)
+    runtime_dir = os.path.join(SANDBOX_DIR, "strata-run")
+    container_cfg_path, mounts = prepare_isolated_strata_config(
+        strata_root, tag, strata_config, engine_dir, runtime_dir, "/strata-run/engine.log"
+    )
+
+    allowed_hosts = "%s,%s,%s,host.docker.internal,localhost,127.0.0.1" % (
+        STRATA_SANDBOX_CONTAINER, STRATA_SANDBOX_HOST_RELAY, SANDBOX_RELAY
+    )
+
+    arguments = [
+        tool, "run", "--rm", "--name", STRATA_SANDBOX_CONTAINER,
+        "--network", SANDBOX_NETWORK,
+        "--hostname", STRATA_SANDBOX_CONTAINER,
+        "--gpus", "all",
+        "--shm-size", "16g",
+        "-e", "STRATA_ALLOWED_HOSTS=" + allowed_hosts,
+    ]
+
+    for host_path, container_path, read_only in mounts:
+        spec = "%s:%s%s" % (host_path, container_path, ":ro" if read_only else "")
+        arguments += ["-v", spec]
+
+    arguments += [
+        image_tag,
+        "sh", "-c",
+        "cp /strata-engine/strata /tmp/strata && chmod +x /tmp/strata && "
+        "if [ -f /strata-engine/strata-vision ]; then cp /strata-engine/strata-vision /tmp/strata-vision && chmod +x /tmp/strata-vision; fi && "
+        "sed 's|\"/strata-engine/strata\"|\"/tmp/strata\"|g' %s > /tmp/strata-config.json && "
+        "export LD_LIBRARY_PATH=/strata-engine:${LD_LIBRARY_PATH:-} && "
+        "exec python3 /strata/serve/server.py --engine strata --config /tmp/strata-config.json --port %d --host 0.0.0.0"
+        % (container_cfg_path, port),
+    ]
+
+    popen_kwargs = {}
+    if IS_WINDOWS:
+        flags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            flags |= subprocess.CREATE_NO_WINDOW
+        if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+        popen_kwargs["creationflags"] = flags
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    log_handle = open(server_log, "wb")
+    try:
+        server_process = subprocess.Popen(
+            arguments,
+            cwd=strata_root,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            **popen_kwargs
+        )
+    finally:
+        log_handle.close()
+
+    # Wait briefly for the container to be created so the host relay can resolve it on SANDBOX_NETWORK
+    for _ in range(30):
+        if server_process.poll() is not None:
+            break
+        rc, ids = run_native(tool, ["ps", "-q", "--filter", "name=^%s$" % STRATA_SANDBOX_CONTAINER])
+        if rc == 0 and ids:
+            break
+        time.sleep(0.5)
+
+    if not start_strata_host_relay(tool, port):
+        stop_strata_containers()
+        fail("could not start the Strata container host relay (%s) on port %d."
+             % (STRATA_SANDBOX_HOST_RELAY, port),
+             "Check that port %d is free and %s can run %s."
+             % (port, backend["label"], SANDBOX_RELAY_IMAGE))
+
+    return server_process
+
+
+def ensure_wsl_strata_rootfs(wsl, distro, avx2):
+    ensure_wsl_rootfs(wsl, distro, avx2)
+
+    check = wsl_run_script(
+        wsl, distro,
+        "chroot '%s' python3 -c 'import numpy, jinja2, regex, yaml, tqdm, requests, PIL, psutil, certifi, urllib3' >/dev/null 2>&1"
+        % WSL_ROOTFS,
+        "strata-deps-check",
+    )
+    if check.returncode == 0:
+        write_skip("WSL Strata Python runtime packages are already installed in the rootfs")
+        return
+
+    write_info("installing Python runtime packages for Strata inside the WSL sandbox rootfs")
+    install_script = (
+        "set -e\n"
+        "chroot '%(rootfs)s' apt-get update\n"
+        "chroot '%(rootfs)s' env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+        "python3 python3-numpy python3-jinja2 python3-regex python3-yaml python3-tqdm "
+        "python3-requests python3-pil python3-psutil python3-markupsafe python3-certifi "
+        "python3-urllib3 python3-idna python3-charset-normalizer libgomp1 libatomic1 libnuma1 zlib1g socat\n"
+    ) % {"rootfs": WSL_ROOTFS}
+
+    proc = wsl_run_script(wsl, distro, install_script, "strata-deps-install")
+    if proc.returncode:
+        fail("could not install Strata Python dependencies inside the WSL rootfs (%s)."
+             % (wsl_tail(proc) or "unknown error"),
+             "Check network access inside %s and run the script again." % distro)
+
+    write_ok("WSL Strata runtime packages installed in the sandbox rootfs")
+
+
+def wsl_push_strata_runtime_files(wsl, distro, extras):
+    os.makedirs(WSL_DIR, exist_ok=True)
+    rev_relay_path = os.path.join(WSL_DIR, "strata-reverse-relay.py")
+    write_text_file(rev_relay_path, WSL_STRATA_REVERSE_RELAY_PY)
+
+    strata_launcher_path = os.path.join(WSL_DIR, "launch-strata.sh")
+    write_text_file(strata_launcher_path, WSL_STRATA_LAUNCHER_SH)
+
+    nspawn_wrapper = (
+        "#!/bin/bash\n"
+        "set -e\n"
+        "export SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=1\n"
+        "extra=()\n"
+        "if [ -f '%(extras)s' ]; then\n"
+        "    while IFS= read -r line; do\n"
+        "        [ -n \"$line\" ] && extra+=(\"$(printf '%%s' \"$line\" | base64 -d)\")\n"
+        "    done < '%(extras)s'\n"
+        "fi\n"
+        "for dev in /dev/dxg /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia0 /dev/nvidia1; do\n"
+        "    [ -e \"$dev\" ] && extra+=(\"--bind=$dev\")\n"
+        "done\n"
+        "[ -d /usr/lib/wsl ] && extra+=(\"--bind-ro=/usr/lib/wsl:/usr/lib/wsl\")\n"
+        "exec systemd-nspawn --quiet --directory=%(rootfs)s --machine=%(machine)s "
+        "--register=no --private-network --bind=%(relay)s:%(relay)s \"${extra[@]}\" \"$@\"\n"
+    ) % {
+        "rootfs": WSL_ROOTFS,
+        "machine": WSL_STRATA_MACHINE,
+        "relay": WSL_RELAY_DIR,
+        "extras": WSL_STRATA_EXTRAS_PATH,
+    }
+    wrapper_path = os.path.join(WSL_DIR, "strata-nspawn-wrapper.sh")
+    write_text_file(wrapper_path, nspawn_wrapper)
+
+    extras_path = os.path.join(WSL_DIR, "strata-extras.txt")
+    extras_body = "".join("%s\n" % base64.b64encode(item.encode("utf-8")).decode("ascii") for item in extras)
+    write_text_file(extras_path, extras_body)
+
+    script = (
+        "set -e\n"
+        "tr -d '\\r' < '%(rev_relay)s' > /tmp/strata-wsl-strata-relay.py\n"
+        "tr -d '\\r' < '%(wrapper)s' > '%(nspawn)s'\n"
+        "chmod +x '%(nspawn)s'\n"
+        "tr -d '\\r' < '%(extras_src)s' > '%(extras_dst)s'\n"
+        "mkdir -p '%(relay_dir)s'\n"
+        "mkdir -p '%(rootfs)s%(script_dir)s'\n"
+        "tr -d '\\r' < '%(launcher)s' > '%(rootfs)s%(launcher_in)s'\n"
+        "chmod +x '%(rootfs)s%(launcher_in)s'\n"
+    ) % {
+        "rev_relay": wsl_wslpath(rev_relay_path),
+        "wrapper": wsl_wslpath(wrapper_path),
+        "nspawn": WSL_STRATA_NSPAWN_SCRIPT,
+        "extras_src": wsl_wslpath(extras_path),
+        "extras_dst": WSL_STRATA_EXTRAS_PATH,
+        "relay_dir": WSL_RELAY_DIR,
+        "rootfs": WSL_ROOTFS,
+        "script_dir": WSL_SCRIPT_DIR,
+        "launcher": wsl_wslpath(strata_launcher_path),
+        "launcher_in": WSL_STRATA_LAUNCHER_PATH,
+    }
+
+    proc = wsl_run_script(wsl, distro, script, "strata-runtime")
+    if proc.returncode:
+        fail("the WSL Strata sandbox runtime files could not be prepared (%s)."
+             % (wsl_tail(proc) or "unknown error"))
+
+
+def wsl_stop_strata_relay(wsl, distro):
+    subprocess.run([wsl, "-d", distro, "-u", "root", "--", "systemctl", "stop", WSL_STRATA_RELAY_UNIT],
+                   capture_output=True, text=True, errors="replace")
+
+
+def wsl_start_strata_relay(wsl, distro, port):
+    wsl_stop_strata_relay(wsl, distro)
+    proc = subprocess.run([
+        wsl, "-d", distro, "-u", "root", "--",
+        "systemd-run", "--collect", "--unit", WSL_STRATA_RELAY_UNIT,
+        "python3", "/tmp/strata-wsl-strata-relay.py", WSL_RELAY_DIR, str(port),
+    ], capture_output=True, text=True, errors="replace")
+
+    if proc.returncode:
+        fail("the WSL Strata reverse relay could not be started (%s)." % (wsl_tail(proc) or "unknown error"),
+             "Check that port %d is free inside WSL (%s) and run the script again." % (port, distro))
+
+
+def start_strata_wsl_server(handle, strata_root, tag, strata_config, port, server_log):
+    wsl, distro = handle["wsl"], handle["distro"]
+
+    stop_strata_wsl()
+
+    engine_dir = ensure_linux_strata_engine(strata_root)
+    runtime_dir = os.path.join(WSL_DIR, "strata-run")
+    container_cfg_path, mounts = prepare_isolated_strata_config(
+        strata_root, tag, strata_config, engine_dir, runtime_dir, "/strata-run/engine.log"
+    )
+
+    stage_engine_script = (
+        "set -e\n"
+        "mkdir -p '%(rootfs)s/strata-engine-bin'\n"
+        "cp -f '%(eng)s/'* '%(rootfs)s/strata-engine-bin/' 2>/dev/null || true\n"
+        "chmod +x '%(rootfs)s/strata-engine-bin/strata' 2>/dev/null || true\n"
+        "[ -f '%(rootfs)s/strata-engine-bin/strata-vision' ] && chmod +x '%(rootfs)s/strata-engine-bin/strata-vision' || true\n"
+    ) % {"rootfs": WSL_ROOTFS, "eng": wsl_wslpath(engine_dir)}
+    proc = wsl_run_script(wsl, distro, stage_engine_script, "stage-strata-engine")
+    if proc.returncode:
+        fail("could not stage the Linux Strata engine into the WSL sandbox (%s)."
+             % (wsl_tail(proc) or "unknown error"))
+
+    # Point exe and lib_dirs to /strata-engine-bin inside rootfs so bind-mounted drvfs noexec/chmod never blocks execution
+    rewritten_path = os.path.join(runtime_dir, "strata-%s-isolated.json" % tag)
+    rewritten_cfg = read_json(rewritten_path) or {}
+    rewritten_cfg["exe"] = "/strata-engine-bin/strata"
+    rewritten_cfg["lib_dirs"] = ["/strata-engine-bin", "/usr/lib/wsl/lib"]
+    write_text_file(rewritten_path, json.dumps(rewritten_cfg, indent=2))
+
+    extras = [
+        "--setenv=LD_LIBRARY_PATH=/strata-engine-bin:/usr/lib/wsl/lib",
+        "--setenv=PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--setenv=STRATA_ALLOWED_HOSTS=localhost,127.0.0.1,host.docker.internal,%s" % SANDBOX_RELAY,
+    ]
+    for host_path, container_path, read_only in mounts:
+        if container_path == "/strata-engine":
+            continue
+        flag = "--bind-ro" if read_only else "--bind"
+        extras.append("%s=%s:%s" % (flag, wsl_wslpath(host_path), container_path))
+
+    wsl_push_strata_runtime_files(wsl, distro, extras)
+    wsl_start_strata_relay(wsl, distro, port)
+
+    popen_kwargs = {}
+    if IS_WINDOWS:
+        flags = 0
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            flags |= subprocess.CREATE_NO_WINDOW
+        if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+            flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+        popen_kwargs["creationflags"] = flags
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    log_handle = open(server_log, "wb")
+    try:
+        server_process = subprocess.Popen(
+            [wsl, "-d", distro, "-u", "root", "--",
+             "systemd-run", "--wait", "--pipe", "--collect", "--unit", WSL_STRATA_UNIT,
+             "bash", WSL_STRATA_NSPAWN_SCRIPT, WSL_STRATA_LAUNCHER_PATH, str(port), container_cfg_path],
+            cwd=strata_root,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            **popen_kwargs
+        )
+    finally:
+        log_handle.close()
+
+    return server_process
+
+
+# ----------------------------------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------------------------------
 
@@ -4812,6 +5538,7 @@ def parse_args():
     parser.add_argument("-Status", dest="status", action="store_true")
     parser.add_argument("-Setup", dest="setup", action="store_true")
     parser.add_argument("-Isolation", dest="isolation", choices=ISOLATION_CHOICES)
+    parser.add_argument("-StrataIsolation", dest="strata_isolation", choices=STRATA_ISOLATION_CHOICES)
     parser.add_argument("-Alias", dest="alias", action="store_true")
     parser.add_argument("-AliasShell", dest="alias_shell")
     parser.add_argument("-Help", "--help", "-h", dest="help", action="store_true")
@@ -4895,6 +5622,8 @@ def main():
         "port": args.port if args.port is not None else DEFAULT_PORT,
         "isolation": args.isolation or "",
         "isolation_specified": args.isolation is not None,
+        "strata_isolation": args.strata_isolation or "",
+        "strata_isolation_specified": args.strata_isolation is not None,
         "context_specified": args.context is not None,
         "kv_specified": args.kv is not None,
         "data_dir_specified": args.data_dir is not None,
@@ -4914,6 +5643,10 @@ def main():
     if state["isolation"] == "wsl" and not IS_WINDOWS:
         fail("the WSL isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
              "For the same wall on this system use docker or podman: scode -Setup -Isolation docker")
+
+    if state["strata_isolation"] == "wsl" and not IS_WINDOWS:
+        fail("the WSL Strata isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
+             "For the same wall on this system use docker or podman: scode -Setup -StrataIsolation docker")
 
     try:
         if args.help:
@@ -5112,25 +5845,39 @@ def main():
             if not state["isolation_specified"]:
                 state["isolation"] = saved_isolation(saved_setup)
 
+            if not state["strata_isolation_specified"]:
+                state["strata_isolation"] = saved_strata_isolation(saved_setup)
+
             if not state["opencode_specified"] and saved_setup.get("startOpencode") is False:
                 state["no_opencode"] = True
 
         isolation = state["isolation"] or "none"
+        strata_isolation = state["strata_isolation"] or "none"
 
         if isolation == "wsl" and not IS_WINDOWS:
             fail("the WSL isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
                  "For the same wall on this system use docker or podman: scode -Setup -Isolation docker")
 
+        if strata_isolation == "wsl" and not IS_WINDOWS:
+            fail("the WSL Strata isolation needs Windows; it runs the container inside Windows Subsystem for Linux.",
+                 "For the same wall on this system use docker or podman: scode -Setup -StrataIsolation docker")
+
         local_guard = isolation == "local"
         container_backend = isolation if isolation in CONTAINER_ISOLATIONS else None
         wsl_active = isolation == "wsl"
+
+        strata_container_backend = (
+            strata_isolation if strata_isolation in CONTAINER_ISOLATIONS else None
+        )
+        strata_wsl_active = strata_isolation == "wsl"
 
         opencode_off = state["no_opencode"]
 
         if opencode_off:
             if isolation != "none":
-                write_warn("isolation is ignored while Start OpenCode is off: nothing OpenCode-related runs")
+                write_warn("OpenCode isolation is ignored while Start OpenCode is off: nothing OpenCode-related runs")
 
+            isolation = "none"
             local_guard = False
             container_backend = None
             wsl_active = False
@@ -5736,6 +6483,28 @@ def main():
             ensure_sandbox_network(sandbox_tool)
             sandbox_tag = ensure_sandbox_image(sandbox_backend, sandbox_tool, spec["avx2"])
 
+        strata_sandbox_tag = None
+        strata_sandbox_backend = (
+            CONTAINER_BACKENDS.get(strata_container_backend) if strata_container_backend else None
+        )
+
+        if strata_sandbox_backend:
+            write_step("Preparing the %s sandbox for Strata" % strata_sandbox_backend["label"])
+
+            strata_tool, strata_detail = container_ready(strata_sandbox_backend)
+
+            if not strata_tool:
+                fail_no_container(strata_sandbox_backend, strata_detail)
+
+            if strata_sandbox_backend != sandbox_backend:
+                write_info("%s version %s" % (strata_sandbox_backend["label"], strata_detail))
+                ensure_sandbox_network(strata_tool)
+
+            strata_sandbox_tag = ensure_strata_sandbox_image(
+                strata_sandbox_backend, strata_tool, strata_version
+            )
+            ensure_linux_strata_engine(strata_root)
+
         # --------------------------------------------------------------------------------------------
         # WSL sandbox preparation (systemd-nspawn inside a WSL 2 distro; no container engine)
         # --------------------------------------------------------------------------------------------
@@ -5759,6 +6528,32 @@ def main():
                 write_warn("if the model connection fails, add [wsl2] and networkingMode=mirrored to "
                            "%UserProfile%\\.wslconfig, then run: wsl --shutdown")
 
+        strata_wsl_handle = None
+
+        if strata_wsl_active:
+            write_step("Preparing the WSL sandbox for Strata")
+
+            if wsl_handle:
+                strata_wsl_handle = wsl_handle
+            else:
+                strata_wsl_handle, strata_wsl_detail = wsl_ready()
+
+                if not strata_wsl_handle:
+                    fail_no_wsl(strata_wsl_detail)
+
+                write_info("distro: %s" % strata_wsl_detail)
+                ensure_wsl_packages(strata_wsl_handle["wsl"], strata_wsl_handle["distro"])
+
+                if not wsl_is_mirrored(strata_wsl_handle["wsl"], strata_wsl_handle["distro"]):
+                    write_warn("mirrored networking was not detected inside WSL (no 10.255.255.254 on lo)")
+                    write_warn("if the model connection fails, add [wsl2] and networkingMode=mirrored to "
+                               "%UserProfile%\\.wslconfig, then run: wsl --shutdown")
+
+            ensure_wsl_strata_rootfs(
+                strata_wsl_handle["wsl"], strata_wsl_handle["distro"], spec["avx2"]
+            )
+            ensure_linux_strata_engine(strata_root)
+
         # --------------------------------------------------------------------------------------------
         # -Setup stops here
         # --------------------------------------------------------------------------------------------
@@ -5781,7 +6576,10 @@ def main():
         server_log = os.path.join(LOG_DIR, "server.log")
 
         if not server_running:
-            write_step("Starting the Strata server")
+            write_step("Starting the Strata server" + (
+                " in the %s sandbox" % strata_sandbox_backend["label"] if strata_sandbox_backend
+                else (" in the WSL sandbox" if strata_wsl_handle else "")
+            ))
 
             strata_config_path = os.path.join(strata_root, "strata-%s.json" % tag)
             strata_config = read_json(strata_config_path)
@@ -5801,45 +6599,62 @@ def main():
                 except OSError:
                     pass
 
-            env = dict(os.environ)
-            env["PYTHONUNBUFFERED"] = "1"
-            env["PYTHONIOENCODING"] = "utf-8"
-
-            if sandbox_backend:
-                env["STRATA_ALLOWED_HOSTS"] = "%s,host.docker.internal" % SANDBOX_RELAY
-                write_info("the server will listen on 0.0.0.0 so the container can reach it; "
-                           "Windows Firewall blocks other devices by default")
-
-            popen_kwargs = {}
-            if IS_WINDOWS:
-                # CREATE_NO_WINDOW, not DETACHED_PROCESS: the server needs a
-                # windowless console so the engine processes it spawns inherit
-                # one. A fully detached server makes each console child create
-                # its own new visible console window.
-                flags = 0
-                if hasattr(subprocess, "CREATE_NO_WINDOW"):
-                    flags |= subprocess.CREATE_NO_WINDOW
-                if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-                    flags |= subprocess.CREATE_NEW_PROCESS_GROUP
-                popen_kwargs["creationflags"] = flags
-            else:
-                popen_kwargs["start_new_session"] = True
-
-            log_handle = open(server_log, "wb")
-            try:
-                server_process = subprocess.Popen(
-                    [python, os.path.join(strata_root, "serve", "server.py"),
-                     "--engine", "strata", "--config", strata_config_path, "--port", str(port)] +
-                    (["--host", "0.0.0.0"] if sandbox_backend else []),
-                    cwd=strata_root,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    env=env,
-                    **popen_kwargs
+            if strata_sandbox_backend:
+                write_info("Strata runs in container '%s' on internal network '%s' "
+                           "(host relay '%s' forwards 127.0.0.1:%d)"
+                           % (STRATA_SANDBOX_CONTAINER, SANDBOX_NETWORK,
+                              STRATA_SANDBOX_HOST_RELAY, port))
+                server_process = start_strata_container_server(
+                    strata_container_backend, strata_sandbox_tag,
+                    strata_root, tag, strata_config, port, server_log
                 )
-            finally:
-                log_handle.close()
+            elif strata_wsl_handle:
+                write_info("Strata runs in a systemd-nspawn container in WSL distro '%s' "
+                           "with --private-network (reverse relay forwards 127.0.0.1:%d)"
+                           % (strata_wsl_handle["distro"], port))
+                server_process = start_strata_wsl_server(
+                    strata_wsl_handle, strata_root, tag, strata_config, port, server_log
+                )
+            else:
+                env = dict(os.environ)
+                env["PYTHONUNBUFFERED"] = "1"
+                env["PYTHONIOENCODING"] = "utf-8"
+
+                if sandbox_backend:
+                    env["STRATA_ALLOWED_HOSTS"] = "%s,host.docker.internal" % SANDBOX_RELAY
+                    write_info("the server will listen on 0.0.0.0 so the container can reach it; "
+                               "Windows Firewall blocks other devices by default")
+
+                popen_kwargs = {}
+                if IS_WINDOWS:
+                    # CREATE_NO_WINDOW, not DETACHED_PROCESS: the server needs a
+                    # windowless console so the engine processes it spawns inherit
+                    # one. A fully detached server makes each console child create
+                    # its own new visible console window.
+                    flags = 0
+                    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                        flags |= subprocess.CREATE_NO_WINDOW
+                    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+                        flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+                    popen_kwargs["creationflags"] = flags
+                else:
+                    popen_kwargs["start_new_session"] = True
+
+                log_handle = open(server_log, "wb")
+                try:
+                    server_process = subprocess.Popen(
+                        [python, os.path.join(strata_root, "serve", "server.py"),
+                         "--engine", "strata", "--config", strata_config_path, "--port", str(port)] +
+                        (["--host", "0.0.0.0"] if sandbox_backend else []),
+                        cwd=strata_root,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_handle,
+                        stderr=subprocess.STDOUT,
+                        env=env,
+                        **popen_kwargs
+                    )
+                finally:
+                    log_handle.close()
 
             write_info("loading the model; the first start may take several minutes")
             write_info("server output: %s" % server_log)
@@ -5850,10 +6665,18 @@ def main():
 
                 show_log_tail(server_log)
 
-                if strata_config and strata_config.get("log"):
+                if strata_sandbox_backend:
+                    iso_log = os.path.join(SANDBOX_DIR, "strata-run", "engine.log")
+                    if os.path.isfile(iso_log):
+                        show_log_tail(iso_log, 15)
+                elif strata_wsl_handle:
+                    iso_log = os.path.join(WSL_DIR, "strata-run", "engine.log")
+                    if os.path.isfile(iso_log):
+                        show_log_tail(iso_log, 15)
+                elif strata_config and strata_config.get("log"):
                     show_log_tail(strata_config["log"], 15)
 
-                if server_process.poll() is None:
+                if server_process.poll() is None or strata_sandbox_backend or strata_wsl_handle:
                     stop_strata_servers(port)
 
                 assert_not_blocked_by_smart_app_control(run_started)

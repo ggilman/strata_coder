@@ -36,7 +36,8 @@ QUESTIONS = {
     "context": "Context",
     "kv": "KV cache",
     "port": "Server port",
-    "isolation": "Isolation - keep OpenCode away from the internet?",
+    "isolation": "OpenCode isolation - keep OpenCode away from the internet?",
+    "strataIsolation": "Strata isolation - run the Strata server in a container?",
     "startOpencode": "Start OpenCode?",
     "alias": "Add the scode shortcut to %s?",
 }
@@ -214,16 +215,18 @@ def isolation_info(which):
         "none": "\n".join([
             "Isolation: None",
             "",
-            "OpenCode runs directly on this PC with the normal internet access of your user "
-            "account. Nothing is blocked.",
+            "The selected component (OpenCode or Strata) runs directly on this PC with the "
+            "normal access of your user account. Nothing extra is sandboxed.",
             "",
-            "Fine for everyday work; pick Local Only or a container when the code or data on "
-            "this machine must not leave it.",
+            "Fine for everyday work; pick Local Only (for OpenCode) or a container (Docker, "
+            "Podman, or WSL Containers) when the code, model, or data on this machine must "
+            "be isolated.",
         ]),
         "local": "\n".join([
-            "Isolation: Local Only",
+            "Isolation: Local Only (OpenCode only)",
             "",
-            "OpenCode keeps running on this PC, but nothing leaves it. While OpenCode runs:",
+            "Applies only to OpenCode (disabled when Start OpenCode is off). OpenCode keeps "
+            "running on this PC, but nothing leaves it. While OpenCode runs:",
             "  - OpenCode and every process it starts get a dead proxy (http://127.0.0.1:9), "
             "so any web request dies instantly;",
             "  - OpenCode's webfetch and websearch tools are switched off;",
@@ -232,62 +235,59 @@ def isolation_info(which):
             "working.",
             "",
             "Local traffic stays exempt (NO_PROXY covers 127.0.0.1 and localhost), so OpenCode "
-            "still reaches the model server on this PC. Everything is undone the moment "
-            "OpenCode exits; no permanent machine changes are made.",
+            "still reaches the Strata server. Everything is undone the moment OpenCode exits; "
+            "no permanent machine changes are made.",
             "",
             "This is a policy wall, not a jail: a very determined exploit could still step "
-            "around it. The Docker and Podman choices are the real jail.",
+            "around it. The Docker, Podman, and WSL choices are the real container jail.",
         ]),
         "docker": "\n".join([
             "Isolation: Docker",
             "",
-            "The stronger wall: OpenCode itself runs inside a Docker container instead of on "
-            "this PC.",
-            "  - the container sits on an internal Docker network with no route to the "
-            "internet;",
-            "  - it reaches the model only through a small relay on that network, and the "
-            "model still runs on this PC;",
-            "  - only the project folder you open is mounted inside the container - the rest "
-            "of this PC is invisible to it;",
-            "  - inside the container the same dead proxy and network-tool deny list as "
-            "Local Only apply.",
+            "Runs the selected component (OpenCode, Strata, or both in two separate containers) "
+            "inside a Docker container instead of directly on this PC.",
+            "  - containers sit on an internal Docker network with no route to the internet;",
+            "  - for OpenCode: only the project folder you open is mounted inside the container "
+            "- the rest of this PC is invisible to it, and the dead proxy and network-tool deny "
+            "list apply;",
+            "  - for Strata: the model server runs inside its own container with only the model "
+            "folder mounted read-only (and GPU passthrough when available);",
+            "  - OpenCode can always reach Strata: directly over the internal container network "
+            "when both are in the same container engine, or through a local loopback relay.",
             "",
-            "Even a misbehaving or compromised OpenCode cannot reach your other files or your "
-            "network. Needs Docker Desktop or Docker Engine; the sandbox image is built on "
-            "first use, and OpenCode's history is kept in a named volume that survives "
-            "restarts.",
+            "Needs Docker Desktop or Docker Engine; sandbox images are built on first use.",
         ]),
         "podman": "\n".join([
             "Isolation: Podman",
             "",
             "The same container wall as Docker, driven by the Podman engine instead: same "
-            "internal network, same image, same relay, same deny lists. Pick it when Podman "
+            "internal network, same images, same relay, same deny lists. You can isolate "
+            "OpenCode, Strata, or both (in two separate containers). Pick it when Podman "
             "is already installed or Docker Desktop's licensing is a problem.",
             "",
             "Needs Podman: on Windows that means a podman machine (run 'podman machine "
             "start' before using it); on Linux the normal podman install works out of the "
-            "box. The sandbox image builds on first use.",
+            "box. Sandbox images build on first use.",
         ]),
         "wsl": "\n".join([
             "Isolation: WSL Containers",
             "",
             "The same container wall as Docker and Podman, but run by systemd-nspawn (part of "
             "systemd) inside a WSL 2 Linux distro - no Docker, no Podman, no container engine "
-            "at all.",
+            "at all. You can isolate OpenCode, Strata, or both in two separate containers.",
             "",
-            "  - the container gets no network interfaces whatsoever (only its own loopback): "
+            "  - each container gets no network interfaces whatsoever (only its own loopback): "
             "no routes, no DNS, nothing to firewall;",
-            "  - the model keeps running on Windows; the container reaches it through a small "
-            "relay inside WSL, using WSL's mirrored networking (shared Windows loopback);",
-            "  - the same Debian dev toolchain and network deny lists as the Docker sandbox; "
-            "your project folder is mounted inside, and OpenCode's history persists in a WSL "
-            "directory.",
+            "  - communication between OpenCode, the host, and Strata happens strictly over "
+            "Unix socket / loopback relays bridged into the containers;",
+            "  - for OpenCode: only your project folder is mounted inside, with the same Debian "
+            "dev toolchain and network deny lists;",
+            "  - for Strata: the Linux Strata server runs inside its own isolated container "
+            "with the model folder mounted read-only.",
             "",
             "Needs Windows plus WSL 2 with systemd in the distro (the stock Ubuntu distro "
-            "qualifies). The script installs a few standard distro packages inside it "
-            "(systemd-container, debootstrap) and builds the sandbox rootfs on first use. If "
-            "your WSL is not in mirrored networking mode yet, add [wsl2] and "
-            "networkingMode=mirrored to %UserProfile%\\.wslconfig and run wsl --shutdown.",
+            "qualifies). The script installs standard distro packages (systemd-container, "
+            "debootstrap) and builds the sandbox rootfs on first use.",
         ]),
     }
 
@@ -295,7 +295,7 @@ def isolation_info(which):
 
 
 def isolation_options():
-    """the console setup's isolation options; WSL Containers is only offered on Windows,
+    """the console setup's OpenCode isolation options; WSL Containers is only offered on Windows,
     where WSL exists."""
     options = [{"value": "none", "name": "None", "label": "None - nothing extra"},
                {"value": "local", "name": "Local", "label": "Local Only - block web access for "
@@ -313,19 +313,37 @@ def isolation_options():
     return options
 
 
+def strata_isolation_options():
+    """the console setup's Strata isolation options (Local Only applies only to OpenCode)."""
+    options = [{"value": "none", "name": "None", "label": "None - run Strata directly on this PC"},
+               {"value": "docker", "name": "Docker", "label": "Docker - Strata in a container "
+                                                              "with no internet"},
+               {"value": "podman", "name": "Podman", "label": "Podman - the same container wall, "
+                                                              "Podman engine"}]
+
+    if os.name == "nt":
+        options.append({"value": "wsl", "name": "WSL",
+                        "label": "WSL Containers - Strata in a WSL 2 container, "
+                                 "no container engine"})
+
+    return options
+
+
 def start_opencode_info_text():
     return "\n".join([
         "Start OpenCode",
         "",
         "On (the default): everything works as usual - OpenCode is checked for, installed,",
-        "and opened when you run scode.",
+        "and opened when you run scode, using the OpenCode isolation mode selected above.",
         "",
-        "Off: setup never checks for or installs OpenCode, and isolation settings do nothing",
-        "because nothing OpenCode-related runs. When you run scode, the server still starts,",
-        "and instead of opening OpenCode the run ends with a small window that says Strata",
-        "is running: the terminal is free the moment the window opens, and clicking Close",
-        "stops the server and ends the process, freeing RAM and VRAM. If no window can be",
-        "shown, the server stays running and must be stopped manually with scode -Stop.",
+        "Off: setup never checks for or installs OpenCode, and OpenCode's isolation options",
+        "are disabled because OpenCode does not run. Strata's own isolation setting still",
+        "applies to the Strata server. When you run scode, the server starts (on the host or",
+        "in its container), and instead of opening OpenCode the run ends with a small window",
+        "that says Strata is running: the terminal is free the moment the window opens, and",
+        "clicking Close stops the server and ends the process, freeing RAM and VRAM. If no",
+        "window can be shown, the server stays running and must be stopped manually with",
+        "scode -Stop.",
     ])
 
 
@@ -564,6 +582,20 @@ def run_setup_gui(sc, overrides=None):
     if default_isolation == "wsl" and os.name != "nt":
         default_isolation = "none"
 
+    default_strata_isolation = (
+        sc.saved_strata_isolation(saved)
+        if hasattr(sc, "saved_strata_isolation")
+        else str((saved or {}).get("strataIsolation") or "none").lower()
+    )
+
+    if "strataIsolation" in overrides:
+        default_strata_isolation = overrides["strataIsolation"]
+
+    if default_strata_isolation == "local" or (
+        default_strata_isolation == "wsl" and os.name != "nt"
+    ):
+        default_strata_isolation = "none"
+
     default_start_opencode = overrides.get("startOpencode")
 
     if default_start_opencode is None:
@@ -755,34 +787,85 @@ def run_setup_gui(sc, overrides=None):
     port_var = tk.StringVar(value=str(default_port))
     ttk.Entry(body, textvariable=port_var, width=10).grid(row=6, column=1, sticky="w")
 
-    add_label("Isolation:", 7)
-    isolation_var = tk.StringVar(value=default_isolation)
-
-    isolation_rows = [("none", "None"),
-                      ("local", "Local Only"),
-                      ("docker", "Docker"),
-                      ("podman", "Podman")]
-
-    if os.name == "nt":
-        isolation_rows.append(("wsl", "WSL Containers"))
-
-    for offset, (value, label) in enumerate(isolation_rows):
-        line = 7 + offset
-        radio = ttk.Radiobutton(body, text=label, variable=isolation_var, value=value)
-        radio.grid(row=line, column=1, sticky="w", pady=1)
-        ttk.Button(body, text="\u24d8", width=4,
-                   command=lambda which=value, label=label: info_popup(label, isolation_info(which))).grid(
-            row=line, column=2, sticky="w", padx=(6, 0))
-
-    add_label("Start OpenCode:", 12)
+    add_label("Start OpenCode:", 7)
     start_opencode_var = tk.StringVar(value="1" if default_start_opencode else "0")
-    ttk.Checkbutton(body, text="Start OpenCode (on by default)",
-                    variable=start_opencode_var, onvalue="1", offvalue="0").grid(
-        row=12, column=1, sticky="w")
+    start_opencode_cb = ttk.Checkbutton(
+        body, text="Start OpenCode (on by default)",
+        variable=start_opencode_var, onvalue="1", offvalue="0")
+    start_opencode_cb.grid(row=7, column=1, sticky="w")
     ttk.Button(body, text="\u24d8", width=4,
                command=lambda: info_popup("Start OpenCode",
                                           start_opencode_info_text())).grid(
-        row=12, column=2, sticky="w", padx=(6, 0))
+        row=7, column=2, sticky="w", padx=(6, 0))
+
+    add_label("Isolation:", 8)
+    isolation_var = tk.StringVar(value=default_isolation if default_start_opencode else "none")
+    strata_isolation_var = tk.StringVar(value=default_strata_isolation)
+    last_opencode_isolation = [default_isolation if default_isolation != "none" else "none"]
+
+    iso_frame = ttk.Frame(body)
+    iso_frame.grid(row=8, column=1, columnspan=2, rowspan=5, sticky="w", pady=(2, 2))
+
+    oc_header = ttk.Label(iso_frame, text="OpenCode", font=("TkDefaultFont", 9, "bold"))
+    oc_header.grid(row=0, column=0, sticky="w", padx=(0, 28), pady=(0, 2))
+    strata_header = ttk.Label(iso_frame, text="Strata Server", font=("TkDefaultFont", 9, "bold"))
+    strata_header.grid(row=0, column=1, sticky="w", padx=(0, 14), pady=(0, 2))
+
+    isolation_rows = [("none", "None", True),
+                      ("local", "Local Only", False),
+                      ("docker", "Docker", True),
+                      ("podman", "Podman", True)]
+
+    if os.name == "nt":
+        isolation_rows.append(("wsl", "WSL Containers", True))
+
+    opencode_radios = []
+    strata_radios = []
+
+    def on_opencode_iso_select():
+        if start_opencode_var.get() != "0":
+            last_opencode_isolation[0] = isolation_var.get()
+
+    for offset, (value, label, allow_strata) in enumerate(isolation_rows, start=1):
+        oc_radio = ttk.Radiobutton(
+            iso_frame, text=label, variable=isolation_var, value=value,
+            command=on_opencode_iso_select)
+        oc_radio.grid(row=offset, column=0, sticky="w", padx=(0, 28), pady=1)
+        opencode_radios.append(oc_radio)
+
+        if allow_strata:
+            st_radio = ttk.Radiobutton(
+                iso_frame, text=label, variable=strata_isolation_var, value=value)
+            st_radio.grid(row=offset, column=1, sticky="w", padx=(0, 14), pady=1)
+            strata_radios.append(st_radio)
+        else:
+            ttk.Label(iso_frame, text="\u2014 (OpenCode only)",
+                      foreground="#777777").grid(row=offset, column=1, sticky="w",
+                                                 padx=(0, 14), pady=1)
+
+        ttk.Button(iso_frame, text="\u24d8", width=4,
+                   command=lambda which=value, lbl=label: info_popup(
+                       lbl, isolation_info(which))).grid(
+            row=offset, column=2, sticky="w", padx=(6, 0), pady=1)
+
+    def sync_opencode_isolation_state(*_args):
+        enabled = start_opencode_var.get() != "0"
+        if enabled:
+            for rb in opencode_radios:
+                rb.configure(state="normal")
+            if isolation_var.get() == "none" and last_opencode_isolation[0] != "none":
+                isolation_var.set(last_opencode_isolation[0])
+            oc_header.configure(text="OpenCode", foreground="")
+        else:
+            if isolation_var.get() != "none":
+                last_opencode_isolation[0] = isolation_var.get()
+            isolation_var.set("none")
+            for rb in opencode_radios:
+                rb.configure(state="disabled")
+            oc_header.configure(text="OpenCode (off)", foreground="#777777")
+
+    start_opencode_cb.configure(command=sync_opencode_isolation_state)
+    sync_opencode_isolation_state()
 
     add_label("scode shortcut:", 13)
     shell_var = tk.StringVar(value="auto")
@@ -925,6 +1008,7 @@ def run_setup_gui(sc, overrides=None):
                                  % (sc.PORT_MIN, sc.PORT_MAX))
             return
 
+        start_oc = start_opencode_var.get() != "0"
         outcome["result"] = {
             "family": variant["family"],
             "model": variant["model"],
@@ -932,8 +1016,9 @@ def run_setup_gui(sc, overrides=None):
             "context": context,
             "kv": kv,
             "port": int(port_text),
-            "isolation": isolation_var.get(),
-            "startOpencode": start_opencode_var.get() != "0",
+            "isolation": isolation_var.get() if start_oc else "none",
+            "strataIsolation": strata_isolation_var.get(),
+            "startOpencode": start_oc,
         }
 
         root.destroy()
@@ -966,6 +1051,7 @@ def apply_setup(sc, result):
         "-Kv", result["kv"],
         "-Port", str(result["port"]),
         "-Isolation", result["isolation"],
+        "-StrataIsolation", result.get("strataIsolation", "none"),
         "-StartOpencode" if result.get("startOpencode", True) else "-NoOpencode",
         "-NoAlias",
         "-NoGui",
