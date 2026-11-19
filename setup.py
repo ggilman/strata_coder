@@ -1029,6 +1029,8 @@ def run_setup_gui(sc, overrides=None):
             "strataIsolation": strata_isolation_var.get(),
             "startOpencode": start_oc,
         }
+        if overrides.get("tune"):
+            outcome["result"]["tune"] = overrides["tune"]
 
         root.destroy()
 
@@ -1065,6 +1067,9 @@ def apply_setup(sc, result):
         "-NoAlias",
         "-NoGui",
     ]
+
+    if result.get("tune"):
+        command += ["-Tune", str(result["tune"])]
 
     _spawn_cli_in_terminal(sc, command)
 

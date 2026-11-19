@@ -154,6 +154,19 @@ def resolve_server(sc, server_port):
         if candidate_health:
             return candidate_port, candidate_health
 
+    if hasattr(sc, "isolated_strata_ports"):
+        try:
+            iso_ports = sc.isolated_strata_ports() or []
+        except Exception:
+            iso_ports = []
+        for candidate_port in iso_ports:
+            candidate_port = _int(candidate_port, 0)
+            if candidate_port <= 0 or candidate_port == server_port:
+                continue
+            candidate_health = sc.strata_health(candidate_port)
+            if candidate_health:
+                return candidate_port, candidate_health
+
     if processes:
         try:
             first_port = _int(sc.server_port(processes[0]), server_port)
@@ -165,9 +178,12 @@ def resolve_server(sc, server_port):
     return server_port, health
 
 
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _fetch_json_dict(url, timeout=5):
     request = urllib.request.Request(url)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _NO_PROXY_OPENER.open(request, timeout=timeout) as response:
         payload = json.load(response)
     return payload if isinstance(payload, dict) else {}
 
@@ -448,7 +464,10 @@ def show_status_panel(sc, server_port):
 def show_status_window(sc, server_port):
     import tkinter as tk
 
-    server_port, health = resolve_server(sc, server_port)
+    default_port = getattr(sc, "DEFAULT_PORT", 8080)
+    server_port = _int(server_port, default_port)
+    if server_port <= 0:
+        server_port = default_port
     base = "http://127.0.0.1:%d" % server_port
 
     root = tk.Tk()
@@ -485,7 +504,7 @@ def show_status_window(sc, server_port):
                       bg="white", fg="#8a8a8a", anchor="w")
     footer.pack(fill="x", padx=14, pady=(6, 10))
 
-    ever_connected = bool(health)
+    ever_connected = False
     bar_w, bar_h = 140, 12
     row_slots = []
     chrome_state = {"border": None, "title": None, "footer": None}
@@ -813,9 +832,9 @@ def show_status_window(sc, server_port):
     root.bind("<KeyPress-R>", trigger_refresh)
     root.bind("<F5>", trigger_refresh)
 
-    initial_data, initial_exc = poll_once(base)
-    render_poll_result(initial_data, initial_exc)
-    schedule_start_poll(POLL_MS)
+    set_row_text(0, "connecting to %s..." % base, fg="#767676")
+    hide_extra_rows(1)
+    start_poll()
     try:
         after_ids["check"] = root.after(100, check_poll)
     except Exception:

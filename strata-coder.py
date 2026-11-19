@@ -767,7 +767,7 @@ def download_file(url, out_file):
         if proc.returncode == 0:
             return
 
-        if proc.returncode == 22 and http_code == "416" and local_size > 0:
+        if proc.returncode == 22 and http_code[-3:] == "416" and local_size > 0:
             write_info("the server reports the file is already fully downloaded")
             return
 
@@ -1079,13 +1079,13 @@ def stop_strata_servers(on_port=0):
             except OSError as exc:
                 write_warn("could not stop the Strata server (PID %d); %s" % (pid, exc))
 
-    found += stop_strata_containers()
-    found += stop_strata_wsl()
+    found += stop_strata_containers(on_port)
+    found += stop_strata_wsl(on_port)
 
     return found
 
 
-def stop_strata_containers():
+def stop_strata_containers(on_port=0):
     found = 0
 
     for backend in CONTAINER_BACKENDS.values():
@@ -1094,20 +1094,42 @@ def stop_strata_containers():
         if not tool:
             continue
 
+        if on_port > 0:
+            rc_port, port_lines = run_native(
+                tool, ["inspect", "-f", "{{range .Args}}{{.}} {{end}}", STRATA_SANDBOX_CONTAINER])
+            if rc_port == 0 and port_lines:
+                joined = " ".join(port_lines)
+                m = re.search(r"--port\s+(\d+)", joined)
+                if m and int(m.group(1)) != on_port:
+                    continue
+            else:
+                rc_rel, rel_lines = run_native(
+                    tool, ["inspect", "-f", "{{range .Args}}{{.}} {{end}}", STRATA_SANDBOX_HOST_RELAY])
+                if rc_rel == 0 and rel_lines:
+                    joined = " ".join(rel_lines)
+                    m = re.search(r"tcp-listen:(\d+)", joined)
+                    if m and int(m.group(1)) != on_port:
+                        continue
+
+        removed_any = False
+
         for name in (STRATA_SANDBOX_CONTAINER, STRATA_SANDBOX_HOST_RELAY):
             rc, ids = run_native(tool, ["ps", "-aq", "--filter", "name=^%s$" % name])
 
             if rc == 0 and ids:
                 rc_rm, _ = run_native(tool, ["rm", "-f", name])
 
-                if rc_rm == 0 and name == STRATA_SANDBOX_CONTAINER:
-                    found += 1
-                    write_ok("stopped the Strata %s container (%s)" % (backend["label"], name))
+                if rc_rm == 0:
+                    removed_any = True
+
+        if removed_any:
+            found += 1
+            write_ok("stopped the Strata %s container (%s)" % (backend["label"], STRATA_SANDBOX_CONTAINER))
 
     return found
 
 
-def stop_strata_wsl():
+def stop_strata_wsl(on_port=0):
     if not IS_WINDOWS:
         return 0
 
@@ -1121,11 +1143,29 @@ def stop_strata_wsl():
     found = 0
 
     try:
-        proc = subprocess.run(
-            [wsl] + distro_args + ["-u", "root", "--", "systemctl", "is-active", WSL_STRATA_UNIT],
-            capture_output=True, text=True, errors="replace",
-        )
-        was_active = (proc.stdout or "").strip() == "active"
+        was_active = False
+        for unit in (WSL_STRATA_UNIT, WSL_STRATA_RELAY_UNIT):
+            proc = subprocess.run(
+                [wsl] + distro_args + ["-u", "root", "--", "systemctl", "is-active", unit],
+                capture_output=True, text=True, errors="replace",
+            )
+            if (proc.stdout or "").strip() == "active":
+                was_active = True
+
+        if was_active and on_port > 0:
+            proc_cat = subprocess.run(
+                [wsl] + distro_args + ["-u", "root", "--", "systemctl", "show", "-p", "ExecStart", WSL_STRATA_UNIT],
+                capture_output=True, text=True, errors="replace",
+            )
+            m = re.search(r"--port\s+(\d+)", proc_cat.stdout or "")
+            if not m:
+                proc_rel = subprocess.run(
+                    [wsl] + distro_args + ["-u", "root", "--", "systemctl", "show", "-p", "ExecStart", WSL_STRATA_RELAY_UNIT],
+                    capture_output=True, text=True, errors="replace",
+                )
+                m = re.search(r"\s(\d+)\s*;", proc_rel.stdout or "") or re.search(r"strata-relay\.py\s+(\d+)", proc_rel.stdout or "")
+            if m and int(m.group(1)) != on_port:
+                return 0
 
         for unit in (WSL_STRATA_UNIT, WSL_STRATA_RELAY_UNIT):
             subprocess.run(
@@ -1145,6 +1185,70 @@ def stop_strata_wsl():
         pass
 
     return found
+
+
+def isolated_strata_ports():
+    ports = []
+
+    for backend in CONTAINER_BACKENDS.values():
+        tool = shutil.which(backend["exe"])
+        if not tool:
+            continue
+
+        rc, ids = run_native(tool, ["ps", "-q", "--filter", "name=^%s$" % STRATA_SANDBOX_CONTAINER])
+        if rc == 0 and ids:
+            rc_port, port_lines = run_native(
+                tool, ["inspect", "-f", "{{range .Args}}{{.}} {{end}}", STRATA_SANDBOX_CONTAINER])
+            if rc_port == 0 and port_lines:
+                m = re.search(r"--port\s+(\d+)", " ".join(port_lines))
+                if m:
+                    p = int(m.group(1))
+                    if p not in ports:
+                        ports.append(p)
+                    continue
+
+        rc_rel, rel_ids = run_native(tool, ["ps", "-q", "--filter", "name=^%s$" % STRATA_SANDBOX_HOST_RELAY])
+        if rc_rel == 0 and rel_ids:
+            rc_insp, rel_lines = run_native(
+                tool, ["inspect", "-f", "{{range .Args}}{{.}} {{end}}", STRATA_SANDBOX_HOST_RELAY])
+            if rc_insp == 0 and rel_lines:
+                m = re.search(r"tcp-listen:(\d+)", " ".join(rel_lines))
+                if m:
+                    p = int(m.group(1))
+                    if p not in ports:
+                        ports.append(p)
+
+    if IS_WINDOWS:
+        wsl = wsl_exe()
+        if wsl:
+            distro = (os.environ.get(WSL_DISTRO_ENV) or "").strip()
+            distro_args = ["-d", distro] if distro else []
+            try:
+                proc = subprocess.run(
+                    [wsl] + distro_args + ["-u", "root", "--", "systemctl", "is-active", WSL_STRATA_UNIT],
+                    capture_output=True, text=True, errors="replace",
+                )
+                if (proc.stdout or "").strip() == "active":
+                    proc_cat = subprocess.run(
+                        [wsl] + distro_args + ["-u", "root", "--", "systemctl", "show", "-p", "ExecStart", WSL_STRATA_UNIT],
+                        capture_output=True, text=True, errors="replace",
+                    )
+                    m = re.search(r"--port\s+(\d+)", proc_cat.stdout or "")
+                    if not m:
+                        proc_rel = subprocess.run(
+                            [wsl] + distro_args + ["-u", "root", "--", "systemctl", "show", "-p", "ExecStart", WSL_STRATA_RELAY_UNIT],
+                            capture_output=True, text=True, errors="replace",
+                        )
+                        m = (re.search(r"\s(\d+)\s*;", proc_rel.stdout or "")
+                             or re.search(r"strata-relay\.py\s+(\d+)", proc_rel.stdout or ""))
+                    if m:
+                        p = int(m.group(1))
+                        if p not in ports:
+                            ports.append(p)
+            except Exception:
+                pass
+
+    return ports
 
 
 def _process_exists_win(pid):
@@ -1344,7 +1448,7 @@ def install_scode_alias(shell):
             except OSError:
                 pass
 
-        lines.append("scode=%s %s $*" % (sys.executable, SCRIPT_PATH))
+        lines.append('scode="%s" "%s" $*' % (sys.executable, SCRIPT_PATH))
 
         with open(macro_file, "w", encoding=_oem_encoding(), newline="") as handle:
             handle.write("\r\n".join(lines) + "\r\n")
@@ -1505,6 +1609,7 @@ def _pad(text, width):
 
 
 def _wrap(text, width):
+    width = max(1, int(width or 1))
     lines = []
     current = ""
 
@@ -1798,6 +1903,9 @@ def run_setup_menu(state):
 
     if state["opencode_specified"]:
         overrides["startOpencode"] = not state["no_opencode"]
+
+    if state.get("tune"):
+        overrides["tune"] = state["tune"]
 
     spawn_detached_gui(MENU_PATH, {menu.CHILD_ENV: json.dumps(overrides)})
 
@@ -2671,12 +2779,31 @@ def fix_copied_settings(where, manifest, new_root):
 
     pairs.sort(key=lambda pair: -len(pair[0]))
 
+    def _replace_path_prefix(text, source, target):
+        for src_sep, tgt_sep in ((source, target),
+                                 (source.replace("\\", "/"), target.replace("\\", "/")),
+                                 (source.replace("/", "\\"), target.replace("/", "\\"))):
+            if not src_sep:
+                continue
+            src_clean = src_sep.rstrip("\\/")
+            tgt_clean = tgt_sep.rstrip("\\/")
+            if text == src_clean or text == src_sep:
+                return tgt_clean
+            for sep in ("\\", "/"):
+                prefix = src_clean + sep
+                if text.startswith(prefix):
+                    return tgt_clean + sep + text[len(prefix):]
+        return text
+
     def transform(value):
         if isinstance(value, str):
             new = value
 
             for source, target in pairs:
-                new = new.replace(source, target)
+                replaced = _replace_path_prefix(new, source, target)
+                if replaced != new:
+                    new = replaced
+                    break
 
             return new, new != value
 
@@ -2875,11 +3002,14 @@ def probe_venv(where, manifest, new_root):
         if os.path.isdir(site_dir):
             merge_tree(site_dir, backup)
 
-        subprocess.run([sys.executable, "-m", "venv", venv_dir, "--clear"], timeout=180)
+        proc = subprocess.run([sys.executable, "-m", "venv", venv_dir, "--clear"], timeout=180)
 
         if os.path.isdir(backup):
-            merge_tree(backup, site_dir)
-            shutil.rmtree(backup, ignore_errors=True)
+            if proc.returncode == 0:
+                merge_tree(backup, site_dir)
+                shutil.rmtree(backup, ignore_errors=True)
+            else:
+                note("venv --clear exited with code %d; keeping backup at %s" % (proc.returncode, backup))
     except Exception as exc:
         note("the venv rebuild failed (%s)" % exc)
         return
@@ -3085,7 +3215,8 @@ def _read_key():
 
     try:
         tty.setcbreak(fd)
-        ch = sys.stdin.read(1)
+        raw = os.read(fd, 1)
+        ch = raw.decode("utf-8", "replace") if raw else ""
 
         if ch == "" or ch == "\x04":
             return "eof"
@@ -3097,11 +3228,17 @@ def _read_key():
             return "enter"
 
         if ch == "\x1b":
-            if not select.select([sys.stdin], [], [], 0.2)[0]:
+            if not select.select([fd], [], [], 0.2)[0]:
                 return "esc"
 
-            head = sys.stdin.read(1)
-            tail = sys.stdin.read(1) if head in ("[", "O") else ""
+            head = os.read(fd, 1).decode("utf-8", "replace")
+            tail = ""
+            if head in ("[", "O") and select.select([fd], [], [], 0.2)[0]:
+                tail = os.read(fd, 1).decode("utf-8", "replace")
+                if tail in ("5", "6") and select.select([fd], [], [], 0.05)[0]:
+                    tilde = os.read(fd, 1).decode("utf-8", "replace")
+                    if tilde == "~":
+                        return "pgup" if tail == "5" else "pgdn"
 
             return {"A": "up", "B": "down", "C": "right", "D": "left",
                     "H": "pgup", "F": "pgdn"}.get(tail)
@@ -3799,7 +3936,7 @@ def delete_strata_engine(root, data_dir):
     deleted = []
     failed = []
 
-    engine_names = ("strata.exe",) if IS_WINDOWS else ("strata",)
+    engine_names = ("strata.exe", "strata") if IS_WINDOWS else ("strata",)
     targets = []
 
     for base in (root, data_dir):
@@ -3807,8 +3944,13 @@ def delete_strata_engine(root, data_dir):
             continue
         for name in engine_names:
             for path in glob.glob(os.path.join(base, "**", name), recursive=True):
-                if os.path.isfile(path) and path not in targets:
-                    targets.append(path)
+                if not os.path.isfile(path) or path in targets:
+                    continue
+                if name == "strata" and IS_WINDOWS:
+                    norm_parent = os.path.normcase(os.path.dirname(path))
+                    if "engine" not in norm_parent and "linux" not in norm_parent:
+                        continue
+                targets.append(path)
 
     for path in targets:
         try:
@@ -4071,7 +4213,7 @@ def show_ram_stability(spec, variant, context_tokens, kv_quant, root, tag, data_
         _emit(RED, "    warn  headroom of about %s GB: the server may run out of RAM and crash" % headroom)
         _emit(RED, "          lower the context, pick q4_0 KV, or choose a smaller variant")
 
-    if headroom < COMFORTABLE_HEADROOM_GB and weights_per_token and kv_baseline_gb:
+    if headroom < COMFORTABLE_HEADROOM_GB and weights_per_token and kv_baseline_gb is not None:
         bytes_per_weight = get_kv_bytes(kv_quant)
 
         fit_tokens = int(
@@ -4114,15 +4256,25 @@ def test_setup_drift(root, tag, context_tokens, kv_quant, data_dir):
     if not test_strata_model_files(config, root):
         return True
 
+    cwd = config.get("cwd") or root or ""
+
+    def resolve_cfg_path(raw):
+        if not isinstance(raw, str) or not raw:
+            return None
+        expanded = os.path.expanduser(raw)
+        if os.path.isabs(expanded):
+            return expanded
+        return os.path.abspath(os.path.join(cwd, expanded)) if cwd else os.path.abspath(expanded)
+
     # the model folder is baked into the engine's model paths; a different
     # folder (or model files that went missing) needs a reconfigure
-    native = get_config_arg_value(config, "--native")
+    native = resolve_cfg_path(get_config_arg_value(config, "--native"))
 
-    if native:
+    if native and data_dir:
         if not os.path.isfile(native) or not path_is_under(native, data_dir):
             return True
 
-    pack = get_config_arg_value(config, "--pack")
+    pack = resolve_cfg_path(get_config_arg_value(config, "--pack"))
 
     if pack and data_dir:
         if not os.path.isdir(pack) or not path_is_under(pack, data_dir):
@@ -4287,9 +4439,15 @@ def invoke_model_tuning(root, config_path, mode):
     if not os.path.isfile(python) or not os.path.isfile(os.path.join(root, "strata.py")):
         return False
 
-    env = dict(os.environ)
+    env = without_sinkhole_proxy(os.environ)
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+
+    if IS_WINDOWS:
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP") else 0
+        popen_kwargs = dict(creationflags=creationflags)
+    else:
+        popen_kwargs = dict(start_new_session=True)
 
     process = subprocess.Popen(
         [python, os.path.join(root, "strata.py"), "tune", "auto", config_path,
@@ -4301,7 +4459,8 @@ def invoke_model_tuning(root, config_path, mode):
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=env)
+        env=env,
+        **popen_kwargs)
 
     try:
         for line in iter(process.stdout.readline, ""):
@@ -4312,6 +4471,19 @@ def invoke_model_tuning(root, config_path, mode):
 
         process.wait()
     finally:
+        if process.poll() is None:
+            if IS_WINDOWS:
+                subprocess.run(["taskkill.exe", "/T", "/F", "/PID", str(process.pid)],
+                               capture_output=True)
+            else:
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except OSError:
+                    process.kill()
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                pass
         try:
             process.stdout.close()
         except Exception:
@@ -5562,17 +5734,43 @@ def _rel_posix_path(child, parent):
     return rel.replace("\\", "/")
 
 
+STRATA_CONFIG_PATH_FLAGS = frozenset((
+    "--native", "--pack", "--ple-gguf", "--native-dense-gguf",
+    "--embd-gguf", "--expert-profile", "--mtp", "--model", "--tokenizer",
+))
+
+
 def prepare_isolated_strata_config(strata_root, tag, strata_config, engine_dir, runtime_dir, log_in_container):
     os.makedirs(runtime_dir, exist_ok=True)
 
+    cfg_cwd = strata_config.get("cwd") or strata_root
     extra_dirs = []
 
-    def register_external_path(candidate):
+    def _resolve_candidate(candidate, is_known_path=False):
         if not candidate or not isinstance(candidate, str):
+            return None
+        expanded = os.path.expanduser(candidate)
+        if os.path.isabs(expanded):
+            return os.path.abspath(expanded) if os.path.exists(expanded) else None
+        if not is_known_path:
+            return None
+        rel_resolved = os.path.abspath(os.path.join(cfg_cwd, expanded))
+        return rel_resolved if os.path.exists(rel_resolved) else None
+
+    def _register_dir(abs_cand):
+        if _is_under_dir(abs_cand, strata_root) or _is_under_dir(abs_cand, engine_dir):
+            return
+        mount_root = abs_cand if os.path.isdir(abs_cand) else os.path.dirname(abs_cand)
+        for existing_root in extra_dirs:
+            if _is_under_dir(mount_root, existing_root):
+                return
+        retained = [r for r in extra_dirs if not _is_under_dir(r, mount_root)]
+        extra_dirs[:] = retained + [mount_root]
+
+    def _map_path(candidate, is_known_path=False):
+        abs_cand = _resolve_candidate(candidate, is_known_path=is_known_path)
+        if not abs_cand:
             return candidate
-        if not (os.path.isabs(candidate) or os.path.exists(candidate)):
-            return candidate
-        abs_cand = os.path.abspath(candidate)
         if _is_under_dir(abs_cand, strata_root):
             rel = _rel_posix_path(abs_cand, strata_root)
             return "/strata" if rel == "." else "/strata/" + rel
@@ -5580,30 +5778,36 @@ def prepare_isolated_strata_config(strata_root, tag, strata_config, engine_dir, 
             rel = _rel_posix_path(abs_cand, engine_dir)
             return "/strata-engine" if rel == "." else "/strata-engine/" + rel
 
-        mount_root = abs_cand if os.path.isdir(abs_cand) else os.path.dirname(abs_cand)
         for idx, existing_root in enumerate(extra_dirs):
             if _is_under_dir(abs_cand, existing_root):
                 rel = _rel_posix_path(abs_cand, existing_root)
                 base = "/strata-models-%d" % idx
                 return base if rel == "." else base + "/" + rel
-            if _is_under_dir(existing_root, mount_root):
-                extra_dirs[idx] = mount_root
-                rel = _rel_posix_path(abs_cand, mount_root)
+
+        _register_dir(abs_cand)
+        for idx, existing_root in enumerate(extra_dirs):
+            if _is_under_dir(abs_cand, existing_root):
+                rel = _rel_posix_path(abs_cand, existing_root)
                 base = "/strata-models-%d" % idx
                 return base if rel == "." else base + "/" + rel
-
-        idx = len(extra_dirs)
-        extra_dirs.append(mount_root)
-        rel = _rel_posix_path(abs_cand, mount_root)
-        base = "/strata-models-%d" % idx
-        return base if rel == "." else base + "/" + rel
+        return candidate
 
     # First pass to find canonical parent directories for external paths
     raw_args = list(strata_config.get("args") or [])
     raw_tokenizer = strata_config.get("tokenizer")
-    for item in raw_args + ([raw_tokenizer] if raw_tokenizer else []):
-        if isinstance(item, str) and (os.path.isabs(item) or os.path.exists(item)):
-            register_external_path(item)
+    if isinstance(raw_tokenizer, str) and raw_tokenizer:
+        cand = _resolve_candidate(raw_tokenizer, is_known_path=True)
+        if cand:
+            _register_dir(cand)
+
+    for idx, item in enumerate(raw_args):
+        if not isinstance(item, str):
+            continue
+        prev = str(raw_args[idx - 1]) if idx > 0 else ""
+        is_flag_val = prev in STRATA_CONFIG_PATH_FLAGS
+        cand = _resolve_candidate(item, is_known_path=is_flag_val)
+        if cand:
+            _register_dir(cand)
 
     # Re-map with consolidated extra_dirs
     rewritten = dict(strata_config)
@@ -5613,9 +5817,14 @@ def prepare_isolated_strata_config(strata_root, tag, strata_config, engine_dir, 
     rewritten["log"] = log_in_container
 
     if isinstance(raw_tokenizer, str) and raw_tokenizer:
-        rewritten["tokenizer"] = register_external_path(raw_tokenizer)
+        rewritten["tokenizer"] = _map_path(raw_tokenizer, is_known_path=True)
 
-    rewritten["args"] = [register_external_path(a) for a in raw_args]
+    mapped_args = []
+    for idx, item in enumerate(raw_args):
+        prev = str(raw_args[idx - 1]) if idx > 0 else ""
+        is_flag_val = prev in STRATA_CONFIG_PATH_FLAGS
+        mapped_args.append(_map_path(item, is_known_path=is_flag_val) if isinstance(item, str) else item)
+    rewritten["args"] = mapped_args
 
     config_filename = "strata-%s-isolated.json" % tag
     host_config_path = os.path.join(runtime_dir, config_filename)
@@ -6472,6 +6681,7 @@ def main():
             write_info("ripgrep: not installed (target: %s)" % RG_DIR)
 
         server_running = False
+        stopped_for_tune = False
         port = state["port"]
         health = strata_health(port)
 
@@ -6481,10 +6691,11 @@ def main():
         else:
             processes = strata_server_processes()
             existing_server = processes[0] if processes else None
+            iso_ports = isolated_strata_ports() if not existing_server else []
 
-            if existing_server:
+            if existing_server or iso_ports:
                 server_running = True
-                other_port = server_port(existing_server)
+                other_port = server_port(existing_server) if existing_server else iso_ports[0]
 
                 if other_port != port:
                     if state["port_specified"]:
@@ -6793,6 +7004,7 @@ def main():
                 write_info("stopping the running server so tuning can use the GPU")
                 stop_strata_servers()
                 server_running = False
+                stopped_for_tune = True
 
             if invoke_model_tuning(
                     strata_root, os.path.join(strata_root, "strata-%s.json" % tag), state["tune"]):
@@ -7000,7 +7212,11 @@ def main():
 
         if state["setup"]:
             write_step("Setup complete")
-            write_info("the server was not started and OpenCode was not opened")
+            if stopped_for_tune:
+                write_info("the running server was stopped for tuning and was not restarted; "
+                           "OpenCode was not opened")
+            else:
+                write_info("the server was not started and OpenCode was not opened")
             write_info("run scode (or strata-coder) in a project folder when you are ready to use it")
 
             show_ram_stability(spec, variant, state["context"], state["kv"],
