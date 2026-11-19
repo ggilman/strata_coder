@@ -1425,6 +1425,8 @@ Options:
   -Status                    Live tokens/sec panel: a GUI window when the
                              machine can display one, otherwise refreshing
                              in place in this console (-NoGui forces it).
+  -Tune [thorough|quick]     Tune the chosen model with Strata's auto-tuner
+                             (defaults to thorough) even if already configured.
   -Update                    Update Strata, OpenCode, and ripgrep to
                              newest releases.
   -Alias                     Add the scode shortcut. Pick the shell with
@@ -5948,6 +5950,8 @@ def parse_args():
     parser.add_argument("-NoOpencode", dest="no_opencode", action="store_true")
     parser.add_argument("-NoAlias", dest="no_alias", action="store_true")
     parser.add_argument("-NoGui", dest="no_gui", action="store_true")
+    parser.add_argument("-Tune", dest="tune", nargs="?", const="thorough",
+                        choices=["quick", "thorough"])
     parser.add_argument("-Update", dest="update", action="store_true")
     parser.add_argument("-Stop", dest="stop", action="store_true")
     parser.add_argument("-Status", dest="status", action="store_true")
@@ -6050,6 +6054,7 @@ def main():
         "dest": args.dest or "",
         "no_alias": args.no_alias,
         "no_gui": args.no_gui,
+        "tune": args.tune or "",
         "update": args.update,
         "check_only": args.check_only,
         "setup": args.setup,
@@ -6614,7 +6619,7 @@ def main():
                 strata_line = "installed (%s)" % strata_version
 
             if model_ready:
-                model_line = "ready"
+                model_line = ("ready (would be tuned: %s)" % state["tune"]) if state["tune"] else "ready"
             elif gguf_dir:
                 model_line = "would be configured from existing GGUF files"
             else:
@@ -6676,7 +6681,7 @@ def main():
                 # does, so it only needs the quick pass
                 exit_code, configured = invoke_model_setup(
                     new_root, variant, data_dir, port, state["context"], state["kv"], gguf_dir, tag,
-                    "quick")
+                    state["tune"] or "quick")
 
                 if not configured:
                     shutil.rmtree(new_root, ignore_errors=True)
@@ -6758,8 +6763,9 @@ def main():
             # counts, sizes and quants across the memory tiers and PCIe bus, so it
             # earns the thorough sweep; a fresh install or a settings-only change
             # just re-establishes the baseline and only needs the quick pass
-            tune = "thorough" if (strata_present and not strata_target
-                                  and not model_ready and not config_drift) else "quick"
+            tune = state["tune"] or ("thorough" if (strata_present and not strata_target
+                                                    and not model_ready and not config_drift)
+                                     else "quick")
 
             exit_code, configured = invoke_model_setup(
                 strata_root, variant, data_dir, port, state["context"], state["kv"], gguf_dir, tag,
@@ -6780,6 +6786,25 @@ def main():
             })
 
             write_ok("model %s is configured" % tag)
+        elif state["tune"]:
+            write_step("Tuning %s (%s)" % (variant["title"], state["tune"]))
+
+            if server_running:
+                write_info("stopping the running server so tuning can use the GPU")
+                stop_strata_servers()
+                server_running = False
+
+            if invoke_model_tuning(
+                    strata_root, os.path.join(strata_root, "strata-%s.json" % tag), state["tune"]):
+                write_ok("model %s tuned (%s)" % (tag, state["tune"]))
+            else:
+                write_warn("the tuning did not finish; the model runs with its standard settings")
+
+            save_state({
+                "StrataRoot": strata_root,
+                "Model": tag,
+                "DataDir": data_dir,
+            })
         else:
             write_skip("model already configured")
 

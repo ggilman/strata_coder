@@ -67,6 +67,7 @@ specific shell when detection picks the wrong one.
 | `strata-coder -Stop` | Stops the Strata server |
 | `strata-coder -Status` | Live dashboard of the running server: tokens/sec for the current answer plus the average over all answers, context use, GPU/RAM, uptime — in a GUI window when the machine can display one, otherwise refreshing in place in the console (Ctrl+C or closing the window quits) |
 | `python status.py [port]` | Opens the status dashboard directly; port defaults to the saved one |
+| `strata-coder -Tune` | Tunes the chosen model with Strata's auto-tuner (`thorough` by default, or `-Tune quick`) even if already configured |
 | `strata-coder -Update` | Moves Strata, OpenCode, and ripgrep to their newest releases |
 | `strata-coder -Setup` | Setup-parameter menu (see below), then installs and configures everything and stops. Opens the GUI menu automatically when the machine can display one |
 | `python setup.py` | Opens the GUI setup window directly — same parameters as `-Setup` |
